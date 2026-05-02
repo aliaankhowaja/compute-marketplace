@@ -1,541 +1,466 @@
-# Component 6: Supabase Backend
+# Component 6: Cloud SQL Postgres + Supabase Auth
+
+## v2 changelog
+
+- Renamed: this component is now **"Cloud SQL Postgres + Supabase Auth"**, not "Supabase Backend". The hot-path database is Cloud SQL for PostgreSQL (regional, in-VPC, private IP). Supabase is retained only as the Auth provider for website users (JWT issuance + session management).
+- All hot-path tables move to Cloud SQL: `agents`, `users`, `sandboxes`, `host_vms`, `templates`, `tier_pricing`, `api_keys`, `billing_intervals`, `credit_transactions`, `pending_deposits`, `audit_log`, `top_up_intervals` (new), `instance_leases` (new), `rate_limit_buckets` (new).
+- Supabase Realtime, Supabase Storage, and Supabase RLS are no longer used. We use Postgres `LISTEN/NOTIFY` + our own WebSocket fan-out for live events. RLS is meaningless because the control plane uses the service role for all writes; client-side reads against Cloud SQL are not exposed.
+- New columns on `agents`: `balance_msats`, `balance_low_water_msats` (per-agent override of the engine default).
+- New table `top_up_intervals` records every BOLT12 top-up settlement (analogous to the old `billing_intervals` rows but at top-up granularity).
+- New table `instance_leases` lets control-plane instances heartbeat their membership when memberlist gossip is unavailable (Cloud SQL fallback for cluster discovery).
+- Connection model uses pgx with per-instance pool of 25 connections; no Supavisor pooler in front.
+
+---
 
 ## Overview
 
-Supabase serves as the managed backend for all persistent state in Satoshi Compute. It provides PostgreSQL for structured data storage, Row Level Security (RLS) for data isolation, Supabase Auth for agent JWT management, Supabase Realtime for live billing event broadcasting, and Supabase Storage for sandbox filesystem snapshots.
+Cloud SQL for PostgreSQL is the single source of truth for every persistent piece of state in Sockt. It runs as a regional HA instance with a private IP in the `sc-control` subnet, reached over Private Services Access from the control-plane MIG. The control plane uses the `pgx` driver natively (no proxy, no pooler).
 
-The Go binary connects to Supabase Postgres via the Supavisor connection pooler in transaction mode, which is compatible with Cloud Run's ephemeral container model. The Supabase JavaScript/TypeScript client is used only by external dashboard consumers — the Go binary uses the raw pgx driver.
+Supabase remains as a separate managed service for website-user authentication. We accept Supabase-issued JWTs (verified locally with the JWKS / JWT secret), but no other Supabase service is used.
 
 ---
 
 ## Services Used
 
-| Supabase Feature | Purpose |
+| Service | Role |
 |---|---|
-| **Postgres** | Primary database: all entities, billing records, host state, credit ledger |
-| **Supabase Auth** | Issues and validates JWTs for agent identity post-L402 registration; also used by website users who sign up to create API keys |
-| **Supabase Realtime** | Broadcasts billing_interval inserts and credit balance changes to subscribed dashboard/agent clients |
-| **Row Level Security** | Agents and users can only read their own rows — enforced at the DB layer |
-| **Supavisor (transaction mode)** | Connection pooling compatible with Cloud Run's transient processes |
-| **Supabase Storage** | Snapshot storage bucket for pause/resume |
+| **Cloud SQL for PostgreSQL** | All persistent state — entities, billing, host pool, audit, leases |
+| **Supabase Auth** (external) | JWT issuance for website users (email/password, OAuth) |
+
+The following are NOT used:
+
+- Supabase Postgres / Storage / Realtime / RLS / Edge Functions / Database webhooks
+- Supavisor pooler (the in-VPC Cloud SQL connection is direct from pgx)
+- Cloud SQL Auth Proxy (private IP makes it unnecessary)
 
 ---
 
 ## Billing Model Split
 
-There are two completely separate billing paths depending on how a request is authenticated:
+Two billing paths share schema but diverge in how settlement is recorded:
 
-| Auth Method | Billing Method | Proof of Payment | Deducted From |
+| Auth Method | Billing Method | Proof of Settlement | Local Counter |
 |---|---|---|---|
-| **L402 + BOLT12** (Lightning agents) | BOLT12 pull-pay micropayments every 10 seconds | Lightning preimage stored in `billing_intervals.bolt12_preimage` | Agent's Lightning wallet |
-| **API Key** (website users) | Credit deduction from pre-purchased credit balance | Credit ledger row in `credit_transactions` | `users.credit_balance_usd_cents` |
+| **L402 + BOLT12** (Lightning agents) | Prepaid msat balance, threshold-triggered BOLT12 top-up | Lightning preimage in `top_up_intervals.preimage` | `agents.balance_msats` |
+| **API Key** (website users) | Prepaid USD-cent balance with periodic per-sandbox allocation | Allocation ledger in `credit_transactions(type='allocation')` | `users.credit_balance_usd_cents` |
 
-These two paths share the same sandbox, orchestrator, and audit infrastructure but diverge entirely in the billing engine. There is no Lightning involvement for API key sessions.
+Both write per-tick consumption rollups to `billing_intervals` (Lightning) or `credit_transactions` (credits) via batched 30s flushes. There is no Lightning involvement on credit sandboxes.
 
 ---
 
-## Database Schema
+## Database Schema (Cloud SQL)
 
-### Table: agents
+### Table: `agents`
 
 Stores one row per agent identity registered via the L402 path (Lightning agents).
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
-| `id` | UUID | PK | Internal agent identifier |
-| `jwt_sub` | UUID | UNIQUE, NOT NULL | Supabase Auth user ID |
-| `offer_type` | TEXT | NOT NULL | bolt12, lnurl, or lightning_address |
-| `bolt12_offer` | TEXT | UNIQUE, nullable | Agent's BOLT12 offer string |
-| `lightning_address` | TEXT | UNIQUE, nullable | Fallback Lightning address |
-| `lnurl` | TEXT | UNIQUE, nullable | Fallback LNURL |
-| `balance_sats` | BIGINT | NOT NULL, DEFAULT 0 | Pre-funded Lightning balance |
+| `id` | UUID | PK, DEFAULT gen_random_uuid() | Internal agent identifier |
+| `jwt_sub` | UUID | UNIQUE, NOT NULL | Supabase Auth user ID (or self-issued) |
+| `offer_type` | TEXT | NOT NULL | `bolt12` or `manual_bolt11` |
+| `bolt12_offer` | TEXT | UNIQUE, nullable | BOLT12 offer string |
+| `lightning_address` | TEXT | UNIQUE, nullable | For BOLT11 manual mode (display only) |
+| `balance_msats` | BIGINT | NOT NULL DEFAULT 0, CHECK >= -1000000 | Prepaid balance; small negative tolerated for in-flight pause |
+| `balance_low_water_msats` | BIGINT | nullable | Per-agent override of `BALANCE_LOW_WATER_SECS` * msats_per_second |
+| `total_msats_topped_up` | BIGINT | NOT NULL DEFAULT 0 | Lifetime top-ups |
+| `total_msats_consumed` | BIGINT | NOT NULL DEFAULT 0 | Lifetime consumption |
 | `label` | TEXT | nullable | Agent-assigned label |
-| `metadata` | JSONB | nullable | Arbitrary key-value store |
-| `created_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
-| `last_active_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
-| `total_sats_spent` | BIGINT | NOT NULL, DEFAULT 0 | Lifetime Lightning spend |
-| `warning_level` | TEXT | NOT NULL, DEFAULT ok | ok, warning, critical, suspended |
+| `metadata` | JSONB | nullable | Arbitrary key-value |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `last_active_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `warning_level` | TEXT | NOT NULL DEFAULT 'ok' | `ok`, `low_balance`, `out_of_balance`, `suspended` |
 
 **Indexes:**
 - `agents_jwt_sub_idx` ON jwt_sub
 - `agents_bolt12_offer_idx` ON bolt12_offer
-- `agents_lightning_address_idx` ON lightning_address
 
 ---
 
-### Table: users
+### Table: `users`
 
-Stores one row per website user (signed up via email/OAuth). Website users authenticate via Supabase Auth and pay for compute using pre-purchased credits, not Lightning.
+Stores one row per website user (signed up via Supabase Auth).
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
-| `id` | UUID | PK, matches auth.users(id) | Supabase Auth user ID — primary key is the auth UUID |
-| `email` | TEXT | UNIQUE, NOT NULL | User's email address (from Supabase Auth) |
-| `credit_balance_usd_cents` | BIGINT | NOT NULL, DEFAULT 0, CHECK >= 0 | Current credit balance in US dollar cents (e.g., 500 = $5.00) |
-| `total_credits_purchased_usd_cents` | BIGINT | NOT NULL, DEFAULT 0 | Lifetime credits purchased |
-| `total_credits_consumed_usd_cents` | BIGINT | NOT NULL, DEFAULT 0 | Lifetime credits consumed by sandboxes |
-| `plan` | TEXT | NOT NULL, DEFAULT free | free, starter, pro, enterprise |
-| `max_concurrent_sandboxes` | INT | NOT NULL, DEFAULT 5 | Concurrent sandbox limit for this user |
-| `max_api_keys` | INT | NOT NULL, DEFAULT 10 | Maximum active API keys allowed |
-| `created_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
-| `last_active_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
-| `warning_level` | TEXT | NOT NULL, DEFAULT ok | ok, low_credits, out_of_credits, suspended |
+| `id` | UUID | PK | Matches Supabase Auth user UUID |
+| `email` | TEXT | UNIQUE, NOT NULL | |
+| `credit_balance_usd_cents` | BIGINT | NOT NULL DEFAULT 0, CHECK >= 0 | Master credit balance |
+| `total_credits_purchased_usd_cents` | BIGINT | NOT NULL DEFAULT 0 | Lifetime purchases |
+| `total_credits_consumed_usd_cents` | BIGINT | NOT NULL DEFAULT 0 | Lifetime consumption |
+| `plan` | TEXT | NOT NULL DEFAULT 'free' | `free`, `starter`, `pro`, `enterprise` |
+| `max_concurrent_sandboxes` | INT | NOT NULL DEFAULT 5 | |
+| `max_api_keys` | INT | NOT NULL DEFAULT 10 | |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `last_active_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `warning_level` | TEXT | NOT NULL DEFAULT 'ok' | `ok`, `low_credits`, `out_of_credits`, `suspended` |
 
 **Indexes:**
 - `users_email_idx` ON email
 
-**Notes:**
-- `credit_balance_usd_cents` has a CHECK constraint ensuring it never goes below 0. The billing engine always checks remaining balance before deducting.
-- Credits are denominated in USD cents (integer) to avoid floating-point rounding errors in financial calculations.
-- Credit-to-compute pricing is defined in the `tier_pricing` table (see below).
-
 ---
 
-### Table: tier_pricing
-
-Defines the compute cost per second for each tier in both sats (Lightning path) and USD cents (credit path). This table is the single source of truth for pricing across both billing systems.
+### Table: `tier_pricing`
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
-| `tier` | TEXT | PK | nano, micro, standard, gpu_small, gpu_large |
-| `sats_per_second` | NUMERIC(10,4) | NOT NULL | Lightning billing rate |
-| `usd_cents_per_second` | NUMERIC(10,6) | NOT NULL | Credit billing rate (e.g., 0.000278 = $0.01/hour) |
-| `cold_start_sats` | INT | NOT NULL, DEFAULT 0 | One-time charge (Lightning) for VM provisioning |
-| `cold_start_usd_cents` | INT | NOT NULL, DEFAULT 0 | One-time charge (credits) for VM provisioning |
-| `updated_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Last pricing change |
+| `tier` | TEXT | PK | `nano`, `micro`, `standard`, `gpu_small`, `gpu_large` |
+| `msats_per_second` | BIGINT | NOT NULL | Lightning rate (msats for sub-sat precision) |
+| `usd_cents_per_second_x100` | BIGINT | NOT NULL | Credit rate at 1/100-of-a-cent precision |
+| `cold_start_msats` | BIGINT | NOT NULL DEFAULT 0 | One-time provisioning charge (Lightning) |
+| `cold_start_usd_cents` | INT | NOT NULL DEFAULT 0 | One-time provisioning charge (credits) |
+| `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 
-**Example pricing (indicative):**
+The unit changes: `msats_per_second` (was `sats_per_second`) gives the engine the precision it needs to compute fractional-msat values without rounding losses on 1s ticks.
 
-| Tier | sats/sec | USD cents/sec | USD/hour |
+**Example pricing:**
+
+| Tier | msats/sec | usd_cents/sec ×100 | USD/hour |
 |---|---|---|---|
-| nano | 0.5 | 0.000139 | ~$0.50 |
-| micro | 2.0 | 0.000556 | ~$2.00 |
-| standard | 8.0 | 0.002222 | ~$8.00 |
-| gpu_small | 80.0 | 0.022222 | ~$80.00 |
-| gpu_large | 400.0 | 0.111111 | ~$400.00 |
+| nano | 500 | 14 | ~$0.50 |
+| micro | 2000 | 56 | ~$2.00 |
+| standard | 8000 | 222 | ~$8.00 |
+| gpu_small | 80_000 | 2222 | ~$80.00 |
+| gpu_large | 400_000 | 11_111 | ~$400.00 |
 
 ---
 
-### Table: api_keys
+### Table: `api_keys`
 
-Stores API keys created by website users. Each key is linked to a `users` row via `user_id`. All sandbox ownership and credit billing flows through `user_id`.
-
-| Column | Type | Constraints | Description |
-|---|---|---|---|
-| `id` | UUID | PK, DEFAULT gen_random_uuid() | Internal key record identifier |
-| `user_id` | UUID | FK users(id), NOT NULL | The website user who owns this key |
-| `key_hash` | TEXT | UNIQUE, NOT NULL | SHA-256 hash of the raw key — stored instead of the key itself |
-| `key_prefix` | TEXT | NOT NULL | First 12 chars of raw key for dashboard display (e.g., sc_live_aB3x) |
-| `name` | TEXT | NOT NULL | Human label (e.g., My MCP Server) |
-| `created_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
-| `last_used_at` | TIMESTAMPTZ | nullable | Updated on each successful authentication |
-| `expires_at` | TIMESTAMPTZ | nullable | Hard expiry; NULL = never expires |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true | Soft-delete / revoke flag |
-| `allowed_tiers` | TEXT[] | nullable | Restrict key to specific tiers; NULL = all tiers |
-| `rate_limit_rpm` | INT | nullable | Per-minute request cap override; NULL = plan default |
-| `ip_allowlist` | INET[] | nullable | Optional IP whitelist; NULL = all IPs allowed |
-| `description` | TEXT | nullable | Optional notes |
-
-**Indexes:**
-- `api_keys_key_hash_active_idx` ON (key_hash) WHERE is_active = true — primary lookup path on every auth
-- `api_keys_user_id_idx` ON user_id
-- `api_keys_key_hash_idx` ON key_hash — for revocation lookup
-
-**Key format:** `sc_live_{32 random URL-safe base64 chars}` — 192 bits of entropy. `sc_test_` prefix for testnet. Raw key shown once at creation and never stored.
-
----
-
-### Table: credit_transactions
-
-Append-only ledger of every credit movement for website users. Both purchases (credit additions) and compute charges (credit deductions) are recorded here. This is the financial source of truth for the credit billing path.
+Unchanged in spec; relocated to Cloud SQL.
 
 | Column | Type | Constraints | Description |
 |---|---|---|---|
 | `id` | UUID | PK, DEFAULT gen_random_uuid() | |
 | `user_id` | UUID | FK users(id), NOT NULL | |
-| `sandbox_id` | UUID | FK sandboxes(id), nullable | Set for compute-charge transactions; NULL for purchases |
-| `api_key_id` | UUID | FK api_keys(id), nullable | Which API key triggered this charge; NULL for purchases |
-| `type` | TEXT | NOT NULL | purchase, compute_charge, refund, adjustment |
-| `amount_usd_cents` | BIGINT | NOT NULL | Always positive. Sign determined by `type`. |
-| `balance_after_usd_cents` | BIGINT | NOT NULL | Snapshot of user balance after this transaction (for auditability) |
-| `description` | TEXT | NOT NULL | Human-readable description (e.g., nano sandbox - 10s interval, Credit purchase via Stripe) |
-| `stripe_payment_intent_id` | TEXT | nullable | Stripe payment intent ID for purchase transactions |
-| `interval_start` | TIMESTAMPTZ | nullable | For compute_charge: start of the billed interval |
-| `interval_end` | TIMESTAMPTZ | nullable | For compute_charge: end of the billed interval |
-| `elapsed_seconds` | NUMERIC(8,3) | nullable | Actual elapsed seconds for compute_charge rows |
-| `tier` | TEXT | nullable | Tier being billed for compute_charge rows |
-| `partial` | BOOLEAN | NOT NULL, DEFAULT false | True if interval cut short by pause/terminate |
-| `created_at` | TIMESTAMPTZ | NOT NULL, DEFAULT now() | |
-
-**Partitioning:** Range-partitioned by month on `created_at`. Old partitions archived after 12 months.
+| `key_hash` | TEXT | UNIQUE, NOT NULL | SHA-256 of raw key |
+| `key_prefix` | TEXT | NOT NULL | First 12 chars |
+| `name` | TEXT | NOT NULL | |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `last_used_at` | TIMESTAMPTZ | nullable | |
+| `expires_at` | TIMESTAMPTZ | nullable | |
+| `is_active` | BOOLEAN | NOT NULL DEFAULT true | |
+| `allowed_tiers` | TEXT[] | nullable | |
+| `rate_limit_rpm` | INT | nullable | |
+| `ip_allowlist` | INET[] | nullable | |
+| `description` | TEXT | nullable | |
 
 **Indexes:**
-- `credit_tx_user_created_idx` ON (user_id, created_at DESC) — billing history queries
-- `credit_tx_sandbox_created_idx` ON (sandbox_id, created_at DESC) — per-sandbox billing
-- `credit_tx_type_idx` ON type — purchase vs charge filtering
+- `api_keys_key_hash_idx` ON key_hash
+- `api_keys_user_id_idx` ON user_id
+
+**Cross-instance revocation:** `DELETE` (soft) on this table issues `NOTIFY apikey_revoked, '<api_key_id>'` so all control-plane instances evict the cached key sub-second.
 
 ---
 
-### Table: sandboxes
+### Table: `credit_transactions`
 
-One new nullable column added compared to the L402-only design:
-
-| New Column | Type | Constraints | Description |
+| Column | Type | Constraints | Description |
 |---|---|---|---|
-| `api_key_id` | UUID | FK api_keys(id), nullable | Set when sandbox created via API key; NULL for L402 sessions |
-| `user_id` | UUID | FK users(id), nullable | Set for API key sessions; NULL for L402 sessions |
-| `billing_method` | TEXT | NOT NULL, DEFAULT lightning | lightning or credits — determines which billing engine path handles this sandbox |
+| `id` | UUID | PK, DEFAULT gen_random_uuid() | |
+| `user_id` | UUID | FK users(id), NOT NULL | |
+| `sandbox_id` | UUID | FK sandboxes(id), nullable | |
+| `api_key_id` | UUID | FK api_keys(id), nullable | |
+| `type` | TEXT | NOT NULL | `purchase`, `allocation`, `compute_charge`, `refund`, `adjustment` |
+| `amount_usd_cents` | BIGINT | NOT NULL | Always positive; sign determined by `type` |
+| `balance_after_usd_cents` | BIGINT | NOT NULL | Balance snapshot |
+| `description` | TEXT | NOT NULL | |
+| `stripe_payment_intent_id` | TEXT | nullable | Set for purchase |
+| `interval_start` | TIMESTAMPTZ | nullable | For `compute_charge` |
+| `interval_end` | TIMESTAMPTZ | nullable | For `compute_charge` |
+| `elapsed_seconds_x1000` | INT | nullable | Sub-second precision for `compute_charge` |
+| `tier` | TEXT | nullable | For `compute_charge` |
+| `partial` | BOOLEAN | NOT NULL DEFAULT false | |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
 
-All other sandbox columns remain as defined in the base schema (id, agent_id, tier, runtime, status, template, host_vm_id, guest_ip, vsock_cid, wss_token, etc.).
+**Partitioning:** monthly by `created_at`, archived after 12 months.
 
-**The `sats_consumed` column is only meaningful for `billing_method = lightning` sandboxes. A new `credits_consumed_usd_cents` column is added for `billing_method = credits` sandboxes:**
+**Indexes:**
+- `credit_tx_user_created_idx` ON (user_id, created_at DESC)
+- `credit_tx_sandbox_created_idx` ON (sandbox_id, created_at DESC)
+- `credit_tx_type_idx` ON type
 
-| New Column | Type | Constraints | Description |
-|---|---|---|---|
-| `credits_consumed_usd_cents` | BIGINT | NOT NULL, DEFAULT 0 | Total credits deducted for this sandbox (credit billing path only) |
+The new `type='allocation'` rows record per-sandbox 60s prepaid allocations. `type='compute_charge'` rows are the per-30s rollups of metered consumption (these are batched).
 
 ---
 
-### Table: billing_intervals
+### Table: `sandboxes`
 
-Retained as-is for Lightning sessions. Not used for credit billing sessions — those write to `credit_transactions` instead.
+Schema matches v1 base plus:
 
-For clarity, a `billing_method` column is added:
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `agent_id` | UUID | nullable, FK agents(id) | Set for L402 sandboxes |
+| `user_id` | UUID | nullable, FK users(id) | Set for API-key sandboxes |
+| `api_key_id` | UUID | nullable, FK api_keys(id) | Set for API-key sandboxes |
+| `billing_method` | TEXT | NOT NULL DEFAULT 'lightning' | `lightning` or `credits` |
+| `host_vm_id` | TEXT | nullable | Currently-running host |
+| `vsock_cid` | INT | nullable | Firecracker only |
+| `local_snapshot_path` | TEXT | nullable | `/var/lib/sc/snapshots/{id}/` (host-local SSD) |
+| `snapshot_node_host_id` | TEXT | nullable | Which host has the hot snapshot |
+| `gcs_snapshot_path` | TEXT | nullable | `gs://sc-snapshots/...` (cold tier) |
+| `gcs_uploaded_at` | TIMESTAMPTZ | nullable | When the host-agent finished GCS upload |
+| `owner_instance_id` | TEXT | nullable | Last known owning control-plane instance (advisory; ring is the source of truth) |
+| `consumed_msats` | BIGINT | NOT NULL DEFAULT 0 | Cumulative Lightning consumption |
+| `credits_consumed_usd_cents` | BIGINT | NOT NULL DEFAULT 0 | Cumulative credit consumption |
+| `data_jwt_revoked_at` | TIMESTAMPTZ | nullable | If non-null, host-agents reject old data_jwts (defense in depth) |
+| `ssh_private_key_wrapped` | BYTEA | nullable | KMS-wrapped DEK + ciphertext for operator backdoor SSH |
+| ... | ... | ... | (id, tier, runtime, status, template, created_at, terminated_at, etc. as in v1) |
+
+---
+
+### Table: `billing_intervals`
+
+For Lightning sandboxes only. Per-tick rollup rows (batched 30s flush from the engine).
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | UUID | PK, DEFAULT gen_random_uuid() | |
+| `sandbox_id` | UUID | FK sandboxes(id), NOT NULL | |
+| `agent_id` | UUID | FK agents(id), NOT NULL | |
+| `interval_start` | TIMESTAMPTZ | NOT NULL | |
+| `interval_end` | TIMESTAMPTZ | NOT NULL | |
+| `msats_consumed` | BIGINT | NOT NULL | Per-tick consumption |
+| `tick_count` | INT | NOT NULL | Number of 1s ticks aggregated into this row |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+**Partitioning:** monthly.
+
+(Per-tick `bolt12_preimage` and `bolt12_invoice` are removed — those live on `top_up_intervals` instead since payment now happens at top-up granularity, not tick granularity.)
+
+---
+
+### Table: `top_up_intervals` (new)
+
+Records every BOLT12 top-up settlement.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `id` | UUID | PK, DEFAULT gen_random_uuid() | |
+| `agent_id` | UUID | FK agents(id), NOT NULL | |
+| `sandbox_id` | UUID | FK sandboxes(id), nullable | The sandbox that triggered the top-up; NULL for manual top-ups |
+| `idempotency_key` | TEXT | NOT NULL UNIQUE | Caller-supplied key |
+| `amount_msats` | BIGINT | NOT NULL | |
+| `payment_hash` | BYTEA | NOT NULL | |
+| `preimage` | BYTEA | nullable | NULL until settled |
+| `bolt12_invoice` | TEXT | nullable | The invoice the agent's Lexe returned |
+| `status` | TEXT | NOT NULL DEFAULT 'pending' | `pending`, `settled`, `failed` |
+| `error_class` | TEXT | nullable | `routing_failure`, `offer_unreachable`, ... |
+| `requested_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `settled_at` | TIMESTAMPTZ | nullable | |
+
+**Indexes:**
+- `top_up_agent_requested_idx` ON (agent_id, requested_at DESC)
+- `top_up_idempotency_idx` ON idempotency_key
+- `top_up_payment_hash_idx` ON payment_hash
+
+---
+
+### Table: `pending_deposits`
+
+Unchanged in spec (Lightning manual deposits for BOLT11 fallback agents).
+
+---
+
+### Table: `host_vms`
+
+Unchanged in spec.
+
+---
+
+### Table: `templates`
+
+Unchanged in spec.
+
+---
+
+### Table: `audit_log`
+
+Adds an `instance_id` column to track which control-plane instance produced the event.
 
 | New Column | Type | Description |
 |---|---|---|
-| `billing_method` | TEXT | lightning — all rows in this table are Lightning-billed. Credit-billed intervals are in credit_transactions. |
-
----
-
-### Table: host_vms
-
-Unchanged from base schema.
-
----
-
-### Table: templates
-
-Unchanged from base schema.
-
----
-
-### Table: pending_deposits
-
-Unchanged from base schema (Lightning top-ups for L402 agents only).
-
----
-
-### Table: audit_log
-
-Two new columns:
-
-| New Column | Type | Description |
-|---|---|---|
-| `api_key_id` | UUID, nullable | Set when event triggered by an API key request |
-| `user_id` | UUID, nullable | Set for website user actions |
-| `auth_method` | TEXT, nullable | l402, api_key, or user_jwt |
+| `api_key_id` | UUID, nullable | Set when triggered by an API key request |
+| `user_id` | UUID, nullable | Set for website-user actions |
+| `agent_id` | UUID, nullable | Set for Lightning agent actions |
+| `auth_method` | TEXT, nullable | `l402`, `api_key`, `user_jwt`, `data_jwt` |
+| `instance_id` | TEXT, nullable | Control-plane instance name (debugging) |
 
 New event types:
-- `api_key.created`
-- `api_key.revoked`
-- `api_key.auth_failure`
-- `credits.purchased`
-- `credits.low_balance` — user balance below $1.00
-- `credits.out_of_credits` — billing deduction failed; sandbox paused
-- `sandbox.paused_no_credits` — sandbox auto-paused due to exhausted credits
+
+- `api_key.created`, `api_key.revoked`, `api_key.auth_failure`
+- `credits.purchased`, `credits.low_balance`, `credits.out_of_credits`
+- `sandbox.paused_no_credits`, `sandbox.paused_no_balance`
+- `billing.lightning.permanent_failure`, `billing.lightning.recovered`
+- `cluster.member_joined`, `cluster.member_left`, `cluster.ring_rebalanced`
+- `host.unreachable`, `host.drained`
 
 ---
 
-## Credit Billing Design
+### Table: `instance_leases` (new)
 
-### How Credits Work
+Used as the cluster-membership fallback when memberlist gossip is unavailable, and as the canonical source of truth for orphan-sandbox detection.
 
-1. Website user purchases credits via the website dashboard (Stripe payment). Credits are stored in `users.credit_balance_usd_cents`.
-2. When an API-key-authenticated agent creates a sandbox, the billing engine spawns a credit billing ticker goroutine (separate from the Lightning ticker).
-3. Every 10 seconds, the credit ticker calculates `cost = tier.usd_cents_per_second × elapsed_seconds` and attempts to deduct from the user's balance.
-4. Deduction is a single Postgres transaction: check balance >= cost → deduct → insert `credit_transactions` row. The CHECK constraint on `credit_balance_usd_cents >= 0` prevents overdraft at the database level.
-5. If deduction fails (balance < cost), the sandbox is paused and the user is notified.
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `instance_id` | TEXT | PK | GCE instance name |
+| `private_ip` | INET | NOT NULL | For peer gRPC |
+| `started_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `last_heartbeat_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `version` | TEXT | NOT NULL | Binary git SHA |
 
-### Credit Deduction Transaction (Atomic)
+Each control-plane instance UPSERTs its row every 5s. A row whose `last_heartbeat_at` is older than 30s is considered dead; the cluster module rebalances the ring.
 
-The deduction must be atomic to prevent race conditions when multiple sandboxes consume credits simultaneously for the same user. The Go billing engine uses a Postgres advisory lock keyed on `user_id` for the duration of each deduction:
+---
 
-```
-BEGIN;
-SELECT pg_advisory_xact_lock(hashtext(user_id::text));
-SELECT credit_balance_usd_cents FROM users WHERE id = user_id FOR UPDATE;
--- check balance >= cost
-UPDATE users SET credit_balance_usd_cents = credit_balance_usd_cents - cost WHERE id = user_id;
-INSERT INTO credit_transactions (...) VALUES (...);
-COMMIT;
-```
+### Table: `rate_limit_buckets` (new)
 
-This ensures that two concurrent 10-second tickers for the same user's two sandboxes do not both read the same balance and both think they have sufficient funds.
+For cross-instance per-principal rate-limit coordination. The token-bucket state for each principal lives in-memory on the instance handling the most recent request, and is sampled to this table every 5s. On request, an instance reads the row to verify the principal's recent global usage. Eventual consistency is acceptable at the 300-rpm thresholds in use.
 
-### Credit Exhaustion Handling
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| `principal_key` | TEXT | PK | `agent_id` or `api_key_id` (hashed) |
+| `tokens_remaining` | INT | NOT NULL | Current bucket level |
+| `bucket_size` | INT | NOT NULL | Per-second cap |
+| `last_refilled_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+| `updated_by_instance_id` | TEXT | NOT NULL | Last instance that wrote |
 
-| Consecutive Failures | Action |
-|---|---|
-| 1 | `credits.low_balance` warning emitted if balance < $1.00; WebSocket budget_warning frame sent |
-| First deduction failure | Sandbox immediately paused; `credits.out_of_credits` audit event; user notified via Supabase Realtime |
+(For tighter rate limiting, a Redis or per-host token bucket can be introduced later — out of scope for v1.)
 
-Unlike the Lightning path (which has a 3-strike rule due to transient routing failures), credit deduction failure is deterministic — if the balance is insufficient, there is no point retrying the same tick. The sandbox is paused immediately.
+---
 
-### Credit Purchase Flow (Stripe)
+## Lightning Path: Settlement Flow Recap
 
-Credit purchases are handled by the website frontend + Stripe. The Go binary provides one webhook endpoint for Stripe payment confirmation:
+Per the new billing engine (Component 3):
 
-**POST /internal/webhooks/stripe** — Stripe calls this when a payment intent succeeds.
+1. The billing engine meters in-memory; no DB writes per tick
+2. Every 30s the engine bulk-inserts `billing_intervals` rows (batched per-tick rollups)
+3. When a sandbox's `balance_msats` falls below threshold, the engine calls `payment.TopUpBalance` which inserts a `top_up_intervals` row in `pending` status, then updates it to `settled` with `preimage` on success
+4. On settle, `agents.balance_msats` is incremented; in-memory cache is updated
+5. `audit_log` rows track non-routine events (top-up failures, pauses, etc.)
 
-Processing:
-1. Verify Stripe webhook signature using `STRIPE_WEBHOOK_SECRET`
-2. Extract `user_id` from payment intent metadata
-3. Extract `amount_usd_cents` from payment intent amount
-4. In a single transaction: increment `users.credit_balance_usd_cents += amount_usd_cents` and insert `credit_transactions` row with `type = purchase`
-5. Emit Supabase Realtime event on `users` table update so the dashboard balance refreshes
+The constraint `agents.balance_msats >= -1000000` (allows up to 1 sat negative) tolerates the 1-tick window between balance reaching zero and the orchestrator's `PauseSandbox` returning.
 
-This endpoint is internal-only (not exposed via Aperture) and protected by Stripe signature verification.
+---
+
+## Credits Path: Allocation Flow Recap
+
+1. The billing engine maintains a per-sandbox in-memory `BalanceCents` (the local prepaid allocation)
+2. When that balance drops below 30s of runtime, the engine calls `AllocateCreditsForSandbox` which:
+   ```
+   BEGIN;
+   SELECT pg_advisory_xact_lock(hashtext(user_id::text));
+   SELECT credit_balance_usd_cents FROM users WHERE id = $1 FOR UPDATE;
+   IF balance >= requested → UPDATE users SET credit_balance -= requested; INSERT credit_transactions(type='allocation', ...)
+   ELSE IF balance > 0 → allocate balance, set to 0
+   ELSE → return ErrInsufficient
+   COMMIT;
+   ```
+3. Every 30s the engine bulk-inserts `credit_transactions(type='compute_charge', ...)` rows for actual consumption
+4. On reconciliation: unused allocations (sandbox terminated before consumption) are refunded via `type='refund'` rows
 
 ---
 
 ## API Key Management Endpoints
 
-These endpoints are called by the website dashboard. They are authenticated via Supabase Auth JWT (the website user's session token) — not by L402 or API key. All routes are prefixed `/v1/user/` and excluded from Aperture's L402 gate.
+These endpoints are called by the website dashboard and authenticated via Supabase Auth JWT.
 
 ### POST /v1/user/api-keys — Create API Key
-
-**Authentication:** Supabase Auth JWT
-
-**Request body:**
-- `name` (string, required) — Human label
-- `description` (string, optional)
-- `expires_at` (ISO8601, optional)
-- `allowed_tiers` (array, optional)
-- `ip_allowlist` (array of IPs, optional)
-- `rate_limit_rpm` (integer, optional)
-
-**Processing:**
-1. Verify Supabase Auth JWT, extract `user_id`
-2. Look up `users` row — verify user exists and `warning_level != 'suspended'`
-3. Check active key count against `users.max_api_keys`
-4. Generate raw key: `sc_live_` + 32 random URL-safe base64 chars via `crypto/rand`
-5. Compute `key_hash = SHA-256(raw_key)` and `key_prefix = raw_key[:12]`
-6. Insert `api_keys` row linked to `user_id`
-7. Write `audit_log` event: `api_key.created`
-8. Return raw key — **shown once only**
-
-**Response 201:**
-```
-{
-  "id": "uuid",
-  "name": "My MCP Server",
-  "key": "sc_live_aB3xK9mPqR7vNwYzL2cD5eF8gH1jI4k",
-  "key_prefix": "sc_live_aB3x",
-  "created_at": "ISO8601",
-  "expires_at": null,
-  "allowed_tiers": null,
-  "warning": "Save this key now. It will not be shown again."
-}
-```
-
----
-
 ### GET /v1/user/api-keys — List Keys
-
-**Response 200:** Array of key metadata objects (no raw key, no hash).
-
----
-
 ### PATCH /v1/user/api-keys/{id} — Update Key
-
-Allows updating: `name`, `description`, `expires_at`, `allowed_tiers`, `ip_allowlist`, `rate_limit_rpm`.
-
-**Response 200:** Updated key object.
-
----
-
 ### DELETE /v1/user/api-keys/{id} — Revoke Key
-
-1. Verify key belongs to the authenticated user
-2. Set `is_active = false`
-3. Purge key from in-process LRU cache immediately
-4. Write `audit_log` event: `api_key.revoked`
-
-**Response 200:** `{ id, revoked: true, revoked_at }`
-
----
-
 ### GET /v1/user/credits — Get Credit Balance
-
-**Response 200:**
-```
-{
-  "credit_balance_usd_cents": 4250,
-  "credit_balance_display": "$42.50",
-  "total_purchased_usd_cents": 10000,
-  "total_consumed_usd_cents": 5750,
-  "warning_level": "ok",
-  "active_sandboxes_count": 2,
-  "estimated_hours_remaining": 14.3
-}
-```
-
-`estimated_hours_remaining` is calculated as: `credit_balance / sum(tier.usd_cents_per_second × 3600)` across all running sandboxes for this user.
-
----
-
 ### GET /v1/user/credits/history — Credit Transaction History
 
-**Query parameters:** `page`, `limit`, `type` (filter by purchase/compute_charge/refund), `sandbox_id`, `from`, `to`
+Behavior unchanged from v1 in shape. Implementation now talks to Cloud SQL directly (no Supabase JS client).
 
-**Response 200:**
-```
-{
-  "transactions": [
-    {
-      "id": "uuid",
-      "type": "compute_charge",
-      "amount_usd_cents": 5,
-      "balance_after_usd_cents": 4250,
-      "description": "micro sandbox - 10s interval",
-      "sandbox_id": "uuid",
-      "tier": "micro",
-      "interval_start": "ISO8601",
-      "interval_end": "ISO8601",
-      "created_at": "ISO8601"
-    }
-  ],
-  "total_pages": 12
-}
-```
+The `DELETE` endpoint additionally issues `NOTIFY apikey_revoked, '<id>'` so all control-plane instances evict their LRU caches sub-second.
 
 ---
 
-## Row Level Security Policies
+## Auth: Supabase or Self-Issued
 
-### agents table
+We have two compatible options for issuing JWTs:
 
-| Policy Name | Operation | Expression |
-|---|---|---|
-| `agents_select_own` | SELECT | `auth.uid() = jwt_sub` |
-| `agents_update_own` | UPDATE | `auth.uid() = jwt_sub` (label and metadata only) |
+1. **Supabase Auth (recommended for v1)** — leverages the existing email/password + OAuth flows, email verification, password reset, magic links. The control plane verifies the JWT signature against Supabase's published JWKS or shared `SUPABASE_JWT_SECRET`.
+2. **Self-issued JWTs** — drop the Supabase dependency entirely and run our own auth (e.g. via `github.com/markbates/goth` for OAuth). More implementation work; useful if Supabase Auth becomes a bottleneck or limitation.
 
-### users table
+The interface is the same either way: a JWT with `sub = users.id` is presented in `Authorization: Bearer <jwt>` and the control plane's `JWTMiddleware` validates it. Lightning agents (L402 path) use a separately self-signed JWT issued by the platform at offer registration time.
 
-| Policy Name | Operation | Expression |
-|---|---|---|
-| `users_select_own` | SELECT | `auth.uid() = id` |
-| `users_update_own` | UPDATE | `auth.uid() = id` (label and metadata only — balance updates only via service role) |
-
-### api_keys table
-
-| Policy Name | Operation | Expression |
-|---|---|---|
-| `api_keys_select_own` | SELECT | `user_id = auth.uid()` (key_hash column excluded) |
-| `api_keys_insert_own` | INSERT | `user_id = auth.uid()` |
-| `api_keys_update_own` | UPDATE | `user_id = auth.uid()` |
-| `api_keys_delete_own` | DELETE | `user_id = auth.uid()` |
-
-### credit_transactions table
-
-| Policy Name | Operation | Expression |
-|---|---|---|
-| `credit_tx_select_own` | SELECT | `user_id = auth.uid()` |
-
-No INSERT/UPDATE/DELETE policies for external clients — only the Go service role writes to this table.
-
-### sandboxes table
-
-| Policy Name | Operation | Expression |
-|---|---|---|
-| `sandboxes_select_l402` | SELECT | `agent_id IN (SELECT id FROM agents WHERE jwt_sub = auth.uid())` |
-| `sandboxes_select_apikey` | SELECT | `user_id = auth.uid()` |
-
-Both policies are OR-combined so a client can see their sandboxes regardless of how they were created.
-
-### billing_intervals table
-
-| Policy Name | Operation | Expression |
-|---|---|---|
-| `billing_select_own` | SELECT | `agent_id IN (SELECT id FROM agents WHERE jwt_sub = auth.uid())` |
-
-### pending_deposits table
-
-| Policy Name | Operation | Expression |
-|---|---|---|
-| `deposits_select_own` | SELECT | `agent_id IN (SELECT id FROM agents WHERE jwt_sub = auth.uid())` |
-
----
-
-## Supabase Auth Configuration
-
-### Two User Types
-
-**Type 1: Lightning Agents (L402 path)**
-- Created programmatically by the Go binary using the Supabase Admin API
-- Synthetic email, no password, no OAuth
-- `app_metadata.offer_type` set
-
-**Type 2: Website Users (API key path)**
-- Sign up on the website using Supabase Auth natively (email/password or OAuth: Google, GitHub)
-- Supabase handles registration, email verification, and session management
-- On first API call to `/v1/user/*`, the Go binary looks up or creates the corresponding `users` row
-
-### JWT Claims Comparison
+### JWT Claims
 
 | Claim | Lightning Agent | Website User |
 |---|---|---|
 | `sub` | Agent UUID | User UUID (matches `users.id`) |
-| `aud` | authenticated | authenticated |
+| `aud` | `sockt` | `authenticated` |
 | `exp` | now + 7 days | now + 1 hour (auto-refreshed by Supabase client) |
-| `app_metadata.offer_type` | bolt12 / lnurl / lightning_address | not set |
+| `app_metadata.offer_type` | bolt12 / manual_bolt11 | not set |
 | `app_metadata.is_website_user` | not set | true |
 
 ---
 
-## Supabase Realtime
+## Realtime / Pub-Sub Replacement
 
-| Table | Events | Use Case |
+In place of Supabase Realtime, we use Cloud SQL `LISTEN/NOTIFY` for cross-instance event distribution and our own WebSocket fan-out (in the host-agent for billing events; in the control plane for dashboard events).
+
+| Channel | When | Consumed By |
 |---|---|---|
-| `billing_intervals` | INSERT | Real-time Lightning billing feed |
-| `credit_transactions` | INSERT | Real-time credit deduction feed to dashboard |
-| `sandboxes` | UPDATE | Status and warning_level changes |
-| `agents` | UPDATE | Lightning balance changes |
-| `users` | UPDATE | Credit balance changes, warning_level changes |
-| `api_keys` | UPDATE | Revocation events visible to open dashboard sessions |
+| `apikey_revoked` | DELETE on `api_keys` | All control-plane instances (LRU cache eviction) |
+| `agent_balance_change` | INSERT on `top_up_intervals` (settled) | Dashboard WS connections |
+| `user_warning_level` | UPDATE on `users.warning_level` | Dashboard WS connections |
+| `host_status_change` | UPDATE on `host_vms.status` | All control-plane instances (host pool refresh) |
+| `tier_pricing_changed` | UPDATE on `tier_pricing` | All control-plane instances (in-memory price cache) |
+
+LISTEN connections are held in dedicated goroutines per instance (one per channel) with auto-reconnect on connection drop.
+
+For dashboard live updates, the control plane exposes `GET /v1/user/events` (HTTP/2 streaming response). The handler subscribes to the relevant LISTEN channels and forwards filtered events to the connected dashboard.
 
 ---
 
 ## Connection Pooling
 
-Unchanged. Supavisor transaction mode at port 6543. pgx pool: MaxConns 20, PreferSimpleProtocol true.
+`pgx` per-instance pool:
 
-The credit deduction transaction uses `pg_advisory_xact_lock` which is compatible with transaction-mode pooling (the lock is released at transaction end, and transaction mode guarantees a single connection for the duration of a transaction).
+| Setting | Value |
+|---|---|
+| `MaxConns` | 25 |
+| `MinConns` | 5 |
+| `MaxConnLifetime` | 30 min |
+| `MaxConnIdleTime` | 5 min |
+| `HealthCheckPeriod` | 1 min |
+
+The credit deduction transaction uses `pg_advisory_xact_lock` directly against this pool (no transaction-mode pooler in between, so locks behave exactly as documented).
+
+For a 30-instance MIG: `30 × 25 = 750` max connections, well within Cloud SQL's `db-custom-8-32768` ceiling of `200 × 8 = 1600` connections (configurable up to ~3000). Read replica adds capacity for heavy reads.
 
 ---
 
 ## Migration Strategy
 
+Migrations are managed by `dbmate` against Cloud SQL.
+
 | # | File | Description |
 |---|---|---|
-| 001 | `create_agents.sql` | L402 agent identities |
-| 002 | `create_users.sql` | **New** — website user accounts with credit balance |
-| 003 | `create_sandboxes.sql` | Sandboxes with billing_method, user_id, credits_consumed columns |
-| 004 | `create_billing_intervals.sql` | Lightning billing log |
+| 001 | `create_agents.sql` | Lightning agent identities + balance columns |
+| 002 | `create_users.sql` | Website user accounts with credit balance |
+| 003 | `create_sandboxes.sql` | Sandboxes with billing_method, host/snapshot/owner columns |
+| 004 | `create_billing_intervals.sql` | Lightning per-tick rollup |
 | 005 | `create_billing_partitions.sql` | Monthly partitions |
-| 006 | `create_host_vms.sql` | VM host pool |
-| 007 | `create_templates.sql` | Sandbox templates |
-| 008 | `create_tier_pricing.sql` | **New** — pricing table for both billing paths |
-| 009 | `create_pending_deposits.sql` | Lightning top-ups |
-| 010 | `create_api_keys.sql` | **New** — API keys linked to users |
-| 011 | `create_credit_transactions.sql` | **New** — credit ledger |
-| 012 | `create_credit_partitions.sql` | **New** — monthly partitions for credit_transactions |
-| 013 | `create_audit_log.sql` | Audit log with auth_method columns |
-| 014 | `enable_rls.sql` | Enable RLS on all tables |
-| 015 | `create_rls_policies.sql` | All RLS policies including new users/api_keys/credit_transactions |
-| 016 | `enable_realtime.sql` | Enable realtime on all monitored tables |
+| 006 | `create_top_up_intervals.sql` | New: Lightning top-up settlements |
+| 007 | `create_host_vms.sql` | VM host pool |
+| 008 | `create_templates.sql` | Sandbox templates |
+| 009 | `create_tier_pricing.sql` | Pricing in msats and cents-x100 |
+| 010 | `create_pending_deposits.sql` | Lightning manual deposits |
+| 011 | `create_api_keys.sql` | API keys |
+| 012 | `create_credit_transactions.sql` | Credit ledger (purchase, allocation, charge, refund) |
+| 013 | `create_credit_partitions.sql` | Monthly partitions |
+| 014 | `create_audit_log.sql` | Audit log with auth_method + instance_id |
+| 015 | `create_instance_leases.sql` | New: control-plane membership |
+| 016 | `create_rate_limit_buckets.sql` | New: cross-instance rate limits |
 | 017 | `seed_templates.sql` | Seed tier_pricing and templates |
+| 018 | `enable_listen_notify_triggers.sql` | Triggers that fire NOTIFY on relevant updates |
+
+(There is no `enable_rls.sql` or `create_rls_policies.sql`. RLS is unused.)
 
 ---
 
@@ -543,19 +468,18 @@ The credit deduction transaction uses `pg_advisory_xact_lock` which is compatibl
 
 | Variable | Description | Source |
 |---|---|---|
-| `SUPABASE_URL` | Project URL | Secret Manager |
-| `SUPABASE_SERVICE_KEY` | Service role key | Secret Manager |
-| `SUPABASE_JWT_SECRET` | JWT validation secret | Secret Manager |
-| `SUPABASE_DB_HOST` | Supavisor transaction mode hostname | Secret Manager |
-| `SUPABASE_DB_PORT` | 6543 | Env var |
-| `SUPABASE_DB_NAME` | postgres | Env var |
-| `SUPABASE_DB_USER` | postgres.{project_ref} | Secret Manager |
-| `SUPABASE_DB_PASSWORD` | Database password | Secret Manager |
-| `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret | Secret Manager |
-| `API_KEY_CACHE_TTL_SECS` | LRU cache TTL (default: 60) | Env var |
-| `API_KEY_CACHE_SIZE` | LRU cache max entries (default: 10000) | Env var |
-| `API_KEY_MAX_PER_USER` | Default max keys per user (default: 10) | Env var |
-| `LOW_CREDIT_THRESHOLD_CENTS` | Warning threshold (default: 100 = $1.00) | Env var |
+| `CLOUDSQL_HOST` | Cloud SQL private IP (`10.4.0.3`) | Env var |
+| `CLOUDSQL_PORT` | `5432` | Env var |
+| `CLOUDSQL_DB` | `sc` | Env var |
+| `CLOUDSQL_USER` | `control_plane` | Env var |
+| `CLOUDSQL_PASSWORD` | DB password | Secret Manager |
+| `CLOUDSQL_RO_HOST` | Read replica private IP | Env var |
+| `SUPABASE_JWT_SECRET` | JWT verify secret (verify only) | Secret Manager |
+| `SUPABASE_AUTH_URL` | For dashboard redirect (no server-side use) | Env var |
+| `STRIPE_WEBHOOK_SECRET` | Stripe signing secret | Secret Manager |
+| `API_KEY_CACHE_SIZE` | LRU max entries (default: 10000) | Env var |
+| `LOW_CREDIT_THRESHOLD_CENTS` | Default: 100 ($1.00) | Env var |
+| `LOW_BALANCE_THRESHOLD_MSATS` | Default: tier-dependent (set per tier) | Env var |
 
 ---
 
@@ -563,12 +487,22 @@ The credit deduction transaction uses `pg_advisory_xact_lock` which is compatibl
 
 | Metric | Type | Alert Threshold |
 |---|---|---|
-| `db_query_duration_ms` | Histogram by operation | Alert P99 > 200ms |
-| `db_pool_acquired` | Gauge | Alert if == MaxConns |
+| `db_query_duration_ms` | Histogram by op | Alert P99 > 100ms |
+| `db_pool_acquired` | Gauge | Alert if == MaxConns for > 60s |
+| `db_pool_acquire_wait_ms` | Histogram | Alert P99 > 50ms |
 | `db_connection_errors_total` | Counter | Alert if > 10/min |
-| `db_credit_deduction_failures_total` | Counter | Monitor — indicates users running out of credits |
-| `db_credit_lock_wait_ms` | Histogram | Alert P99 > 100ms (advisory lock contention) |
-| `api_key_cache_hits_total` | Counter | Monitor cache efficiency |
-| `api_key_cache_misses_total` | Counter | Monitor cache miss rate |
-| `api_key_auth_failures_total` | Counter | Alert if > 50/min |
-| `db_realtime_subscribers` | Gauge | Monitor concurrent subscribers |
+| `db_credit_allocation_failures_total` | Counter | Monitor — users running out of credits |
+| `db_credit_lock_wait_ms` | Histogram | Alert P99 > 100ms |
+| `db_listen_notify_received_total` | Counter | by channel |
+| `db_listen_notify_disconnects_total` | Counter | Alert if any non-zero (channel reconnect issue) |
+| `cloudsql_cpu_pct` | Gauge (Cloud Monitoring) | Alert > 80% for 10 min |
+| `cloudsql_replication_lag_ms` | Gauge | Alert > 5000 ms |
+
+---
+
+## Dependencies
+
+- **Cloud SQL for PostgreSQL** (Component 9) — primary data store
+- **Supabase Auth** — JWT issuance for website users
+- **GCP Secret Manager** for DB and JWT secrets
+- **Control Plane Binary** — every other component depends on this schema

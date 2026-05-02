@@ -1,27 +1,38 @@
-# Component 1: API Gateway & L402 Proxy
+# Component 1: API Gateway & Native L402
+
+## v2 changelog
+
+- Aperture sidecar removed entirely. L402 verification (macaroon HMAC chain + preimage check + caveat enforcement) is now native Go middleware in the control-plane binary at `internal/auth/l402.go`.
+- The gateway no longer terminates auth at a separate process; the GCP global LB simply load-balances HTTPS to the control-plane internal LB or the host-data internal LB based on URL path.
+- Added explicit path split: `/v1/*` and `/mcp/*` go to the control plane; `/h/{host_id}/*` goes to the per-host data plane via `ilb-host-data`. Data-plane requests carry a short-lived `data_jwt` minted by the control plane after the initial auth, so the host-agent verifies it locally without contacting the control plane.
+- Removed the `X-Auth-Bypass: api_key` indirection — there is no separate proxy to inform; one Go middleware sees the request and dispatches by `Authorization` scheme.
+- Pre-minted L402 BOLT11 invoice pool eliminates `lnd.AddInvoice` from the 402 response path.
+
+---
 
 ## Overview
 
-The API Gateway is the single public entry point for all traffic into Satoshi Compute. It consists of two layers running as sidecars on the same Cloud Run service: an **Nginx reverse proxy** handling TLS termination, rate limiting, and request routing, and an **Aperture L402 proxy** that gates every protected route behind a Lightning payment + macaroon credential check.
+The "API Gateway" is now just two pieces:
 
-No business logic lives here. The gateway's sole responsibilities are authentication enforcement, traffic shaping, and routing to the correct Go handler inside the unified binary.
+1. **GCP Global HTTPS LB** in front, with HTTP/3, Cloud Armor, and a URL map that routes by path prefix.
+2. **Native Go middleware** inside the control-plane binary that validates L402, JWT, and API key credentials in a single pass.
+
+There is no Aperture process, no Nginx, no sidecar. The control plane is the only thing that authenticates external traffic. Once a sandbox is created, host-data-plane traffic is authenticated by the host-agent itself using a JWT that the control plane signed at sandbox-create time.
 
 ---
 
 ## Responsibilities
 
-- Terminate HTTPS and enforce TLS 1.3 minimum
-- Rate-limit by IP and by agent identity (macaroon root key or API key hash)
-- Route `/v1/*` to the Go API module
-- Route `/mcp/*` to the Go MCP module
-- Gate L402-protected routes through Aperture (Lightning agents)
-- Pass API-key-authenticated requests directly to the Go binary, bypassing Aperture (Go binary validates the key)
-- Pass website user JWT requests directly to the Go binary for `/v1/user/*` routes (no L402 required)
-- Issue BOLT12-backed macaroons on first unauthenticated request to L402 routes (HTTP 402)
-- Verify macaroon + preimage on subsequent authenticated L402 requests
-- Forward verified agent identity headers to the Go binary
-- Return structured JSON error responses for auth failures
-- Log every request with sandbox_id and agent_id trace context
+- Terminate HTTPS at the global LB (managed certs, HTTP/3, anycast)
+- Rate-limit by IP at Cloud Armor (DDoS layer)
+- Rate-limit per-agent and per-API-key in Go middleware
+- Route `/v1/*` and `/mcp/*` to the control-plane internal LB
+- Route `/h/{host_id}/*` to the host-data internal LB
+- Inside the control plane: dispatch requests to the L402, API-key, or JWT validator based on the `Authorization` scheme
+- Issue L402 macaroons backed by a pre-minted BOLT11 invoice pool on first unauthenticated request to L402-gated routes
+- Mint a `data_jwt` (sandbox-scoped, short-lived) when a sandbox is created or resumed; embed in the response for the SDK to use against the host data plane
+- Verify, on the host-agent side, the `data_jwt` locally (no control-plane round-trip)
+- Return structured JSON error responses
 
 ---
 
@@ -29,47 +40,58 @@ No business logic lives here. The gateway's sole responsibilities are authentica
 
 | Component | Technology | Reason |
 |-----------|------------|--------|
-| L402 proxy | Aperture (Lightning Labs, Go) | Reference implementation; Aperture-native macaroon minting; integrates directly with LND gRPC |
-| TLS termination | GCP Cloud Load Balancer (upstream of Cloud Run) | Managed certs, anycast, no config needed |
-| Rate limiting | Aperture built-in + Cloud Armor (GCP) + Go middleware | Aperture rate-limits L402 sessions per macaroon; Go middleware rate-limits API key sessions; Cloud Armor rate-limits by IP |
-| Lightning node backend | LND 0.18+ with LNDK sidecar | Aperture requires LND; LNDK adds BOLT12 onion messaging |
+| Edge LB | GCP Global External HTTPS LB | Anycast, managed certs, HTTP/3 native, integrated Cloud Armor |
+| Native L402 verification | Go (own implementation, ports `gopkg.in/macaroon.v2` HMAC chain + preimage check) | Eliminates Aperture sidecar, ~1-2ms saved per request, single auth code path |
+| Rate limiting | Cloud Armor (IP) + Go middleware (per-agent / per-key) | One layer at the edge, one in-process for fine-grained limits |
+| Lightning node backend | LND HA pair (Component 9) + LNDK | BOLT12 onion messaging without leaving LND |
+| Macaroon library | `gopkg.in/macaroon.v2` (Go) | Standard implementation; matches Aperture's macaroon format for compatibility with existing L402 wallets |
 
 ---
 
 ## Authentication Methods
 
-The gateway supports three distinct authentication paths. All three ultimately resolve to an `agent_id` that is forwarded to the Go binary.
+The control-plane binary supports three distinct auth schemes, all dispatched by `internal/auth/middleware.go` looking at the `Authorization` header.
 
 | Method | Who Uses It | Header | Validated By | Billing |
 |---|---|---|---|---|
-| **L402 + Macaroon** | Lightning agents (programmatic, no account) | `Authorization: L402 <macaroon>:<preimage>` | Aperture sidecar (stateless crypto) | BOLT12 Lightning micropayments |
-| **API Key** | Website users' agents (MCP servers, SDK) | `Authorization: Bearer sc_live_...` | Go binary auth middleware (LRU cache → Supabase) | USD credit deduction from pre-purchased balance |
-| **Website User JWT** | Website dashboard calls to `/v1/user/*` | `Authorization: Bearer <supabase_jwt>` | Go binary `UserJWTMiddleware` (stateless JWT verify) | N/A (key management only) |
+| **L402 + Macaroon** | Lightning agents (programmatic) | `Authorization: L402 <macaroon>:<preimage>` | `internal/auth/l402.go` (stateless crypto + caveat check) | Prepaid msat balance (top-ups via BOLT12 — see Component 3) |
+| **API Key** | Website users' agents (MCP, SDK) | `Authorization: Bearer sockt_live_...` | `internal/auth/apikey.go` (LRU cache → Cloud SQL) | USD-cent credit deduction from prepaid balance |
+| **Website User JWT** | Website dashboard calls to `/v1/user/*` | `Authorization: Bearer <supabase_jwt>` | `internal/auth/jwt.go` (stateless JWT verify against Supabase JWKS) | N/A (key/credit management only) |
 
-Aperture only sees and processes requests using the L402 path. Requests using an API key or website JWT are **passed through Aperture untouched** — Aperture is configured to allow these routes through unconditionally, and the Go binary is solely responsible for validating them.
+All three resolve to a `principal` struct that downstream handlers consume:
+
+```
+type Principal struct {
+    Kind        AuthKind   // L402 | APIKey | UserJWT
+    AgentID     uuid.UUID  // for L402
+    UserID      uuid.UUID  // for APIKey, UserJWT
+    APIKeyID    uuid.UUID  // for APIKey
+    Caveats     map[string]string // for L402
+    BalanceKey  string     // hashed identity used for in-memory balance lookup
+}
+```
+
+There is no `X-Macaroon-Verified` style header; the auth result lives only in the request context.
 
 ---
 
 ## Route Classification
 
-### L402-Gated Routes (Aperture enforces payment)
+### L402-Gated Routes
 
-These routes require either a valid L402 credential or an API key. Aperture intercepts requests to these routes. If the request carries `Authorization: L402 ...`, Aperture verifies it. If the request carries `Authorization: Bearer sc_live_...`, Aperture is configured to forward it to the Go binary with an `X-Auth-Bypass: api_key` header, allowing the Go binary to handle validation.
+The middleware applies L402 verification when `Authorization: L402 ...` is present, or returns 402 if no `Authorization` header is set on these routes.
 
 | Route Prefix | Initial Price (sats) | Macaroon Capabilities | Notes |
 |---|---|---|---|
 | `POST /v1/wallet/offer` | 1 sat | `service=onboarding` | One-time: agent registers BOLT12 offer |
-| `POST /v1/sandbox/create` | 0 sat (price encoded in tier caveat) | `service=sandbox`, `tier=<tier>` | Tier caveat written at creation time |
-| `POST /v1/sandbox/{id}/exec` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Macaroon scoped to specific sandbox |
-| `GET /v1/sandbox/{id}/status` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Read-only, same macaroon |
-| `POST /v1/sandbox/{id}/files` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Write scoped to sandbox |
-| `GET /v1/sandbox/{id}/files` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Read scoped to sandbox |
-| `POST /v1/sandbox/{id}/pause` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Lifecycle op |
-| `POST /v1/sandbox/{id}/resume` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Lifecycle op |
-| `DELETE /v1/sandbox/{id}` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Termination |
+| `POST /v1/sandbox/create` | 0 sat (top-up funded) | `service=sandbox`, `tier=<tier>` | Tier caveat written at creation time; first top-up triggered server-side |
+| `POST /v1/sandbox/{id}/extend-balance` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Manual top-up trigger |
 | `GET /v1/billing/history` | 0 sat | `service=billing` | Billing ledger read |
+| `POST /v1/sandbox/{id}/delegate` | 0 sat | `service=sandbox`, `sandbox_id=<id>` | Macaroon attenuation for sub-agents |
 
-### Public Routes (no auth, Aperture passes through)
+All sandbox data-plane operations (`exec`, `read_file`, `write_file`, `shell`, `status`, `pause`, `resume`, `terminate`) are NOT on this list because they live on the host-data plane (`/h/{host_id}/sandbox/{id}/*`) and use `data_jwt` instead.
+
+### Public Routes
 
 | Route | Notes |
 |---|---|
@@ -77,57 +99,72 @@ These routes require either a valid L402 credential or an API key. Aperture inte
 | `GET /v1/templates` | Template catalog |
 | `GET /healthz` | Health check |
 
-### Website User Routes (JWT-only, Aperture passes through)
-
-These routes are excluded from Aperture's payment gate entirely. They are validated by the Go binary's `UserJWTMiddleware` using the Supabase Auth JWT from the website user's session.
+### Website User Routes (JWT only)
 
 | Method | Route | Description |
 |---|---|---|
 | `POST` | `/v1/user/api-keys` | Create a new API key |
-| `GET` | `/v1/user/api-keys` | List all API keys for the authenticated user |
-| `PATCH` | `/v1/user/api-keys/{id}` | Update key metadata (name, description, limits) |
+| `GET` | `/v1/user/api-keys` | List all API keys |
+| `PATCH` | `/v1/user/api-keys/{id}` | Update key metadata |
 | `DELETE` | `/v1/user/api-keys/{id}` | Revoke an API key |
-| `GET` | `/v1/user/profile` | Get website user profile and linked agent summary |
+| `GET` | `/v1/user/profile` | Get website user profile |
+| `GET` | `/v1/user/credits` | Get credit balance |
+| `GET` | `/v1/user/credits/history` | Credit transaction history |
 
-Aperture configuration explicitly excludes the `/v1/user/*` prefix from its service definitions. Requests to these routes bypass Aperture's invoice check entirely and are forwarded directly to the Go binary on `127.0.0.1:8081`.
+### Host Data Plane Routes (data_jwt only, terminated on host-agent)
+
+| Method | Route | Description |
+|---|---|---|
+| `POST` | `/h/{host_id}/sandbox/{id}/exec` | Execute a command |
+| `POST` | `/h/{host_id}/sandbox/{id}/files` | Write a file |
+| `GET` | `/h/{host_id}/sandbox/{id}/files` | Read a file |
+| `GET` | `/h/{host_id}/sandbox/{id}/files/list` | List files |
+| `GET` | `/h/{host_id}/sandbox/{id}/status` | Live status (CPU, mem, balance) |
+| `GET` | `/h/{host_id}/sandbox/{id}/shell` (WSS) | Interactive shell |
+
+These never reach the control plane (the global LB routes them straight to `ilb-host-data`).
 
 ---
 
-## Aperture Configuration
+## Native L402 Middleware Design
 
-### Service Definition
+### Macaroon Format
 
-Aperture is configured with a services file that maps URL path prefixes to backend addresses and pricing rules. Each service entry declares:
+Identical to Aperture's macaroon format so existing L402-aware wallets (Lexe, Alby, Voltage) interoperate without change. A macaroon contains:
 
-- **Host pattern** — the URL prefix to intercept
-- **Backend URL** — where to forward authenticated requests (the Go binary's internal port)
-- **Auth type** — `lnd` (Lightning invoice + macaroon)
-- **Price** — initial access price in satoshis
-- **Capabilities** — list of macaroon caveats Aperture will enforce
-- **Bypass header** — when `Authorization: Bearer sc_live_...` is detected, Aperture adds `X-Auth-Bypass: api_key` and forwards without issuing a 402
+- `id`: random 16-byte identifier (the platform's "key id" — used to look up the HMAC root key in Secret Manager)
+- `payment_hash`: 32-byte SHA-256 of the BOLT11 preimage that funds this macaroon
+- `caveats`: array of first-party caveats (`service=...`, `sandbox_id=...`, `expiry=...`, `readonly=...`, `max_duration_secs=...`)
+- `signature`: HMAC chain signature
 
-### Aperture Bypass Logic for API Keys
+### Verification Steps (per request)
 
-Aperture is configured with a **header-based bypass rule** for API key traffic:
+1. Parse `Authorization: L402 <macaroon_b64>:<preimage_hex>`
+2. Decode the macaroon
+3. Look up the HMAC root key for the macaroon's `id` from a per-process LRU cache (refilled from Secret Manager on miss)
+4. Recompute the HMAC chain over `id` + each caveat; compare to the macaroon's signature → reject on mismatch
+5. Compute `sha256(preimage_hex)`; compare to `payment_hash` → reject on mismatch
+6. Walk the caveats and reject if:
+   - `expiry` < now
+   - `service` does not match the requested route's service tag
+   - `sandbox_id` does not match the URL `{id}`
+   - `readonly=true` and the request method is not GET
+   - `max_duration_secs` exceeded since macaroon issuance
+7. Resolve `agent_id` from the macaroon's `id` → put on request context as `Principal{Kind: L402, AgentID: ...}`
+8. Continue to the handler
 
-- If the incoming `Authorization` header value starts with `Bearer sc_live_` or `Bearer sc_test_`: forward the request to the Go binary with `X-Auth-Bypass: api_key` set, without issuing a 402 or verifying a macaroon.
-- The Go binary's `APIKeyMiddleware` then performs the actual key validation.
-- If validation fails in the Go binary, it returns `401 Unauthorized` directly — Aperture is not involved in API key rejection.
+Total verification cost: one HMAC, one SHA-256, ~10 string comparisons. < 100µs in benchmarks.
 
-This design keeps Aperture as the sole L402 authority while adding API key support purely in Go without modifying Aperture's core logic.
+### Pre-Minted BOLT11 Invoice Pool
 
-### Macaroon Caveats Enforced by Aperture
+To remove the 50-200ms `lnd.AddInvoice` call from every 402 response, the payment module maintains an in-memory pool of unused BOLT11 invoices:
 
-Aperture enforces caveats at the proxy layer before the request reaches Go code. The Go binary trusts headers Aperture sets — it does not re-verify the macaroon. Caveats do not apply to API key requests.
+- Pool target size: 1000 invoices
+- Refill: background goroutine creates new invoices whenever the pool drops below 500
+- Each invoice expires in 1 hour; expired invoices are evicted
+- Each invoice has a fixed amount (1 sat) for L402 onboarding; per-route price differences are handled by minting on demand for non-onboarding routes (rare)
 
-| Caveat Key | Example Value | Enforcement Rule |
-|---|---|---|
-| `service` | `sandbox` | Request path must match service category |
-| `tier` | `micro` | Only used for billing pre-authorization logging |
-| `sandbox_id` | `uuid` | `{id}` in the URL path must equal this value |
-| `max_duration_secs` | `3600` | Aperture checks wall clock against macaroon issue time |
-| `expiry` | `unix timestamp` | Hard expiry; Aperture rejects expired macaroons |
-| `readonly` | `true` | Aperture blocks POST/PUT/DELETE for read-only delegated macaroons |
+When a 402 response is needed, the middleware pulls one invoice from the pool, builds the macaroon binding `payment_hash = sha256(preimage)` (the preimage is generated when the invoice was minted and stored alongside it), and returns both. P50 latency for 402 responses drops from ~150ms to ~5ms.
 
 ---
 
@@ -135,52 +172,44 @@ Aperture enforces caveats at the proxy layer before the request reaches Go code.
 
 ### Step 1: Initial Unauthenticated Request
 
-Agent sends any `POST /v1/sandbox/create` without an `Authorization` header.
+Agent sends `POST /v1/sandbox/create` without an `Authorization` header.
 
-Aperture intercepts and responds:
+The control-plane middleware responds:
 
 ```
 HTTP/1.1 402 Payment Required
-WWW-Authenticate: L402 token="<base64_macaroon>", invoice="<BOLT12_or_BOLT11_invoice>"
+WWW-Authenticate: L402 token="<base64_macaroon>", invoice="<BOLT11_invoice>"
 Content-Type: application/json
 
 {
   "code": 402,
   "error": "payment_required",
   "token": "<base64_macaroon>",
-  "invoice": "<BOLT12_offer_or_BOLT11_invoice>",
+  "invoice": "<BOLT11_invoice>",
   "amount_sats": 1,
   "message": "Pay the invoice and retry with Authorization: L402 <token>:<preimage>"
 }
 ```
 
+(The macaroon and invoice come from the pre-minted pool; total handler latency for this response is ~5ms.)
+
 ### Step 2: Agent Pays Invoice
 
-The agent pays the invoice using its Lexe wallet and receives a preimage (32-byte secret).
+The agent pays via its Lexe wallet (or any L402-compatible wallet) and obtains the preimage.
 
 ### Step 3: Authenticated Retry
-
-Agent retries the original request with:
 
 ```
 Authorization: L402 <base64_macaroon>:<hex_preimage>
 ```
 
-### Step 4: Aperture Verifies
+### Step 4: Native Middleware Verifies
 
-Aperture performs stateless verification:
-1. Decode the macaroon — check HMAC chain integrity
-2. Verify the payment hash in the macaroon matches `sha256(preimage)`
-3. Check all caveats (expiry, service, sandbox_id)
-4. If all pass: forward request to Go binary with `X-Macaroon-Verified: true` and `X-Agent-Caveats: <json>`
-5. If any fail: return `HTTP 401 Unauthorized` with structured error
+Steps 1–8 from "Verification Steps" above. On success, the request proceeds to `HandleCreateSandbox`.
 
-### Step 5: Go Binary Trusts Forwarded Headers
+### Step 5: Top-Up Triggered Server-Side
 
-The Go `api` module reads:
-- `X-Agent-ID` — agent UUID extracted from macaroon root key identifier
-- `X-Macaroon-Caveats` — JSON-encoded caveat map for business logic use
-- `X-Macaroon-Verified` — must be `true` or request is rejected at Go middleware level
+`HandleCreateSandbox` calls `payment.TopUpBalance(agent_id, initial_chunk_sats)` which uses the macaroon binding to identify the agent's BOLT12 offer and pulls the initial balance. If this fails, the sandbox creation rolls back. If it succeeds, the sandbox starts with a positive balance and the billing engine takes over (Component 3).
 
 ---
 
@@ -188,105 +217,116 @@ The Go `api` module reads:
 
 ### Step 1: Agent Sends API Key
 
-Agent (e.g., MCP server configured by a website user) sends:
-
 ```
 POST /v1/sandbox/create
-Authorization: Bearer sc_live_aB3xK9mPqR7vNwYzL2cD5eF8gH1jI4k
+Authorization: Bearer sockt_live_aB3xK9mPqR7vNwYzL2cD5eF8gH1jI4k
 Content-Type: application/json
 ```
 
-### Step 2: Aperture Bypasses
+### Step 2: Native Middleware Validates
 
-Aperture detects the `Bearer sc_live_` prefix, adds `X-Auth-Bypass: api_key` header, and forwards the request unchanged to the Go binary on `127.0.0.1:8081`.
+The single `AuthMiddleware` sees `Bearer sockt_live_...` and dispatches to `internal/auth/apikey.go`:
 
-### Step 3: Go Binary APIKeyMiddleware Validates
+1. Extract the raw key
+2. Compute `key_hash = SHA-256(raw_key)`
+3. Check the per-instance LRU cache for `key_hash`:
+   - **Cache hit:** use cached `{user_id, allowed_tiers, is_active, expires_at, ip_allowlist, rate_limit_rpm}`
+   - **Cache miss:** query Cloud SQL `api_keys` table by `key_hash` and populate cache
+4. Validate active/expiry/IP allowlist/tier
+5. Update `last_used_at` asynchronously (fire-and-forget)
+6. Set `Principal{Kind: APIKey, UserID: ..., APIKeyID: ...}` on context
 
-The Go `APIKeyMiddleware` runs before any route handler:
+### Cache Invalidation Across Instances
 
-1. Extracts the raw key from `Authorization: Bearer {raw_key}`
-2. Computes `key_hash = SHA-256(raw_key)`
-3. Checks the in-process LRU cache for `key_hash`:
-   - **Cache hit:** Use cached `{agent_id, allowed_tiers, is_active, expires_at}`
-   - **Cache miss:** Query Supabase `api_keys` table by `key_hash`; populate cache
-4. Validates:
-   - `is_active = true` — key is not revoked
-   - `expires_at IS NULL OR expires_at > now()` — key is not expired
-   - `ip_allowlist IS NULL OR request_ip IN ip_allowlist` — IP is allowed
-   - `allowed_tiers IS NULL OR requested_tier IN allowed_tiers` — tier is permitted
-5. Updates `api_keys.last_used_at = now()` asynchronously (fire-and-forget, non-blocking)
-6. Sets internal request context: `agent_id`, `auth_method = "api_key"`, `api_key_id`
-7. Proceeds to route handler
+API key revocation must propagate sub-second across all control-plane instances. Mechanism:
 
-### Step 4: Route Handler Executes Normally
+- `DELETE /v1/user/api-keys/{id}` issues `NOTIFY apikey_revoked, '<api_key_id>'` on Cloud SQL after marking `is_active = false`
+- Each control-plane instance holds a `LISTEN apikey_revoked` connection in a dedicated goroutine
+- On notification, the local LRU cache evicts every entry whose `api_key_id` matches
 
-The route handler (e.g., `HandleCreateSandbox`) reads `agent_id` from request context. It does not know or care whether authentication was via L402 or API key. All billing, orchestration, and audit logic is identical for both paths.
+This replaces the 60s LRU TTL revocation lag with sub-second invalidation.
 
 ### Step 5: Failure Cases
 
 | Condition | Response |
 |---|---|
 | Key not found in DB | `401 Unauthorized`, `error: invalid_api_key` |
-| Key found but `is_active = false` | `401 Unauthorized`, `error: api_key_revoked` |
+| `is_active = false` | `401 Unauthorized`, `error: api_key_revoked` |
 | Key expired | `401 Unauthorized`, `error: api_key_expired` |
 | IP not in allowlist | `403 Forbidden`, `error: ip_not_allowed` |
-| Tier not in allowed_tiers | `403 Forbidden`, `error: tier_not_allowed` |
+| Tier not in `allowed_tiers` | `403 Forbidden`, `error: tier_not_allowed` |
 
 ---
 
 ## Macaroon Delegation (Sub-Agent Support)
 
-An orchestrator agent can attenuate its sandbox macaroon and delegate it to a sub-agent with fewer permissions. This applies only to L402-authenticated agents. API key holders may use the `POST /v1/sandbox/{id}/delegate` endpoint to generate a scoped L402 macaroon for sub-agents, even if the parent request was authenticated via API key.
+Unchanged in spirit: the `POST /v1/sandbox/{id}/delegate` endpoint produces an attenuated macaroon. The endpoint runs inside the native L402 middleware now (no Aperture). Delegation rules:
 
-### Delegation Rules
+- Holder may only **add** caveats, never remove
+- `readonly=true` blocks POST/PUT/DELETE
+- `max_duration_secs` restricts the sub-agent's session
+- `sandbox_id=<uuid>` pins to a specific sandbox
 
-- The holder may only **add** caveats, never remove them
-- A macaroon with `readonly=true` allows GET requests only
-- A macaroon with `max_duration_secs=300` restricts the sub-agent to 5 minutes
-- A macaroon with `sandbox_id=<specific_uuid>` cannot be used on any other sandbox
+API-key holders can still call this endpoint to obtain an L402 macaroon for sub-agents; the resulting macaroon is funded by the user's credit balance (a single deduction is recorded for the delegation issuance).
 
-### Delegation Endpoint (handled by Go api module, not Aperture)
+---
 
-`POST /v1/sandbox/{id}/delegate`
+## Data-Plane JWT (`data_jwt`)
 
-Request body:
-- `additional_caveats` — object: key-value pairs to append
-- `expiry_secs` — integer: relative expiry for the delegated token
+The control plane mints a `data_jwt` whenever a sandbox transitions to `running` (on create or resume). The agent receives it in the response and includes it on every host-data-plane call.
 
-Response:
-- `delegated_token` — new base64-encoded attenuated macaroon
-- `expiry_at` — absolute UTC timestamp
+### `data_jwt` Claims
+
+| Claim | Value |
+|---|---|
+| `iss` | `sockt-cp` |
+| `aud` | `host-data-plane` |
+| `sub` | `sandbox_id` |
+| `host_id` | the host VM the sandbox lives on |
+| `principal_kind` | `l402` or `api_key` |
+| `agent_id` or `user_id` | the owner |
+| `iat` | issuance time |
+| `exp` | iat + 1 hour |
+| `scope` | array: `exec`, `files`, `shell`, `status` |
+| `readonly` | true if delegated readonly |
+
+Signed with HS256 using `wss-jwt-secret` from Secret Manager. The host-agent loads the same secret at startup and verifies tokens locally — no control-plane round-trip per data-plane request.
+
+### Refresh
+
+The SDK proactively refreshes `data_jwt` when it has < 10 minutes remaining by calling `POST /v1/sandbox/{id}/refresh-data-jwt` against the control plane. The control plane verifies the original L402/API-key auth, looks up the sandbox's current `host_id`, and mints a new `data_jwt`. This also handles the case where the sandbox was resumed onto a different host.
 
 ---
 
 ## Rate Limiting Rules
 
-### Layer 1: Cloud Armor (IP-level, before Cloud Run)
+### Layer 1: Cloud Armor (IP-level, before LB)
 
 | Rule | Threshold | Action |
 |---|---|---|
 | Per-IP requests/minute | 300 | Throttle (429) |
 | Per-IP requests/minute | 600 | Block (403) |
-| Known Tor exit node | Any | Block (403) — optional, configurable |
+| Known Tor exit node | Any | Block (403) — optional |
 
-### Layer 2: Aperture (per-macaroon-root-key, L402 only)
+### Layer 2: Control-Plane Middleware (per-principal)
 
-| Rule | Threshold | Action |
+A token bucket per `Principal.BalanceKey` enforced in `internal/auth/ratelimit.go`:
+
+| Rule | L402 Default | API Key Default | Override |
+|---|---|---|---|
+| Requests per minute | 300 | 300 | `api_keys.rate_limit_rpm` per key |
+| Sandbox creates per minute | 20 | 20 | Plan-based |
+| Concurrent open sandboxes | 50 | `users.max_concurrent_sandboxes` | Per-user limit for API keys |
+
+Cross-instance coordination uses a Cloud SQL `rate_limit_buckets` table sampled every 5s (good enough for 300 rpm thresholds; sub-second cross-instance precision isn't needed at these limits).
+
+### Layer 3: Host-Agent (per-data_jwt)
+
+| Rule | Default | Override |
 |---|---|---|
-| Exec calls per second | 10 | Throttle (429) |
-| Sandbox creations per minute | 20 | Throttle (429) |
-| Concurrent open sandboxes | 50 | Reject (429) |
-
-### Layer 3: Go Binary Middleware (API key sessions)
-
-The Go binary applies its own rate limits for API key authenticated requests, using a per-`api_key_id` token bucket stored in-process.
-
-| Rule | Default Threshold | Override |
-|---|---|---|
-| Requests per minute | 300 | `api_keys.rate_limit_rpm` overrides this per key |
 | Exec calls per second | 10 | Not overrideable |
-| Sandbox creations per minute | 20 | Not overrideable |
-| Concurrent open sandboxes | 50 | Not overrideable |
+| Concurrent shell connections | 3 per sandbox | Not overrideable |
+| Input frame rate (WSS) | 100/sec | Not overrideable |
 
 ---
 
@@ -316,104 +356,83 @@ All authentication and gateway errors return a consistent JSON body:
 | `api_key_expired` | 401 | API key has passed its expiry date |
 | `ip_not_allowed` | 403 | Request IP not in API key allowlist |
 | `tier_not_allowed` | 403 | Requested tier not in API key allowed_tiers |
+| `data_jwt_invalid` | 401 | host-agent rejected the data-plane JWT |
+| `data_jwt_expired` | 401 | data_jwt past `exp`; SDK should refresh |
+| `host_unreachable` | 503 | host-agent not responding; failover in progress |
 | `rate_limited` | 429 | Too many requests |
-| `service_unavailable` | 503 | Go binary health check failing |
+| `service_unavailable` | 503 | Control plane health check failing |
 
 ---
 
-## Headers Passed to Go Binary (Trusted Internal Headers)
+## Headers Set by Middleware (Trusted Internal Headers)
 
-These headers are set by Aperture or by Aperture's bypass logic and must not be accepted from external clients. The Go binary's middleware strips any of these headers that arrive from outside the Aperture trust boundary.
-
-### Set by Aperture for L402 requests
+The native middleware places auth context on the Go request context, not on HTTP headers — there is no longer an HTTP boundary between auth and handler. The only HTTP headers that survive into handlers are:
 
 | Header | Content |
 |---|---|
-| `X-Macaroon-Verified` | `true` |
-| `X-Agent-ID` | Agent UUID derived from macaroon root key |
-| `X-Agent-Tier` | Tier caveat value (e.g., `micro`) |
-| `X-Sandbox-ID` | sandbox_id caveat value, if present |
-| `X-Macaroon-Expiry` | Unix timestamp of macaroon expiry |
-| `X-Macaroon-Readonly` | `true` if readonly caveat present |
-| `X-Request-ID` | UUID generated by Aperture for trace correlation |
+| `X-Request-ID` | UUID generated per request |
 
-### Set by Aperture for API key requests (bypass path)
-
-| Header | Content |
-|---|---|
-| `X-Auth-Bypass` | `api_key` |
-| `X-Request-ID` | UUID generated by Aperture for trace correlation |
-
-The Go binary's `APIKeyMiddleware` reads `X-Auth-Bypass: api_key` and performs its own validation, setting `agent_id` and `auth_method` in the request context internally.
+External clients cannot influence the in-process Principal struct.
 
 ---
 
 ## MCP Server Configuration (API Key Path)
 
-Website users who set up an MCP server configure it with their API key instead of a Lexe wallet. The `@satoshi-compute/mcp-server` npm package accepts API key configuration:
+Website users who set up an MCP server configure it with their API key:
 
 ```json
 {
   "mcpServers": {
-    "satoshi-compute": {
+    "sockt": {
       "command": "npx",
-      "args": ["-y", "@satoshi-compute/mcp-server"],
+      "args": ["-y", "@sockt/mcp-server"],
       "env": {
-        "SATOSHI_API_URL": "https://api.satoshicompute.io",
-        "SATOSHI_API_KEY": "sc_live_aB3xK9mPqR7vNwYzL2cD5eF8gH1jI4k"
+        "SOCKT_API_URL": "https://api.sockt.io",
+        "SOCKT_API_KEY": "sockt_live_aB3xK9mPqR7vNwYzL2cD5eF8gH1jI4k"
       }
     }
   }
 }
 ```
 
-When `SATOSHI_API_KEY` is set, the MCP proxy sends `Authorization: Bearer sc_live_...` on all requests and skips the L402 + Lexe wallet payment flow entirely. Compute costs are deducted from the website user's pre-purchased credit balance instead of Lightning payments. No Lightning node or BOLT12 offer is required for API key users.
+When `SOCKT_API_KEY` is set, the MCP proxy sends `Authorization: Bearer sockt_live_...` on all control-plane requests and skips the L402 + Lexe wallet payment flow entirely. After `sandbox.create`, the proxy starts using the returned `data_endpoint` + `data_jwt` for tool calls that need data-plane reach (`exec`, `write_file`, etc.).
 
 ---
 
-## Deployment on Cloud Run
+## Deployment Notes
 
-Aperture runs as a **sidecar container** in the same Cloud Run service revision as the Go binary. The two containers share a loopback network namespace.
+There is no per-service-binary sidecar to deploy. The control plane is a single Go binary on `mig-control-plane`:
 
-### Container Startup Order
-
-1. Go binary starts and binds to `127.0.0.1:8081`
-2. Aperture starts and binds to `0.0.0.0:8080` (the public port)
-3. Aperture connects to LND gRPC at `10.0.0.5:10009` (VPC internal)
-4. Cloud Run health check polls `GET /healthz` on port 8080 (Aperture forwards to Go `/healthz`)
-
-### Environment Variables (Aperture)
-
-| Variable | Value |
-|---|---|
-| `APERTURE_LND_HOST` | `10.0.0.5:10009` |
-| `APERTURE_LND_MACAROON_PATH` | `/secrets/lnd-invoice-macaroon` |
-| `APERTURE_LND_TLS_CERT_PATH` | `/secrets/lnd-tls-cert` |
-| `APERTURE_BACKEND_URL` | `http://127.0.0.1:8081` |
-| `APERTURE_SERVICES_CONFIG` | `/config/aperture-services.yaml` |
-| `APERTURE_DEBUG` | `false` |
+- Binds plain HTTP on `:8081` (the internal LB terminates TLS for the control path; mTLS isn't required between the LB and the MIG since traffic is already in-VPC)
+- Loads `wss-jwt-secret`, `host-agent-mtls-ca` (client cert for talking to host-agents), `cloudsql-password`, `lnd-tls-cert`, `lnd-invoice-macaroon`, `supabase-jwt-secret` from Secret Manager at startup
+- Connects to Cloud SQL primary via private IP at `10.4.0.3:5432`
+- Connects to active LND via private IP at `10.0.0.5:10009` (with failover discovery via the `lnd-active` GCE label)
+- Joins the cluster gossip on `:7444`
 
 ---
 
 ## Observability
 
-### Metrics (exported to Cloud Monitoring)
+### Metrics (Prometheus, scraped by Cloud Monitoring)
 
 | Metric | Type | Labels |
 |---|---|---|
-| `aperture_requests_total` | Counter | route, status_code, auth_result |
-| `aperture_402_issued_total` | Counter | route, invoice_type (bolt11/bolt12) |
-| `aperture_macaroon_verify_duration_ms` | Histogram | result (ok/fail) |
-| `aperture_rate_limit_hits_total` | Counter | rule_name |
-| `gateway_api_key_auth_total` | Counter | result (ok/revoked/expired/not_found) |
-| `gateway_api_key_cache_hit_ratio` | Gauge | — |
+| `auth_l402_verify_duration_us` | Histogram | result (ok/fail) |
+| `auth_l402_402_issued_total` | Counter | route |
+| `auth_l402_invoice_pool_size` | Gauge | — |
+| `auth_l402_invoice_pool_misses_total` | Counter | — |
+| `auth_apikey_lookup_duration_ms` | Histogram | source (cache/db) |
+| `auth_apikey_cache_hit_ratio` | Gauge | — |
+| `auth_apikey_revocation_propagation_ms` | Histogram | — |
+| `auth_jwt_verify_duration_us` | Histogram | — |
+| `auth_data_jwt_minted_total` | Counter | scope |
 
 ### Structured Log Fields (every request)
 
 - `request_id` — UUID
-- `agent_id` — if authenticated (either path)
-- `auth_method` — `l402`, `api_key`, `user_jwt`, or `unauthenticated`
-- `api_key_id` — if API key auth (key UUID, not the raw key)
+- `agent_id` or `user_id` — set after auth
+- `auth_method` — `l402`, `api_key`, `user_jwt`, `data_jwt`, or `unauthenticated`
+- `api_key_id` — if API key auth
 - `route` — path + method
 - `auth_result` — `pass`, `fail_preimage`, `fail_caveat`, `fail_expiry`, `invalid_api_key`, `api_key_revoked`, `unauthenticated`
 - `status_code`
@@ -423,19 +442,21 @@ Aperture runs as a **sidecar container** in the same Cloud Run service revision 
 
 ## Security Considerations
 
-- Aperture must only accept LND connections over mTLS
-- The LND macaroon used by Aperture must be scoped to `invoice:read` and `invoice:write` only — never an admin macaroon
-- Internal trust headers (`X-Macaroon-Verified`, `X-Auth-Bypass`, etc.) must be stripped at the Aperture ingress layer if they arrive from external clients
-- All secrets (LND macaroon, TLS cert) are mounted from GCP Secret Manager as volume mounts — never environment variables
-- Aperture access logs must be shipped to Cloud Logging with no plaintext macaroon values (truncate after first 8 chars)
-- Raw API keys must never appear in logs. The Go middleware logs only `api_key_id` (the UUID) and `key_prefix` (first 12 chars of the key)
-- The `key_hash` column in Supabase is excluded from all RLS SELECT policies — external Supabase clients cannot read it
+- The macaroon HMAC root key is loaded once at startup and held only in memory. Rotation requires a rolling restart and a key-id bump.
+- LND macaroon used by the payment module is scoped to `invoice:read`, `invoice:write`, `offchain:read`, `offchain:write` — never an admin macaroon.
+- All secrets (LND macaroon, TLS cert, JWT secrets) are mounted from GCP Secret Manager via the metadata server — never written to disk on the GCE instance.
+- Logs scrub macaroon and preimage values (truncated to 8 chars).
+- Raw API keys never appear in logs. Only `api_key_id` and `key_prefix` (first 12 chars).
+- The `key_hash` column has no SELECT policy for any role except the control-plane service account.
+- `data_jwt` validation on host-agents uses constant-time HMAC comparison.
 
 ---
 
 ## Dependencies
 
-- LND node (Component 5: Payment Module) must be running and reachable at `10.0.0.5:10009`
-- GCP Cloud Load Balancer (Component 9: GCP Infrastructure) for upstream TLS termination
-- Go unified binary (Component 2) must be healthy for Aperture to forward requests
-- Supabase `api_keys` table (Component 6) for API key lookup on cache miss
+- LND HA pair (Component 5: Payment Module) reachable at `10.0.0.5:10009` (with failover to `10.0.0.6`)
+- GCP Global LB + Cloud Armor (Component 9: GCP Infrastructure)
+- Control-plane binary (Component 2) — auth lives inside it
+- Cloud SQL (Component 6) for `api_keys`, `agents`, and `rate_limit_buckets` tables
+- GCP Secret Manager for all key material
+- Per-host `host-agent` binaries (Component 4) verify `data_jwt` independently
