@@ -126,7 +126,7 @@ The session is destroyed on stream close, on 30 minutes of inactivity, or when t
 - `duration_ms` (integer)
 - `timed_out` (boolean)
 
-**Implementation:** the MCP server looks up `sandboxes.host_vm_id`, mints a fresh `data_jwt` (with `scope=exec`), and POSTs to `https://api.sockt.io/h/{host_id}/sandbox/{id}/exec` with the JWT. The response is forwarded to the LLM as the tool result.
+**Implementation:** the MCP server looks up `sandboxes.host_vm_id`, mints a fresh `data_jwt` (with `scope=exec`), and POSTs to `https://api.sockt.dev/h/{host_id}/sandbox/{id}/exec` with the JWT. The response is forwarded to the LLM as the tool result.
 
 **Errors:**
 - `NOT_FOUND` — Sandbox does not exist or belongs to another agent/user
@@ -325,7 +325,7 @@ Current tier pricing in msats/second and usd-cents/second.
       "command": "npx",
       "args": ["-y", "@sockt/mcp-server"],
       "env": {
-        "SOCKT_API_URL": "https://api.sockt.io",
+        "SOCKT_API_URL": "https://api.sockt.dev",
         "SOCKT_API_KEY": "sockt_live_aB3xK9mPqR7vNwYzL2cD5eF8gH1jI4k"
       }
     }
@@ -342,7 +342,7 @@ Current tier pricing in msats/second and usd-cents/second.
       "command": "npx",
       "args": ["-y", "@sockt/mcp-server"],
       "env": {
-        "SOCKT_API_URL": "https://api.sockt.io",
+        "SOCKT_API_URL": "https://api.sockt.dev",
         "AGENT_JWT": "eyJ...",
         "LEXE_SEED_PATH": "~/.lexe/seedphrase.txt"
       }
@@ -359,7 +359,7 @@ The `@sockt/mcp-server` npm package is a thin Node.js process that:
 ### Direct MCP Streamable HTTP (for native MCP clients)
 
 ```
-POST https://api.sockt.io/mcp/stream
+POST https://api.sockt.dev/mcp/stream
 Authorization: Bearer {jwt}
 Content-Type: application/json
 ```

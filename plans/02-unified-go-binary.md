@@ -383,10 +383,10 @@ Unchanged in spec. Validates the BOLT12 offer locally, creates an `agents` row w
   "tier": "micro",
   "runtime": "firecracker",
   "template": "python3",
-  "data_endpoint": "https://api.sockt.io/h/vm-host-pool-001/sandbox/{id}",
+  "data_endpoint": "https://api.sockt.dev/h/vm-host-pool-001/sandbox/{id}",
   "data_jwt": "eyJ...",
   "data_jwt_expires_at": "ISO8601",
-  "shell_url": "wss://api.sockt.io/h/vm-host-pool-001/sandbox/{id}/shell",
+  "shell_url": "wss://api.sockt.dev/h/vm-host-pool-001/sandbox/{id}/shell",
   "sats_per_second": 2.0,
   "initial_balance_sats": 600,
   "host_vm": "vm-host-pool-001",
@@ -440,9 +440,9 @@ Unchanged in spec. Validates the BOLT12 offer locally, creates an `agents` row w
 {
   "sandbox_id": "uuid",
   "status": "running",
-  "data_endpoint": "https://api.sockt.io/h/{new_host_id}/sandbox/{id}",
+  "data_endpoint": "https://api.sockt.dev/h/{new_host_id}/sandbox/{id}",
   "data_jwt": "eyJ...",
-  "shell_url": "wss://api.sockt.io/h/{new_host_id}/sandbox/{id}/shell",
+  "shell_url": "wss://api.sockt.dev/h/{new_host_id}/sandbox/{id}/shell",
   "resumed_at": "ISO8601",
   "resumed_from": "host_local_ssd | gcs"
 }

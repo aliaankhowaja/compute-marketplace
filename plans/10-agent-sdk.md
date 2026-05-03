@@ -6,7 +6,7 @@
 - The SDK transparently refreshes `data_jwt` (and the underlying `data_endpoint`, in case the sandbox migrated to a new host) by calling `POST /v1/sandbox/{id}/refresh-data-jwt` when the JWT has < 10 min remaining or when a 401 `data_jwt_expired` is returned.
 - The L402 retry loop is replaced with **one-shot top-up handling**: the SDK pays one initial L402 challenge at registration time and then never sees a 402 again. All subsequent funding flows through the platform's prepaid balance + threshold top-up; the SDK observes `low_balance` events on the WSS but does not perform L402 payments per call.
 - Streamable HTTP MCP transport replaces SSE in the npm `@sockt/mcp-server` package (lockstep with Component 7).
-- Per-sandbox WebSocket shell connects directly to the host-agent URL (`wss://api.sockt.io/h/{host_id}/sandbox/{id}/shell?token={data_jwt}`).
+- Per-sandbox WebSocket shell connects directly to the host-agent URL (`wss://api.sockt.dev/h/{host_id}/sandbox/{id}/shell?token={data_jwt}`).
 - New SDK error class `HostUnreachableError` for transient host-data-plane failures (typically resolved by `data_jwt` refresh, which the SDK does automatically with one retry before raising).
 
 ---
@@ -37,7 +37,7 @@ The main entry point. Handles L402 onboarding, JWT management, control-plane API
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `api_url` | str | Yes | Sockt API base URL (e.g. `https://api.sockt.io`) |
+| `api_url` | str | Yes | Sockt API base URL (e.g. `https://api.sockt.dev`) |
 | `bolt12_offer` | str | No | Pre-registered BOLT12 offer string. Skips registration when present. |
 | `lexe_seed_path` | str | No | Path to Lexe seed file. Required if `bolt12_offer` is not pre-registered. |
 | `lexe_env` | str | No | `mainnet` or `testnet` (default: mainnet) |
@@ -384,7 +384,7 @@ npx @sockt/mcp-server
 ### Test Mode
 
 Both SDKs support a test mode that points to a Sockt testnet deployment:
-- `api_url = "https://test.sockt.io"`
+- `api_url = "https://test.sockt.dev"`
 - `lexe_env = "testnet"`
 - Testnet sats; testnet sandboxes have lower resource limits but identical API
 

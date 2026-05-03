@@ -14,7 +14,7 @@
 
 In MVP, the gateway is the Cloud Run control-plane service itself:
 
-- one public HTTPS endpoint (`api.sockt.io`)
+- one public HTTPS endpoint (`api.sockt.dev`)
 - in-process auth middleware
 - no sidecars, no external proxy tier
 
@@ -127,7 +127,7 @@ No Cloud Armor dependency in MVP.
 ## Deployment Notes
 
 - deploy as Cloud Run service
-- custom domain mapping for `api.sockt.io`
+- custom domain mapping for `api.sockt.dev`
 - auth, routing, and error handling all in app code
 
 ---

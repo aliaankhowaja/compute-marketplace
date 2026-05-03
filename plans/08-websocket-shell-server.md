@@ -3,7 +3,7 @@
 ## v2 changelog
 
 - The WSS endpoint moves entirely off the control plane and onto the **host-agent** running on each host VM. WSS connections terminate on the same VM that runs the sandbox; the control plane is no longer in the data path.
-- The agent connects to a host-aware URL: `wss://api.sockt.io/h/{host_id}/sandbox/{id}/shell`. The global LB routes by path prefix to the internal `ilb-host-data`, which routes to the named host's `:8443`.
+- The agent connects to a host-aware URL: `wss://api.sockt.dev/h/{host_id}/sandbox/{id}/shell`. The global LB routes by path prefix to the internal `ilb-host-data`, which routes to the named host's `:8443`.
 - The control plane mints `wss_token` (a `data_jwt` with `scope=shell`) at sandbox creation/resume time. The host-agent verifies the JWT locally — no control-plane round-trip.
 - Billing-event fan-out is now an **in-process channel inside the host-agent**. The control plane pushes `BalanceUpdate` to the host-agent via the gRPC `UpdateBalance` RPC; the host-agent broadcasts to local WSS clients. No cross-instance fan-out is needed because the WSS terminates on the host that owns the sandbox.
 - `wss_token` schema unified with `data_jwt` (Component 1); shell connections also accept the broader `data_jwt` so the SDK can use one credential for `/exec` and `/shell`.
@@ -38,7 +38,7 @@ There is no Cloud Run, no VPC connector, no Aperture, no extra control-plane hop
 ### Connection URL Format
 
 ```
-wss://api.sockt.io/h/{host_id}/sandbox/{sandbox_id}/shell?token={data_jwt}
+wss://api.sockt.dev/h/{host_id}/sandbox/{sandbox_id}/shell?token={data_jwt}
 ```
 
 The `{host_id}` is returned by the control plane in `sandbox.create` (or refreshed via `/v1/sandbox/{id}/refresh-data-jwt`). The SDK reads `data_endpoint` from the create response and uses it directly.

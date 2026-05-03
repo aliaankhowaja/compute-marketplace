@@ -27,7 +27,7 @@ But data-plane routing now targets runtime pods directly via RunPod URLs.
 
 Control-plane API:
 
-- `https://api.sockt.io/v1/...`
+- `https://api.sockt.dev/v1/...`
 
 Data-plane per sandbox:
 

@@ -150,7 +150,7 @@ This is a deliberate single point of failure for MVP cost control. Phase 2 resto
 For MVP, use:
 
 - Cloud Run managed HTTPS endpoint
-- custom domain mapping for `api.sockt.io`
+- custom domain mapping for `api.sockt.dev`
 - optional Cloudflare free plan in front (DNS + basic WAF)
 
 Deferred to Phase 2:

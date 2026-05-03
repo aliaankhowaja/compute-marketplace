@@ -387,7 +387,7 @@ Website users who set up an MCP server configure it with their API key:
       "command": "npx",
       "args": ["-y", "@sockt/mcp-server"],
       "env": {
-        "SOCKT_API_URL": "https://api.sockt.io",
+        "SOCKT_API_URL": "https://api.sockt.dev",
         "SOCKT_API_KEY": "sockt_live_aB3xK9mPqR7vNwYzL2cD5eF8gH1jI4k"
       }
     }

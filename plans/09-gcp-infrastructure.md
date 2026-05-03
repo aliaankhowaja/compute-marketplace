@@ -359,7 +359,7 @@ Snapshots are written to host-local SSD first (see Component 4); GCS is the cold
 - Anycast global IP
 - HTTP/2 and **HTTP/3 (QUIC)** enabled
 - SSL policy: `MODERN` (TLS 1.2+, strong cipher suites)
-- Managed SSL certificate for `api.sockt.io`
+- Managed SSL certificate for `api.sockt.dev`
 - WebSocket and SSE explicitly enabled (`--connection-draining-timeout=300s`)
 
 ### URL Map
