@@ -82,6 +82,8 @@ Agent <----direct HTTPS/WSS----> RunPod Pod Runtime (sockt-runtime)
 6. MCP server route set (07)
 7. SDK updates for RunPod endpoints (10)
 
+Detailed checklist version: [BUILD_ORDER_CHECKLIST.md](./BUILD_ORDER_CHECKLIST.md).
+
 ---
 
 ## Key Design Decisions (MVP)
