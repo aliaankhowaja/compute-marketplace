@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sockt"
+version = "0.1.0"
+description = "Sockt Agent SDK — RunPod MVP (control plane + data plane)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Sockt" }]
+dependencies = [
+  "httpx>=0.27,<1",
+  "websockets>=14,<16",
+  "PyJWT>=2.8,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sockt*"]
