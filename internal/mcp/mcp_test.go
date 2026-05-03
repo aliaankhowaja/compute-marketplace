@@ -21,8 +21,8 @@ func TestHealthPayload(t *testing.T) {
 }
 
 func TestToolListCount(t *testing.T) {
-	if n := len(toolList()); n != 11 {
-		t.Fatalf("expected 11 tools, got %d", n)
+	if n := len(toolList()); n != 13 {
+		t.Fatalf("expected 13 tools, got %d", n)
 	}
 }
 
@@ -69,7 +69,7 @@ func TestHandlerInitializeAndToolsList(t *testing.T) {
 	}
 	rm, _ := env2.Result.(map[string]any)
 	tools, _ := rm["tools"].([]any)
-	if len(tools) != 11 {
+	if len(tools) != 13 {
 		t.Fatalf("tools/list: got %d tools", len(tools))
 	}
 }

@@ -1,26 +1,35 @@
 # Component 5: Payment Module (Single-LND MVP)
 
-## v3 changelog
+## v4 changelog
+
+- **Prepaid BOLT11 only for agent balance:** Sockt mints invoices; agents pay Sockt out-of-band (wallet / internal liquidity). Sockt **does not** pay agents via BOLT12, LNURL, or pull-pay.
+- Dropped autonomous `TopUpBalance` / agent-offer-driven pull from the MVP control plane path.
+- `RequestDepositInvoice` + pending-deposit bookkeeping + indexer/settlement callbacks remain the Lightning funding path aligned with billing.
+
+---
+
+## v3 changelog (historical)
 
 - Replaced LND HA pair with one LND node on `e2-small`.
 - Dropped `lnd-active` discovery and failover logic from MVP.
 - Switched to Neutrino mode (no local bitcoind).
 - Reduced pre-minted L402 invoice pool target from 1000 to 100.
-- Kept BOLT12 top-up + idempotency interface unchanged.
 
 ---
 
 ## Overview
 
-The payment module (`internal/payment`) remains the only Lightning integration point, but now targets a single LND instance for ultra-low fixed cost.
+The payment module (`internal/payment`) is the only Lightning integration point for the control plane, targeting a single LND instance.
 
 Responsibilities:
 
-- validate/register offers
-- mint L402 invoices
-- execute BOLT12 top-ups
-- settle manual BOLT11 deposits
-- surface node health
+- mint L402 challenge invoices (pool)
+- mint **deposit** BOLT11 invoices (`RequestDepositInvoice`) and record pending rows
+- detect settlement and credit agent balance (with idempotency)
+- optional direct `PayInvoice` for platform ops (unchanged contract)
+- surface node health (`GetNodeHealth`)
+
+**Not** in MVP anymore: validating/storing agent BOLT12 offers, LNURL webhook pull-pay, Sockt initiating payment to agent nodes for “top-up.”
 
 ---
 
@@ -36,36 +45,33 @@ Responsibilities:
 
 ### Explicit risk
 
-Single point of failure: if this node is down, top-ups pause until recovery.
+Single point of failure: if this node is down, **new deposits and L402 issuance** stall until recovery; already-funded balances still meter offline until callbacks fail.
 
 ---
 
-## Primary APIs
+## Primary APIs (`internal/payment.Payment`)
 
-- `ValidateOffer(offer)`
-- `TopUpBalance(ctx, agentID, sats, idempotencyKey)`
-- `RequestBOLT12Invoice(ctx, offer, amountSats, memo)`
-- `PayInvoice(ctx, invoice, idempotencyKey)`
-- `CreateBOLT11Invoice(ctx, amountSats, memo, expiry)`
-- `MintL402Invoice()`
+- `MintL402Invoice()` / pool maintenance
+- `RequestDepositInvoice(ctx, agentID, amountSats, expirySeconds, memo, idempotencyKey)` — mint BOLT11 + persist pending deposit
+- `PayInvoice(ctx, bolt11, idempotencyKey)` — when the platform pays an invoice
+- `CreateBOLT11Invoice` / decoding helpers (`DecodeBolt11`, `LooksLikeBolt11Invoice`) as implemented
 - `GetNodeHealth(ctx)`
 - `VerifyPreimage(preimage, paymentHash)`
 
 ---
 
-## Top-Up Flow
+## Deposit / refill flow (Lightning agents)
 
-1. Resolve offer by agent.
-2. Build BOLT12 invoice request.
-3. Receive invoice from agent wallet.
-4. Pay invoice through LND.
-5. Record settlement (`top_up_intervals`).
-6. Return preimage + amount to caller.
+1. Agent (or MCP/SDK) hits `POST /v1/wallet/deposit` (or runtime extend-balance / topup-trigger responds with **`deposit_required`**).
+2. Control plane mints BOLT11, stores `pending_deposit`, returns `bolt11`, `payment_hash`, `expires_at`.
+3. Agent pays invoice from **their** wallet.
+4. LND / hooks mark invoice settled → `SettlePendingDeposit` (+ balance increment).
+5. Wallet balance poll + MCP `wallet_deposit_status` + WSS **`low_balance` / `deposit_required`** hints keep UX in sync.
 
 Idempotency:
 
-- app-level cache by `idempotencyKey` (24h)
-- protocol-level safety via payment hash dedupe
+- app-level cache by `idempotency_key` (24h TTL) replays identical mint responses
+- payment-hash dedupe in store
 
 ---
 
@@ -80,8 +86,6 @@ Policy:
 - 1-hour expiry
 - cancel stale invoices where possible
 
-This keeps memory footprint low for Cloud Run while preserving low-latency 402 responses.
-
 ---
 
 ## Error Classification
@@ -89,24 +93,10 @@ This keeps memory footprint low for Cloud Run while preserving low-latency 402 r
 | Error | Action |
 |---|---|
 | `routing_failure` | retry later |
-| `offer_unreachable` | retry later |
-| `invoice_expired` | immediate regenerate/retry |
-| `payment_rejected` | pause sandbox |
-| `offer_invalid` | mark permanent failure |
+| `invoice_expired` | regenerate deposit |
+| `payment_rejected` | user-facing; may pause sandbox |
 | `lnd_unavailable` | transient, retry with backoff |
-| `manual_topup_required` | notify user, do not auto-retry |
-
----
-
-## Deposit Flow (Manual Top-Up)
-
-1. Create BOLT11 invoice.
-2. Store pending deposit row.
-3. Subscribe/poll invoice settlement.
-4. On settle:
-   - increment agent balance
-   - mark deposit settled
-   - publish balance event
+| `invoice_failed` / `deposit_mint_failed` | surface to client; retry mint |
 
 ---
 
@@ -127,23 +117,23 @@ Optional:
 
 Track:
 
-- top-up success/failure rate
-- top-up latency p95/p99
+- deposit mint success/failure rate
+- time-to-settle for pending deposits
 - invoice pool size + misses
-- channel balance
+- channel balance / inbound liquidity
 - LND connection health
 
 Alert on:
 
 - connection unavailable > 60s
-- top-up failures sustained
+- sustained mint failures
 - pool size near zero
 
 ---
 
 ## Dependencies
 
-- Billing callbacks (Component 3)
+- Billing / runtime callbacks (Component 3)
 - Supabase backend (Component 6)
 - API auth middleware (Component 1)
 
@@ -151,9 +141,7 @@ Alert on:
 
 ## Phase 2 (post-MVP)
 
-Restore v2 Lightning architecture:
-
-- active/passive LND pair
-- failover daemon + active-label discovery
+- active/passive LND pair + failover
 - larger invoice pool
 - optional local bitcoind backend
+- reconsider pull-pay models only if product requires them

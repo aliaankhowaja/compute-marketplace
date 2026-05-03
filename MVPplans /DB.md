@@ -34,19 +34,19 @@ One row per dashboard user; `id` matches Supabase Auth `auth.users.id`.
 
 ### `agents`
 
-Lightning / L402 path principals (not website `users`).
+Lightning / L402 path principals (not website `users`). Agent balance is **prepaid** by paying Sockt-minted **BOLT11 invoices**; there is **no** persisted BOLT12 offer / LNURL handle on this row.
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | `uuid` | PK, DEFAULT `gen_random_uuid()` | |
 | `jwt_sub` | `uuid` | UNIQUE NOT NULL | Stable id for agent JWT `sub` (may mirror a platform-issued identity) |
-| `offer_type` | `text` | NOT NULL | `'bolt12'` or `'manual_bolt11'` |
-| `bolt12_offer` | `text` | UNIQUE, nullable | BOLT12 offer string when applicable |
 | `balance_msats` | `bigint` | NOT NULL DEFAULT 0, CHECK (>= -1000000) | Prepaid msats; small negative for in-flight pause |
 | `warning_level` | `text` | NOT NULL DEFAULT `'ok'` | e.g. `ok`, `low_balance`, `out_of_balance`, `suspended` |
 | `created_at` | `timestamptz` | NOT NULL DEFAULT `now()` | |
 
-**Indexes:** `agents_jwt_sub_idx` on `(jwt_sub)`; partial unique on `bolt12_offer` where not null if desired.
+**Indexes:** `agents_jwt_sub_idx` on `(jwt_sub)`.
+
+Historical columns removed: `offer_type`, `bolt12_offer`, `lightning_address`.
 
 ---
 

@@ -35,13 +35,10 @@ func (s *Store) PingTx(ctx context.Context) error {
 
 // Agent row (lightning path principal).
 type Agent struct {
-	ID               uuid.UUID
-	JWTSub           uuid.UUID
-	OfferType        string
-	Bolt12Offer      *string
-	LightningAddress *string
-	BalanceMsats     int64
-	WarningLevel     string
+	ID           uuid.UUID
+	JWTSub       uuid.UUID
+	BalanceMsats int64
+	WarningLevel string
 }
 
 // User row (dashboard / credits).

@@ -53,7 +53,14 @@ def _slug_maps_to_exc(slug: str, msg: str, status: int) -> Exception | None:
         return SandboxNotRunningError(msg, slug=s or None, status_code=status)
     if s in {"unauthorized", "forbidden", "invalid_l402_macaroon"}:
         return AuthenticationError(msg, slug=s or None, status_code=status)
-    if "topup" in s or "top_up" in s:
+    if (
+        "topup" in s
+        or "top_up" in s
+        or "deposit" in s
+        or s == "deposit_required"
+        or s == "out_of_balance"
+        or s == "deposit_mint_failed"
+    ):
         return TopUpFailedError(msg, slug=s or None, status_code=status)
     return None
 
@@ -173,6 +180,35 @@ class ComputeClient:
         """Requires Supabase user JWT (`SOCKT_USER_JWT` / `supabase_jwt`)."""
 
         resp = self._request_cp("GET", "/v1/wallet/balance")
+        self._raise_for_cp(resp)
+        data = resp.json()
+        return dict(data) if isinstance(data, dict) else {}
+
+    def wallet_deposit(
+        self,
+        *,
+        amount_sats: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Mint a BOLT11 deposit invoice (prepaid balance). Requires user JWT."""
+
+        body: dict[str, Any] = {}
+        if amount_sats is not None:
+            body["amount_sats"] = int(amount_sats)
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key.strip()
+        resp = self._request_cp("POST", "/v1/wallet/deposit", json=body or {})
+        self._raise_for_cp(resp)
+        data = resp.json()
+        return dict(data) if isinstance(data, dict) else {}
+
+    def wallet_deposit_status(self, payment_hash_hex: str) -> dict[str, Any]:
+        """Poll settlement for a deposit by 32-byte payment hash (hex)."""
+
+        h = (payment_hash_hex or "").strip()
+        if not h:
+            raise ValueError("payment_hash_hex required")
+        resp = self._request_cp("GET", f"/v1/wallet/deposits/{h}")
         self._raise_for_cp(resp)
         data = resp.json()
         return dict(data) if isinstance(data, dict) else {}

@@ -1,16 +1,14 @@
 package api
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/aliaankhowaja/sockt-backend/internal/payment"
 	"github.com/aliaankhowaja/sockt-backend/internal/runtime"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
@@ -69,6 +67,16 @@ func handleAuditBatch(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 			if err := d.Store.InsertBillingIntervals(r.Context(), *sb.AgentID, rows); err != nil {
 				writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 				return
+			}
+			maxr, _ := d.Store.MaxMsatsPerSecondRunningSandboxesForAgent(r.Context(), *sb.AgentID)
+			if maxr <= 0 {
+				if pr, err2 := d.Store.GetTierPricing(r.Context(), "nano"); err2 == nil && pr != nil {
+					maxr = pr.MsatsPerSecond
+				}
+			}
+			lwMs := int64(d.Cfg.BalanceLowWaterSecs) * maxr
+			if lwMs > 0 {
+				_ = d.Store.RefreshAgentLightningWarning(r.Context(), *sb.AgentID, lwMs)
 			}
 			newConsumed := sb.ConsumedMsats + total
 			_ = d.Store.SetSandboxConsumedMsats(r.Context(), sid, newConsumed)
@@ -153,40 +161,51 @@ func handleTopupTrigger(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "disabled"})
 				return
 			}
-			sats := body.RequestedTopup
-			if sats <= 0 {
-				sats = body.Balance / 1000
-				if sats <= 0 {
-					sats = 50_000
+			chunkMsats := body.RequestedTopup
+			if chunkMsats <= 0 {
+				if body.Balance > 0 {
+					chunkMsats = body.Balance
 				}
 			}
-			idem := fmt.Sprintf("topup:%s:%s:%d", sid.String(), strings.TrimSpace(body.PodID), body.ConsumedTotal)
-			preHex, err := d.PaySvc.TopUpBalance(r.Context(), *sb.AgentID, sats, idem)
-			if err != nil {
+			sats := chunkMsats / 1000
+			if chunkMsats%1000 != 0 {
+				sats++
+			}
+			if sats <= 0 {
+				sats = 50_000
+			}
+			idem := fmt.Sprintf("runtime-mint:%s:%s:%d", sid.String(), strings.TrimSpace(body.PodID), body.ConsumedTotal)
+			memo := fmt.Sprintf("runtime-deposit:sandbox:%s:pod:%s", sid.String(), strings.TrimSpace(body.PodID))
+			dep, err := d.PaySvc.RequestDepositInvoice(r.Context(), *sb.AgentID, sats, 3600, memo, idem)
+			if err != nil || dep == nil {
+				msg := ""
+				if err != nil {
+					msg = err.Error()
+				}
 				writeJSON(w, http.StatusOK, map[string]any{
 					"balance_delta": int64(0),
-					"error_class":   string(payment.Classify(err)),
-					"message":       err.Error(),
+					"error_class":   "deposit_mint_failed",
+					"message":       msg,
 				})
 				return
 			}
-			preBytes, err := hex.DecodeString(strings.TrimSpace(preHex))
-			if err != nil || len(preBytes) != 32 {
-				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "preimage"})
-				return
-			}
-			sum := sha256.Sum256(preBytes)
-			msats := sats * 1000
-			if err := d.Store.ApplyAutonomousTopUp(r.Context(), *sb.AgentID, idem, msats, sum[:], preBytes, ""); err != nil {
-				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "store", "message": err.Error()})
-				return
-			}
+			expRFC := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second).Format(time.RFC3339)
 			ag, _ := d.Store.GetAgentByID(r.Context(), *sb.AgentID)
-			bal := int64(0)
+			wlvl := ""
 			if ag != nil {
-				bal = ag.BalanceMsats
+				wlvl = ag.WarningLevel
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"balance_delta": msats, "new_balance": bal})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"balance_delta": int64(0),
+				"error_class":   "deposit_required",
+				"warning_level": wlvl,
+				"deposit": map[string]any{
+					"bolt11":        dep.PaymentRequest,
+					"payment_hash": fmt.Sprintf("%x", dep.RHash),
+					"amount_msats":  dep.AmountMsats,
+					"expires_at":    expRFC,
+				},
+			})
 		case "credits":
 			if sb.UserID == nil {
 				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "no_user"})

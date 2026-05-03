@@ -15,6 +15,16 @@ Monorepo-local SDKs for the Sockt control plane and RunPod-backed runtime.
 
 **TypeScript / Python:** Data-plane `GET /sandbox/{id}/status` is `sandbox.runtimeStatus()` / `sandbox.runtime_status()` — keep separate from the control-plane lifecycle string on `sandbox.status`.
 
+## Wallet (Lightning prepaid)
+
+Agents on the Lightning billing path keep a prepaid **msats** balance. Use `get_wallet_balance()` / `getWalletBalance()` for `next_action`, `deposit_url`, and suggested amounts.
+
+- **Mint invoice:** `wallet_deposit` / `walletDeposit({ amountSats?, idempotencyKey? })` → `POST /v1/wallet/deposit`.
+- **Poll settlement:** `wallet_deposit_status` / `walletDepositStatus(hex)` → `GET /v1/wallet/deposits/{payment_hash}`.
+- **Live shell:** server may emit `low_balance` and `deposit_required` frames — handle them in Python’s `recv` loop or TS `ShellSession.onFrame()` / `recv()`.
+
+Credits billing path unchanged (automatic allocation callbacks server-side).
+
 ## Quick start
 
 1. Copy [`AgentSDK/.env.example`](./.env.example) to `.env` and fill values.

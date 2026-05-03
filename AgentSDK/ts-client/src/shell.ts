@@ -2,6 +2,9 @@ import WebSocket from "ws";
 
 import { shellUrlFor } from "./util.js";
 
+/** Raw JSON object from the runtime shell WebSocket (stdin/stdout/billing/deposit hints). */
+export type ShellServerFrame = Record<string, unknown>;
+
 /** Sandbox subset needed for interactive shell (avoids circular imports). */
 export interface ShellSessionSandbox {
   id: string;
@@ -45,6 +48,58 @@ export class ShellSession {
 
   resize(cols: number, rows: number): void {
     this.sendRaw({ type: "resize", cols, rows });
+  }
+
+  /**
+   * Subscribe to every server JSON frame (`billing`, `low_balance`, `deposit_required`, stdout, etc.).
+   * Call after `connect()`. Multiple listeners stack.
+   */
+  onFrame(cb: (frame: ShellServerFrame) => void): void {
+    if (!this.ws) {
+      throw new Error("shell websocket not connected");
+    }
+    this.ws.on("message", (buf) => {
+      try {
+        const data = JSON.parse(String(buf)) as ShellServerFrame;
+        cb(data);
+      } catch {
+        /* ignore malformed */
+      }
+    });
+  }
+
+  /** Await next JSON frame or timeout (rejects on timeout). */
+  recv(timeoutMs = 30_000): Promise<ShellServerFrame> {
+    const ws = this.ws;
+    if (!ws) {
+      return Promise.reject(new Error("shell websocket not connected"));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("shell recv timeout"));
+      }, timeoutMs);
+      const onMessage = (buf: WebSocket.RawData) => {
+        try {
+          const data = JSON.parse(String(buf)) as ShellServerFrame;
+          cleanup();
+          resolve(data);
+        } catch {
+          /* wait for next */
+        }
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error("shell websocket closed"));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        ws.off("message", onMessage);
+        ws.off("close", onClose);
+      };
+      ws.on("message", onMessage);
+      ws.once("close", onClose);
+    });
   }
 
   close(): void {

@@ -1,5 +1,13 @@
 # Component 10: Agent SDK (RunPod MVP)
 
+## v4 changelog
+
+- **`GET /v1/wallet/balance`** — clients should surface `next_action`, `min_deposit_msats`, `suggested_deposit_msats`, and `deposit_url` for Lightning UX.
+- **`POST /v1/wallet/deposit`** + **`GET /v1/wallet/deposits/{payment_hash}`** (`walletDeposit` / `walletDepositStatus` in SDKs).
+- Interactive shell helpers: listen for **`low_balance`**, **`deposit_required`**, **`out_of_balance`** frames (Python: handle in `recv` loop; TypeScript: `ShellSession.onFrame` / `recv()`).
+
+---
+
 ## v3 changelog
 
 - `data_endpoint` now points to RunPod proxy URL.
@@ -93,7 +101,7 @@ On refresh, SDK updates:
 | `HostUnreachableError` | runtime endpoint not reachable after retry |
 | `NoCapacityError` | RunPod cannot place requested tier in selected region |
 | `SandboxNotRunningError` | operation attempted on paused/terminated sandbox |
-| `TopUpFailedError` | manual top-up action failed |
+| `TopUpFailedError` | Lightning deposit / extend-balance mint failed (`deposit_required`, slug includes `deposit` / `out_of_balance`) |
 | `AuthenticationError` | JWT/API key/L402 issue |
 
 Keep `HostUnreachableError` name for compatibility even though backend is pod-based.
@@ -102,12 +110,16 @@ Keep `HostUnreachableError` name for compatibility even though backend is pod-ba
 
 ## Python + TypeScript Notes
 
-Both SDKs should:
+Both SDKs:
 
-- surface `pod_id` in sandbox metadata
-- cache current endpoint per sandbox instance
-- avoid assumptions about stable host identity
-- remain transport-compatible with MCP proxy package
+- surface `pod_id` in sandbox metadata and cache current `data_endpoint`
+- remain transport-compatible with MCP proxy package (no assumptions about stable host identity)
+
+Wallet + Lightning prepaid hints:
+
+- `getWalletBalance` / `get_wallet_balance()` — includes `next_action`, `suggested_deposit_msats`, `deposit_url`
+- `walletDeposit` / `wallet_deposit(...)` — `{ amount_sats, idempotency_key }` → `{ bolt11, payment_hash, ... }`
+- `walletDepositStatus` / `wallet_deposit_status(hex)` — `{ status, settled_at?, ... }`
 
 ---
 
@@ -130,6 +142,7 @@ Update integration tests for:
 - resume flow returning new pod id
 - token refresh path on pod restart
 - no host-draining event assumptions
+- wallet `deposit` + `deposit_status` HTTP mocks (`/v1/wallet/deposit`, `/v1/wallet/deposits/...`)
 
 ---
 

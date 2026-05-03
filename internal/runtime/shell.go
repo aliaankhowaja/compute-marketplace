@@ -27,11 +27,16 @@ type ClientFrame struct {
 
 // ServerFrame is emitted by the runtime shell handler.
 type ServerFrame struct {
-	Type    string `json:"type"`
-	Data    string `json:"data,omitempty"`
-	Balance int64  `json:"balance,omitempty"`
-	Code    int    `json:"code,omitempty"`
-	Message string `json:"message,omitempty"`
+	Type                  string `json:"type"`
+	Data                  string `json:"data,omitempty"`
+	Balance               int64  `json:"balance,omitempty"`
+	Code                  int    `json:"code,omitempty"`
+	Message               string `json:"message,omitempty"`
+	Bolt11                string `json:"bolt11,omitempty"`
+	PaymentHash           string `json:"payment_hash,omitempty"`
+	AmountMsats           int64  `json:"amount_msats,omitempty"`
+	SuggestedDepositMsats int64  `json:"suggested_deposit_msats,omitempty"`
+	ExpiresAt             string `json:"expires_at,omitempty"`
 }
 
 var shellUpgrader = websocket.Upgrader{
@@ -115,7 +120,9 @@ func ShellHandler(cfg *Config, meter *Meter, cb *Callbacks) http.Handler {
 					case "topup":
 						writeFrame(ServerFrame{Type: "topup", Balance: ev.Balance, Message: ev.Message})
 					case "low_balance":
-						writeFrame(ServerFrame{Type: "low_balance", Balance: ev.Balance})
+						writeFrame(ServerFrame{Type: "low_balance", Balance: ev.Balance, Message: ev.Message, SuggestedDepositMsats: ev.SuggestedDepositMsats})
+					case "deposit_required":
+						writeFrame(ServerFrame{Type: "deposit_required", Balance: ev.Balance, Message: ev.Message, SuggestedDepositMsats: ev.SuggestedDepositMsats})
 					case "out_of_balance":
 						writeFrame(ServerFrame{Type: "out_of_balance", Balance: ev.Balance})
 					case "error":
@@ -169,15 +176,33 @@ func ShellHandler(cfg *Config, meter *Meter, cb *Callbacks) http.Handler {
 				go func(bal0 int64, cons0 int64) {
 					ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
 					defer cancel2()
-					_ = cb.PostTopupTriggerApply(ctx2, bal0, cons0, func(delta int64, newBal int64) {
-						if newBal != 0 {
-							meter.ApplyNewBalance(newBal)
-						} else if delta != 0 {
-							meter.ApplyBalanceDelta(delta)
-						} else {
-							meter.ClearTopupFlight()
+					switch strings.ToLower(strings.TrimSpace(cfg.BillingMethod)) {
+					case "lightning":
+						doc, err := cb.PostRuntimeDepositMint(ctx2, bal0, cons0)
+						if err != nil {
+							writeFrame(ServerFrame{Type: "error", Message: err.Error()})
+							return
 						}
-					})
+						writeFrame(ServerFrame{
+							Type:        "deposit_required",
+							Balance:     bal0,
+							Bolt11:      doc.Bolt11,
+							PaymentHash: doc.PaymentHash,
+							AmountMsats: doc.AmountMsats,
+							ExpiresAt:   doc.ExpiresAt,
+							Message:     "pay_bolt11_to_extend_balance",
+						})
+					default:
+						_ = cb.PostCreditAllocateApply(ctx2, bal0, cons0, func(delta int64, newBal int64) {
+							if newBal != 0 {
+								meter.ApplyNewBalance(newBal)
+							} else if delta != 0 {
+								meter.ApplyBalanceDelta(delta)
+							} else {
+								meter.ClearTopupFlight()
+							}
+						})
+					}
 				}(meter.Snapshot().Balance, meter.Snapshot().ConsumedTotal)
 			case "input", "":
 				if cf.Type == "" {

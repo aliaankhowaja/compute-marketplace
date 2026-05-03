@@ -21,7 +21,7 @@ type NodeHealth struct {
 	BlockHeight   uint32
 	Alias         string
 	IdentityPub   string // hex
-	LNDKEstimated bool   // true if Bolt12Fetcher is wired (caller hint); optional heuristic
+	LNDKEstimated bool // deprecated hint; always false when Bolt12 bridge removed
 	IsTestNet     bool
 }
 

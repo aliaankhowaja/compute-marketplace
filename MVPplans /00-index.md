@@ -9,6 +9,7 @@
 - Global LB + Cloud Armor + internal LBs were removed; Cloud Run domain mapping is used initially.
 - LND HA pair was replaced with a single LND node on a small GCE VM (Neutrino mode).
 - Billing meter moved into each runtime pod so control plane can scale to zero.
+- Lightning agent funding ships as **prepaid BOLT11 deposits to Sockt** (see Component 05/03/10); no autonomous BOLT12/LNURL pull-pay from Sockt to agents in MVP.
 
 ---
 
@@ -19,7 +20,7 @@ This directory contains implementation plans for the MVP architecture optimized 
 - programmable sandboxes
 - Lightning + API key auth paths
 - live shell/file/exec workflow
-- prepaid balance metering and top-up flow
+- prepaid Lightning balance (deposit + meter) + auto credit top-ups
 
 The previous v2 architecture is intentionally preserved as a Phase 2 target for scale.
 
@@ -61,14 +62,14 @@ Agent <----direct HTTPS/WSS----> RunPod Pod Runtime (sockt-runtime)
 |---|---|---|---|
 | 01 | [01-api-gateway-l402-proxy.md](./01-api-gateway-l402-proxy.md) | API Gateway + Native L402 | Cloud Run edge auth, L402/JWT/API-key middleware, data JWT issuance |
 | 02 | [02-unified-go-binary.md](./02-unified-go-binary.md) | Control Plane + Runtime Binary | Cloud Run control plane + in-pod `sockt-runtime`, module boundaries |
-| 03 | [03-billing-engine.md](./03-billing-engine.md) | Billing Engine | In-pod 1s metering, callback-based top-up triggers, batched audit writes |
+| 03 | [03-billing-engine.md](./03-billing-engine.md) | Billing Engine | In-pod 1s metering, low-balance + deposit-required signals, mint/pause callbacks, batched audits |
 | 04 | [04-sandbox-orchestrator.md](./04-sandbox-orchestrator.md) | Sandbox Orchestrator | RunPod lifecycle orchestration, tier mapping, pause/resume via pod stop/start |
-| 05 | [05-payment-module.md](./05-payment-module.md) | Payment Module | Single LND topology, BOLT12 top-up, L402 invoice pool |
+| 05 | [05-payment-module.md](./05-payment-module.md) | Payment Module | Single LND topology, prepaid BOLT11 deposits + settlement, L402 invoice pool |
 | 06 | [06-supabase-backend.md](./06-supabase-backend.md) | Supabase Backend | Sole Postgres backend, auth, realtime, storage, pooler strategy |
 | 07 | [07-mcp-server.md](./07-mcp-server.md) | MCP Server | Streamable HTTP MCP on Cloud Run, reconnect-oriented session model |
 | 08 | [08-websocket-shell-server.md](./08-websocket-shell-server.md) | WebSocket Shell | WSS terminated in RunPod runtime pod with in-process billing events |
 | 09 | [09-gcp-infrastructure.md](./09-gcp-infrastructure.md) | Minimal Infrastructure | Cloud Run + single LND VM + secrets + logging + domain mapping |
-| 10 | [10-agent-sdk.md](./10-agent-sdk.md) | Agent SDK | `data_endpoint` as RunPod URL, runtime-aware retries, JWT refresh flow |
+| 10 | [10-agent-sdk.md](./10-agent-sdk.md) | Agent SDK | RunPod URLs, JWT refresh, `wallet/deposit`, shell billing frames |
 
 ---
 

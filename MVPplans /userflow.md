@@ -52,7 +52,7 @@ flowchart TD
 3. Sockt prepares the sandbox and returns connection details.
 4. User starts working: execute code, read/write files, and open a shell.
 5. Usage is metered in the background while work continues.
-6. When balance gets low, refill is triggered automatically so sessions stay smooth.
+6. When balance runs low, Sockt surfaces **deposit hints** over API, MCP, or the live shell (`low_balance`, `deposit_required`). The user **pays a BOLT11 invoice to Sockt** to top up prepaid msats; credits path still auto-requests allocation.
 7. User can pause, resume, or terminate when done.
 
 ### Primary Path Sequence
@@ -109,5 +109,5 @@ sequenceDiagram
 - **One product, two access paths:** Lightning-native or website API key fallback.
 - **Fast start:** create a sandbox and begin working in minutes.
 - **Smooth runtime:** execute, edit, and shell access in one workflow.
-- **Predictable billing:** usage is tracked continuously with clear low-balance handling.
+- **Predictable billing:** usage metered continuously; Lightning users top up via **prepaid deposits** (`wallet/deposit` + pay BOLT11), credits allocate automatically server-side until exhausted.
 - **User control:** easy pause, resume, terminate, and key rotation.

@@ -22,4 +22,4 @@ export {
   TopUpFailedError,
 } from "./errors.js";
 export { ShellSession } from "./shell.js";
-export type { ShellSessionSandbox } from "./shell.js";
+export type { ShellServerFrame, ShellSessionSandbox } from "./shell.js";

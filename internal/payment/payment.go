@@ -17,30 +17,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const (
-	defaultBolt12Wait = 8 * time.Second
-	defaultPayWait    = 25 * time.Second
-)
-
-// AgentOfferInfo describes how to pull prepaid top-ups for an agent.
-type AgentOfferInfo struct {
-	OfferType        string // bolt12 | manual_bolt11 | lnurl_pay
-	Bolt12Offer      string
-	LightningAddress string // user@domain.com or https://... lnurl
-}
-
-// AgentOffers resolves Bolt12/manual/lnurl routing data for prepaid pull payments.
-type AgentOffers interface {
-	Lookup(ctx context.Context, agentID uuid.UUID) (AgentOfferInfo, error)
-}
+const defaultPayWait = 25 * time.Second
 
 // Payment is the façade consumed by billing, L402, and wallet HTTP handlers.
 type Payment interface {
-	ValidateOffer(offer string) error
-	TopUpBalance(ctx context.Context, agentID uuid.UUID, sats int64, idempotencyKey string) (preimageHex string, err error)
-	RequestBOLT12Invoice(ctx context.Context, offer string, amountSats int64, memo string) (invoice string, err error)
 	PayInvoice(ctx context.Context, invoice string, idempotencyKey string) (preimageHex string, err error)
 	CreateBOLT11Invoice(ctx context.Context, amountSats int64, memo string, expirySeconds int64) (*Bolt11Invoice, error)
+	RequestDepositInvoice(ctx context.Context, agentID uuid.UUID, amountSats int64, expirySeconds int64, memo string, idempotencyKey string) (*DepositMintResult, error)
 	MintL402Invoice(ctx context.Context) (*Bolt11Invoice, []byte, error)
 	GetNodeBalance(ctx context.Context) (BalanceInfo, error)
 	GetNodeHealth(ctx context.Context) (NodeHealth, error)
@@ -51,31 +34,21 @@ type Service struct {
 	LND               *Client
 	Pool              *InvoicePool
 	IDem              *IdempotencyCache
-	Agents            AgentOffers
-	Bolt12            Bolt12Fetcher
-	LNURL             LNURLFetcher
+	PendingDeps       PendingDepositRecorder
 	Chain             *chaincfg.Params
-	Bolt12FetchWait   time.Duration
 	PaymentSendExpiry time.Duration
 }
 
-// LNURLFetcher resolves a lightning address / LNURL-pay endpoint to a BOLT11 invoice.
-type LNURLFetcher interface {
-	FetchInvoice(ctx context.Context, lightningAddressOrLNURL string, amountSats int64) (bolt11 string, err error)
-}
-
-// NewService constructs a Service with optional pool (L402), fetchers (Bolt12/LNURL), and agents resolver.
-func NewService(lnd *Client, pool *InvoicePool, idem *IdempotencyCache, agents AgentOffers, bolt12 Bolt12Fetcher, lnurl LNURLFetcher) *Service {
+// NewService constructs a Service with optional pool (L402) and pending-deposit persistence.
+func NewService(lnd *Client, pool *InvoicePool, idem *IdempotencyCache, pending PendingDepositRecorder) *Service {
 	if idem == nil {
 		idem = NewIdempotencyCache()
 	}
 	return &Service{
-		LND:    lnd,
-		Pool:   pool,
-		IDem:   idem,
-		Agents: agents,
-		Bolt12: bolt12,
-		LNURL:  lnurl,
+		LND:         lnd,
+		Pool:        pool,
+		IDem:        idem,
+		PendingDeps: pending,
 	}
 }
 
@@ -102,23 +75,11 @@ func subtleConstantTimeCompare(a, b []byte) bool {
 	return v == 0
 }
 
-// ValidateOffer validates that the offer string parses as Bolt 12 (bech32m).
-func (s *Service) ValidateOffer(offer string) error {
-	return ValidateOffer(offer)
-}
-
 func (s *Service) chainParams() *chaincfg.Params {
 	if s.Chain != nil {
 		return s.Chain
 	}
 	return &chaincfg.MainNetParams
-}
-
-func (s *Service) bolt12Timeout() time.Duration {
-	if s.Bolt12FetchWait > 0 {
-		return s.Bolt12FetchWait
-	}
-	return defaultBolt12Wait
 }
 
 func (s *Service) paymentTimeout() time.Duration {
@@ -137,31 +98,6 @@ func (s *Service) classifyRPC(err error) error {
 		}
 	}
 	return err
-}
-
-// RequestBOLT12Invoice returns a payment request usable with PayInvoice/SendPaymentV2.
-func (s *Service) RequestBOLT12Invoice(ctx context.Context, offer string, amountSats int64, memo string) (string, error) {
-	net := s.chainParams()
-	trim := strings.TrimSpace(offer)
-	if LooksLikeBolt11Invoice(trim, net) {
-		return trim, nil
-	}
-	if err := ValidateOffer(trim); err != nil {
-		return "", err
-	}
-	if s.Bolt12 == nil {
-		return "", errBolt12FetchNotConfigured
-	}
-	ctx2, cancel := context.WithTimeout(ctx, s.bolt12Timeout())
-	defer cancel()
-
-	inv, err := s.Bolt12.FetchBolt12Invoice(ctx2, Bolt12FetchParams{
-		Offer:      trim,
-		AmountSats: amountSats,
-		PayerNote:  memo,
-		Timeout:    s.bolt12Timeout(),
-	})
-	return strings.TrimSpace(inv), err
 }
 
 func (s *Service) decodePayHash(invoice string) ([]byte, error) {
@@ -198,6 +134,25 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, idempotencyKey
 	return preHex, nil
 }
 
+func (s *Service) finalizePaymentRequest(ctx context.Context, invoice string) (string, error) {
+	phBytes, err := s.decodePayHash(invoice)
+	if err != nil {
+		return "", err
+	}
+	payment, payErr := s.LND.SendPaymentViaRouter(ctx, strings.TrimSpace(invoice), s.paymentTimeout())
+	if payErr != nil {
+		return "", classifyForPay(payment, payErr)
+	}
+	preImg, err := hex.DecodeString(strings.TrimSpace(payment.PaymentPreimage))
+	if err != nil || len(preImg) != 32 {
+		return "", classifyErr(ClassRoutingFailure, errors.New("missing preimage"))
+	}
+	if !VerifyPreimage(preImg, phBytes) {
+		return "", classifyErr(ClassRoutingFailure, errors.New("preimage mismatch"))
+	}
+	return hex.EncodeToString(preImg), nil
+}
+
 func classifyForPay(p *lnrpc.Payment, payErr error) error {
 	var cl *Classifier
 	if errors.As(payErr, &cl) {
@@ -209,7 +164,7 @@ func classifyForPay(p *lnrpc.Payment, payErr error) error {
 	return classifyErr(ClassRoutingFailure, payErr)
 }
 
-// CreateBOLT11Invoice backs manual deposit onboarding flows.
+// CreateBOLT11Invoice backs prepaid deposit onboarding flows.
 func (s *Service) CreateBOLT11Invoice(ctx context.Context, amountSats int64, memo string, expirySeconds int64) (*Bolt11Invoice, error) {
 	if amountSats <= 0 {
 		return nil, classifyErr(ClassOfferInvalid, errors.New("amount must be positive"))
@@ -272,6 +227,6 @@ func (s *Service) GetNodeHealth(ctx context.Context) (NodeHealth, error) {
 	if err != nil {
 		return h, s.classifyRPC(err)
 	}
-	h.LNDKEstimated = s.Bolt12 != nil || s.LNURL != nil
+	h.LNDKEstimated = false
 	return h, nil
 }

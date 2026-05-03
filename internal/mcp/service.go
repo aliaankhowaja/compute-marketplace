@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 	"github.com/aliaankhowaja/sockt-backend/internal/config"
+	"github.com/aliaankhowaja/sockt-backend/internal/lightningwallet"
 	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/payment"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
@@ -81,7 +81,8 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	case "":
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "tool name required"}
 	case "sandbox_create", "sandbox_exec", "sandbox_write_file", "sandbox_read_file", "sandbox_list_files",
-		"sandbox_status", "sandbox_pause", "sandbox_resume", "sandbox_terminate", "sandbox_extend_balance", "wallet_balance":
+		"sandbox_status", "sandbox_pause", "sandbox_resume", "sandbox_terminate", "sandbox_extend_balance",
+		"wallet_balance", "wallet_deposit", "wallet_deposit_status":
 		if s.Store == nil {
 			return nil, http.StatusServiceUnavailable, "store_unavailable", map[string]any{"message": "store not configured"}
 		}
@@ -122,6 +123,10 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 		return s.toolSandboxExtendBalance(ctx, p, m)
 	case "wallet_balance":
 		return s.toolWalletBalance(ctx, p)
+	case "wallet_deposit":
+		return s.toolWalletDeposit(ctx, p, m)
+	case "wallet_deposit_status":
+		return s.toolWalletDepositStatus(ctx, p, m)
 	default:
 		return nil, 0, "", nil
 	}
@@ -507,24 +512,28 @@ func (s *Service) toolSandboxExtendBalance(ctx context.Context, p *auth.Principa
 		}
 		idem := argString(args, "idempotency_key")
 		if idem == "" {
-			idem = fmt.Sprintf("mcp-extend:%s:%d", id.String(), time.Now().Unix())
+			idem = fmt.Sprintf("mcp-extend:%s:%d", id.String(), time.Now().UnixNano())
 		}
-		pre, err := s.PaySvc.TopUpBalance(ctx, agentID, sats, idem)
+		memo := fmt.Sprintf("mcp-extend:sandbox:%s", id.String())
+		dep, err := s.PaySvc.RequestDepositInvoice(ctx, agentID, sats, 3600, memo, idem)
 		if err != nil {
-			return nil, http.StatusPaymentRequired, slugFromPaymentClass(string(payment.Classify(err))), map[string]any{"message": err.Error()}
+			return nil, http.StatusBadGateway, slugFromPaymentClass(string(payment.Classify(err))), map[string]any{"message": err.Error()}
 		}
-		preb, _ := hex.DecodeString(pre)
-		ph := sha256.Sum256(preb)
-		_ = s.Store.ApplyAutonomousTopUp(ctx, agentID, idem, sats*1000, ph[:], preb, "")
-		ag, _ := s.Store.GetAgentByID(ctx, agentID)
-		bal := int64(0)
-		if ag != nil {
-			bal = ag.BalanceMsats
+		if dep == nil || len(dep.RHash) != 32 {
+			return nil, http.StatusBadGateway, "invoice_failed", map[string]any{"message": "bad invoice"}
+		}
+		expRFC := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second).Format(time.RFC3339)
+		ag3, _ := s.Store.GetAgentByID(ctx, agentID)
+		wlvl := ""
+		if ag3 != nil {
+			wlvl = ag3.WarningLevel
 		}
 		return map[string]any{
-			"balance_msats_after": bal,
-			"topup_settled_at":    time.Now().UTC().Format(time.RFC3339),
-			"preimage":            pre,
+			"bolt11":         dep.PaymentRequest,
+			"payment_hash":   hex.EncodeToString(dep.RHash),
+			"amount_msats":   dep.AmountMsats,
+			"expires_at":     expRFC,
+			"warning_level": wlvl,
 		}, 0, "", nil
 	default:
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing method"}
@@ -555,21 +564,114 @@ func (s *Service) toolWalletBalance(ctx context.Context, p *auth.Principal) (any
 		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
 	}
 	if ag == nil {
-		return nil, http.StatusNotFound, "not_found", map[string]any{"message": "register wallet offer first"}
+		return nil, http.StatusNotFound, "not_found", map[string]any{"message": "register wallet first"}
 	}
+	rate, _ := s.Store.MaxMsatsPerSecondRunningSandboxesForAgent(ctx, ag.ID)
+	if rate <= 0 {
+		pr, err2 := s.Store.GetTierPricing(ctx, "nano")
+		if err2 != nil || pr == nil {
+			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": "tier pricing"}
+		}
+		rate = pr.MsatsPerSecond
+	}
+	nextAction, minD, sug := lightningwallet.Hints(ag.BalanceMsats, rate, s.Cfg)
 	active, _ := s.Store.CountRunningSandboxesByAgent(ctx, ag.ID)
-	offer := ""
-	if ag.Bolt12Offer != nil {
-		offer = *ag.Bolt12Offer
+	cp := strings.TrimRight(strings.TrimSpace(s.Cfg.ControlPlanePublicURL), "/")
+	depositURL := ""
+	if cp != "" {
+		depositURL = cp + "/v1/wallet/deposit"
 	}
 	return map[string]any{
-		"bolt12_offer":                   offer,
-		"offer_type":                     ag.OfferType,
-		"balance_msats":                  ag.BalanceMsats,
-		"active_sandboxes":               active,
-		"active_msats_per_second":        int64(0),
-		"total_msats_topped_up_lifetime": int64(0),
-		"total_msats_consumed_lifetime":  int64(0),
-		"warning_level":                  ag.WarningLevel,
+		"balance_msats":             ag.BalanceMsats,
+		"active_sandboxes":         active,
+		"billing_hint_msats_sec":    rate,
+		"warning_level":             ag.WarningLevel,
+		"next_action":               nextAction,
+		"min_deposit_msats":        minD,
+		"suggested_deposit_msats":  sug,
+		"deposit_url":               depositURL,
 	}, 0, "", nil
+}
+
+func resolveAgentUUID(ctx context.Context, s *Service, p *auth.Principal) (uuid.UUID, error) {
+	if p == nil {
+		return uuid.Nil, fmt.Errorf("no principal")
+	}
+	switch {
+	case p.AgentID != nil:
+		return *p.AgentID, nil
+	case p.Kind == auth.KindUserJWT && p.UserID != nil:
+		ag, err := s.Store.GetAgentByJWTSub(ctx, *p.UserID)
+		if err != nil || ag == nil {
+			return uuid.Nil, fmt.Errorf("agent not registered")
+		}
+		return ag.ID, nil
+	default:
+		return uuid.Nil, fmt.Errorf("agent context required")
+	}
+}
+
+func (s *Service) toolWalletDeposit(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
+	if s.PaySvc == nil || s.PaySvc.LND == nil {
+		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lnd not configured"}
+	}
+	agentID, err := resolveAgentUUID(ctx, s, p)
+	if err != nil {
+		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": err.Error()}
+	}
+	sats := int64(argFloat(args, "amount_sats"))
+	idem := argString(args, "idempotency_key")
+	expiry := int64(3600)
+	memo := fmt.Sprintf("mcp-wallet-deposit:agent:%s", agentID)
+	dep, err := s.PaySvc.RequestDepositInvoice(ctx, agentID, sats, expiry, memo, strings.TrimSpace(idem))
+	if err != nil || dep == nil {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		return nil, http.StatusBadGateway, "invoice_failed", map[string]any{"message": msg}
+	}
+	if len(dep.RHash) != 32 {
+		return nil, http.StatusBadGateway, "invoice_bad_hash", nil
+	}
+	expRFC := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second).Format(time.RFC3339)
+	return map[string]any{
+		"bolt11":         dep.PaymentRequest,
+		"payment_hash":   hex.EncodeToString(dep.RHash),
+		"amount_msats":   dep.AmountMsats,
+		"expires_at":     expRFC,
+		"min_amount_msats": int64(1000),
+	}, 0, "", nil
+}
+
+func (s *Service) toolWalletDepositStatus(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
+	agentID, err := resolveAgentUUID(ctx, s, p)
+	if err != nil {
+		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": err.Error()}
+	}
+	hhex := strings.TrimSpace(argString(args, "payment_hash"))
+	ph, err := hex.DecodeString(hhex)
+	if err != nil || len(ph) != 32 {
+		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "payment_hash"}
+	}
+	st, err := s.Store.GetDepositStatusForAgent(ctx, agentID, ph)
+	if err != nil {
+		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
+	}
+	if st == nil {
+		return nil, http.StatusNotFound, "not_found", map[string]any{"message": "unknown payment_hash"}
+	}
+	out := map[string]any{
+		"status":       st.Status,
+		"amount_msats": st.AmountMsats,
+		"settled_at":   nil,
+		"bolt11":       nil,
+	}
+	if st.SettledAt != nil {
+		out["settled_at"] = st.SettledAt.UTC().Format(time.RFC3339)
+	}
+	if st.Bolt11Invoice != nil {
+		out["bolt11"] = *st.Bolt11Invoice
+	}
+	return out, 0, "", nil
 }

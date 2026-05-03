@@ -54,8 +54,8 @@ var (
 	ErrManualTopUpRequired = classifyErr(ClassManualTopUpRequired, errors.New("manual top-up required"))
 	ErrAmountBelowMinimum  = classifyErr(ClassAmountBelowMinimum, errors.New("amount below offer minimum"))
 
-	errBolt12FetchNotConfigured = classifyErr(ClassOfferUnreachable,
-		errors.New("bolt12 invoice fetch not configured; wire payment.Bolt12Fetcher"))
+	// ErrMissingPaymentHash signals a decoded BOLT11 missing its payment_hash field.
+	ErrMissingPaymentHash = errors.New("bolt11 invoice missing payment hash")
 )
 
 // Classify maps an error chain to Classification (unknown-safe).

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,9 +21,10 @@ type RuntimeBalance struct {
 
 // MeterEvent is pushed to websocket subscribers for billing fan-out.
 type MeterEvent struct {
-	Type    string `json:"type"`
-	Balance int64  `json:"balance"`
-	Message string `json:"message,omitempty"`
+	Type                  string `json:"type"`
+	Balance               int64  `json:"balance"`
+	Message               string `json:"message,omitempty"`
+	SuggestedDepositMsats int64  `json:"suggested_deposit_msats,omitempty"`
 }
 
 // Meter drives the 1 Hz tick loop and coordinates callbacks + subscribers.
@@ -66,14 +68,14 @@ func (m *Meter) Snapshot() RuntimeBalance {
 	return m.balance
 }
 
-// ClearTopupFlight clears the top-up latch without changing balance.
+// ClearTopupFlight clears the credit allocation latch without changing balance.
 func (m *Meter) ClearTopupFlight() {
 	m.mu.Lock()
 	m.balance.TopupInFlight = false
 	m.mu.Unlock()
 }
 
-// ApplyBalanceDelta adjusts balance after a successful control-plane top-up response.
+// ApplyBalanceDelta adjusts balance after a successful control-plane credit allocation response.
 func (m *Meter) ApplyBalanceDelta(delta int64) {
 	m.mu.Lock()
 	m.balance.Balance += delta
@@ -182,7 +184,8 @@ func (m *Meter) tick(parentCtx context.Context) {
 
 	m.broadcast(MeterEvent{Type: "billing", Balance: bal})
 
-	if bal < thresh && bal > floor && !topupInFlight {
+	// Credits path: allocate more balance from centralized credit pool via control plane.
+	if strings.EqualFold(m.cfg.BillingMethod, "credits") && bal < thresh && bal > floor && !topupInFlight {
 		m.mu.Lock()
 		m.balance.TopupInFlight = true
 		m.mu.Unlock()
@@ -191,7 +194,7 @@ func (m *Meter) tick(parentCtx context.Context) {
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 
-			err := m.cb.PostTopupTriggerApply(ctx, b0, c0, func(delta int64, newBal int64) {
+			err := m.cb.PostCreditAllocateApply(ctx, b0, c0, func(delta int64, newBal int64) {
 				if newBal != 0 {
 					m.ApplyNewBalance(newBal)
 				} else if delta != 0 {
@@ -201,19 +204,22 @@ func (m *Meter) tick(parentCtx context.Context) {
 				}
 			})
 			if err != nil {
-				log.Printf("runtime/meter: topup-trigger failed: %v", err)
+				log.Printf("runtime/meter: credit-allocation-trigger failed: %v", err)
 				m.mu.Lock()
 				m.balance.TopupInFlight = false
 				m.mu.Unlock()
-				m.broadcast(MeterEvent{Type: "error", Balance: m.Snapshot().Balance, Message: "topup_trigger_failed"})
+				m.broadcast(MeterEvent{Type: "error", Balance: m.Snapshot().Balance, Message: "credit_allocation_trigger_failed"})
 			} else {
-				m.broadcast(MeterEvent{Type: "topup", Balance: m.Snapshot().Balance, Message: "topup_trigger_ok"})
+				m.broadcast(MeterEvent{Type: "topup", Balance: m.Snapshot().Balance, Message: "credit_allocation_trigger_ok"})
 			}
 		}(bal, consumed)
 	}
 
-	if prevBal >= thresh && bal < thresh {
-		m.broadcast(MeterEvent{Type: "low_balance", Balance: bal})
+	// Lightning prepaid: advise agent to deposit; no automatic LN pull.
+	if strings.EqualFold(m.cfg.BillingMethod, "lightning") && prevBal >= thresh && bal < thresh {
+		sug := m.cfg.TopupAmount
+		m.broadcast(MeterEvent{Type: "low_balance", Balance: bal, Message: "deposit_required", SuggestedDepositMsats: sug})
+		m.broadcast(MeterEvent{Type: "deposit_required", Balance: bal, SuggestedDepositMsats: sug})
 	}
 
 	if bal <= floor {
@@ -253,7 +259,6 @@ func (m *Meter) flushAudit(ctx context.Context) {
 
 	if err := m.cb.PostAuditBatch(ctx, batch); err != nil {
 		log.Printf("runtime/meter: audit-batch failed: %v", err)
-		// re-queue intervals best-effort
 		m.mu.Lock()
 		m.pendingAudit = append(batch, m.pendingAudit...)
 		m.mu.Unlock()

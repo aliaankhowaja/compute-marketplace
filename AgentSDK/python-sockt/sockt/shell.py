@@ -58,4 +58,12 @@ class ShellSession:
         self.__exit__(None, None, None)
 
     def on_billing_event(self, _cb: Callable[[dict[str, Any]], None]) -> None:
-        """Hook stub — handle `billing` / `topup` frames in your own recv loop."""
+        """Optional hook point — in your own `recv` loop, branch on `type`, e.g.:
+
+        - ``billing`` — periodic balance tick
+        - ``low_balance`` — warn before funds run out
+        - ``deposit_required`` — BOLT11 minted server-side; frame may include ``bolt11``, ``payment_hash``, ``suggested_deposit_msats``
+        - ``out_of_balance`` / ``error`` — sandbox may pause soon or already blocked
+
+        The server no longer performs autonomous BOLT12/LNURL pull-pay; agents top up by paying invoices.
+        """

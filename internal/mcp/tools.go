@@ -132,7 +132,7 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "sandbox_extend_balance",
-			Description: "Top up agent balance (lightning) or allocate credits to sandbox (credits). Use 'sats' for lightning; use 'cents' for credits (optional).",
+			Description: "Lightning: mint a BOLT11 deposit invoice for this sandbox. Credits: allocate more cents into the sandbox local balance.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id"],
@@ -146,10 +146,32 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "wallet_balance",
-			Description: "Lightning agent balance / offer metadata for the authenticated principal.",
+			Description: "Lightning prepaid balance plus next_action / suggested deposit sizing for polling.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {}
+			}`),
+		},
+		{
+			Name:        "wallet_deposit",
+			Description: "Mint a BOLT11 invoice to deposit sats against your prepaid Sockt balance (paid to Sockt LND).",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"amount_sats": {"type": "integer"},
+					"idempotency_key": {"type": "string"}
+				}
+			}`),
+		},
+		{
+			Name:        "wallet_deposit_status",
+			Description: "Poll pending/settled status for a deposit by payment_hash (hex).",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"required": ["payment_hash"],
+				"properties": {
+					"payment_hash": {"type": "string"}
+				}
 			}`),
 		},
 	}

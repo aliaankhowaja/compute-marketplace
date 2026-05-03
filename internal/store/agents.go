@@ -9,15 +9,13 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (s *Store) CreateAgent(ctx context.Context, jwtSub uuid.UUID, offerType string, bolt12 *string, lnAddr *string) (*Agent, error) {
+func (s *Store) CreateAgent(ctx context.Context, jwtSub uuid.UUID) (*Agent, error) {
 	id := uuid.New()
-	q := `INSERT INTO public.agents (id, jwt_sub, offer_type, bolt12_offer, lightning_address, balance_msats, warning_level)
-		VALUES ($1,$2,$3,$4,$5,0,'ok')
-		RETURNING id, jwt_sub, offer_type, bolt12_offer, lightning_address, balance_msats, warning_level`
+	q := `INSERT INTO public.agents (id, jwt_sub, balance_msats, warning_level)
+		VALUES ($1,$2,0,'ok')
+		RETURNING id, jwt_sub, balance_msats, warning_level`
 	var a Agent
-	err := s.Tx.QueryRow(ctx, q, id, jwtSub, offerType, bolt12, lnAddr).Scan(
-		&a.ID, &a.JWTSub, &a.OfferType, &a.Bolt12Offer, &a.LightningAddress, &a.BalanceMsats, &a.WarningLevel,
-	)
+	err := s.Tx.QueryRow(ctx, q, id, jwtSub).Scan(&a.ID, &a.JWTSub, &a.BalanceMsats, &a.WarningLevel)
 	if err != nil {
 		return nil, err
 	}
@@ -25,12 +23,10 @@ func (s *Store) CreateAgent(ctx context.Context, jwtSub uuid.UUID, offerType str
 }
 
 func (s *Store) GetAgentByID(ctx context.Context, id uuid.UUID) (*Agent, error) {
-	q := `SELECT id, jwt_sub, offer_type, bolt12_offer, lightning_address, balance_msats, warning_level
+	q := `SELECT id, jwt_sub, balance_msats, warning_level
 		FROM public.agents WHERE id = $1`
 	var a Agent
-	err := s.Tx.QueryRow(ctx, q, id).Scan(
-		&a.ID, &a.JWTSub, &a.OfferType, &a.Bolt12Offer, &a.LightningAddress, &a.BalanceMsats, &a.WarningLevel,
-	)
+	err := s.Tx.QueryRow(ctx, q, id).Scan(&a.ID, &a.JWTSub, &a.BalanceMsats, &a.WarningLevel)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -41,12 +37,10 @@ func (s *Store) GetAgentByID(ctx context.Context, id uuid.UUID) (*Agent, error) 
 }
 
 func (s *Store) GetAgentByJWTSub(ctx context.Context, sub uuid.UUID) (*Agent, error) {
-	q := `SELECT id, jwt_sub, offer_type, bolt12_offer, lightning_address, balance_msats, warning_level
+	q := `SELECT id, jwt_sub, balance_msats, warning_level
 		FROM public.agents WHERE jwt_sub = $1`
 	var a Agent
-	err := s.Tx.QueryRow(ctx, q, sub).Scan(
-		&a.ID, &a.JWTSub, &a.OfferType, &a.Bolt12Offer, &a.LightningAddress, &a.BalanceMsats, &a.WarningLevel,
-	)
+	err := s.Tx.QueryRow(ctx, q, sub).Scan(&a.ID, &a.JWTSub, &a.BalanceMsats, &a.WarningLevel)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -54,12 +48,6 @@ func (s *Store) GetAgentByJWTSub(ctx context.Context, sub uuid.UUID) (*Agent, er
 		return nil, err
 	}
 	return &a, nil
-}
-
-func (s *Store) UpdateAgentOffer(ctx context.Context, id uuid.UUID, offerType string, bolt12 *string, lnAddr *string) error {
-	_, err := s.Tx.Exec(ctx, `UPDATE public.agents SET offer_type = $2, bolt12_offer = $3, lightning_address = $4 WHERE id = $1`,
-		id, offerType, bolt12, lnAddr)
-	return err
 }
 
 func (s *Store) IncrementAgentBalanceMsats(ctx context.Context, id uuid.UUID, delta int64) (int64, error) {
@@ -74,4 +62,18 @@ func (s *Store) IncrementAgentBalanceMsats(ctx context.Context, id uuid.UUID, de
 
 func (s *Store) DecrementAgentBalanceMsats(ctx context.Context, id uuid.UUID, delta int64) (int64, error) {
 	return s.IncrementAgentBalanceMsats(ctx, id, -delta)
+}
+
+// RefreshAgentLightningWarning sets warning_level from balance thresholds (msats floor at 0 vs low-water).
+func (s *Store) RefreshAgentLightningWarning(ctx context.Context, agentID uuid.UUID, lowWaterMsats int64) error {
+	if lowWaterMsats <= 0 {
+		lowWaterMsats = 1
+	}
+	q := `UPDATE public.agents SET warning_level =
+		CASE WHEN balance_msats <= 0 THEN 'out_of_balance'
+		     WHEN balance_msats < $2 THEN 'low_balance'
+		     ELSE 'ok' END
+		WHERE id = $1`
+	_, err := s.Tx.Exec(ctx, q, agentID, lowWaterMsats)
+	return err
 }

@@ -67,7 +67,14 @@ function mapSlug(slug: string, msg: string, status: number): Error | undefined {
   if (["unauthorized", "forbidden", "invalid_l402_macaroon"].includes(s)) {
     return new AuthenticationError(msg, { slug: s || undefined, statusCode: status });
   }
-  if (s.includes("topup") || s.includes("top_up")) {
+  if (
+    s.includes("topup") ||
+    s.includes("top_up") ||
+    s.includes("deposit") ||
+    s === "deposit_required" ||
+    s === "out_of_balance" ||
+    s === "deposit_mint_failed"
+  ) {
     return new TopUpFailedError(msg, { slug: s || undefined, statusCode: status });
   }
   return undefined;
@@ -193,6 +200,27 @@ export class ComputeClient {
 
   async getWalletBalance(): Promise<Record<string, unknown>> {
     const resp = await this.controlPlaneFetch("GET", "/v1/wallet/balance");
+    if (!resp.ok) await readError(resp);
+    return (await resp.json()) as Record<string, unknown>;
+  }
+
+  async walletDeposit(body?: {
+    amountSats?: number;
+    idempotencyKey?: string;
+  }): Promise<Record<string, unknown>> {
+    const payload: Record<string, unknown> = {};
+    if (body?.amountSats != null) payload.amount_sats = body.amountSats;
+    if (body?.idempotencyKey) payload.idempotency_key = body.idempotencyKey;
+    const resp = await this.controlPlaneFetch("POST", "/v1/wallet/deposit", {
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) await readError(resp);
+    return (await resp.json()) as Record<string, unknown>;
+  }
+
+  async walletDepositStatus(paymentHashHex: string): Promise<Record<string, unknown>> {
+    const hex = encodeURIComponent(paymentHashHex.trim());
+    const resp = await this.controlPlaneFetch("GET", `/v1/wallet/deposits/${hex}`);
     if (!resp.ok) await readError(resp);
     return (await resp.json()) as Record<string, unknown>;
   }

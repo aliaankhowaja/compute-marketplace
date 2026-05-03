@@ -43,7 +43,7 @@ Expanded from [00-index.md](./00-index.md) § Build Order. Check items as you co
 
 - [.] Provision GCE VM `lnd-node-mvp` (`e2-small`, `pd-balanced` 30 GB, static internal IP in `sc-lnd`)
 - [ ] Install LND (Neutrino); configure `lnd.conf`; initialize wallet/seed
-- [ ] Open channels with adequate inbound/outbound for top-ups and L402
+- [ ] Open channels with adequate **inbound** liquidity for prepaid agent deposits + outbound for L402 as needed
 - [ ] Export `channel.backup` every 5 min → upload to Supabase Storage `lnd-backups`
 - [ ] Store `lnd-tls-cert`, `lnd-macaroon` (optional: `lnd-node-pubkey`) in Secret Manager
 - [ ] Optional: health sidecar with `/healthz` for alerting
@@ -91,7 +91,7 @@ Expanded from [00-index.md](./00-index.md) § Build Order. Check items as you co
 ### 4.4 Payment (05)
 
 - [ ] LND gRPC client (single node)
-- [ ] Top-up, BOLT12, BOLT11, L402 pool (100 target, refill <40), idempotency
+- [ ] Deposit mint + settle path (`pending_deposits`, balance credit), L402 pool (100 target, refill <40), idempotency store
 - [ ] Error classification per plan
 
 ### 4.5 Orchestrator (04)

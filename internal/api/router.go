@@ -77,7 +77,8 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 	// Wallet (JWT)
 	mux.Handle("POST /v1/wallet/offer", jt(http.HandlerFunc(handleWalletOffer(d))))
 	mux.Handle("GET /v1/wallet/balance", jt(http.HandlerFunc(handleWalletBalance(d))))
-	mux.Handle("POST /v1/wallet/topup", jt(http.HandlerFunc(handleWalletTopup(d))))
+	mux.Handle("POST /v1/wallet/deposit", jt(http.HandlerFunc(handleWalletDeposit(d))))
+	mux.Handle("GET /v1/wallet/deposits/{payment_hash}", jt(http.HandlerFunc(handleWalletDepositStatus(d))))
 
 	// Sandbox lifecycle — API key (credits) or L402 (lightning)
 	sandboxBase := eitherAPIKeyOrL402(d.APIKeys, mint, l402Root, rl)

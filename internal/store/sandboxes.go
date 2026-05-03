@@ -78,6 +78,18 @@ func (s *Store) CountRunningSandboxesByAgent(ctx context.Context, agentID uuid.U
 	return n, err
 }
 
+// MaxMsatsPerSecondRunningSandboxesForAgent returns peak msats/sec among active sandboxes (pending/running) for metering hints.
+func (s *Store) MaxMsatsPerSecondRunningSandboxesForAgent(ctx context.Context, agentID uuid.UUID) (int64, error) {
+	var max int64
+	err := s.Tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(tp.msats_per_second), 0)
+		FROM public.sandboxes s
+		INNER JOIN public.tier_pricing tp ON tp.tier = s.tier
+		WHERE s.agent_id = $1 AND lower(s.status) IN ('pending','running')
+	`, agentID).Scan(&max)
+	return max, err
+}
+
 func (s *Store) ListSandboxesByUser(ctx context.Context, userID uuid.UUID, limit int) ([]Sandbox, error) {
 	if limit <= 0 {
 		limit = 50

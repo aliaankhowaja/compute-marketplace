@@ -74,13 +74,7 @@ func main() {
 		pool.SetSizing(cfg.InvoicePoolTarget, cfg.InvoicePoolRefillBelow)
 		go pool.Run(ctx)
 
-		agents := &payment.StoreAgentOffers{St: st}
-		var bolt12 payment.Bolt12Fetcher
-		if cfg.LNDKHTTPURL != "" {
-			bolt12 = &payment.HTTPBolt12Fetcher{EndpointURL: cfg.LNDKHTTPURL}
-		}
-		ln := payment.NewLNURLClient(time.Duration(cfg.LNURLHTTPTimeoutSecs) * time.Second)
-		paySvc = payment.NewService(lnd, pool, nil, agents, bolt12, ln)
+		paySvc = payment.NewService(lnd, pool, nil, st)
 		paySvc.Chain = net
 		payIface = paySvc
 		mint = paySvc

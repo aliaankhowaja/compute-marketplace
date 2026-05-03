@@ -15,11 +15,11 @@ import (
 
 // AuditInterval is one second of metering shipped to the control plane.
 type AuditInterval struct {
-	StartedAt      time.Time `json:"started_at"`
-	EndedAt        time.Time `json:"ended_at"`
-	RatePerSecond  int64     `json:"rate_per_second"`
-	Consumed       int64     `json:"consumed"`
-	BillingMethod  string    `json:"billing_method"`
+	StartedAt     time.Time `json:"started_at"`
+	EndedAt       time.Time `json:"ended_at"`
+	RatePerSecond int64     `json:"rate_per_second"`
+	Consumed      int64     `json:"consumed"`
+	BillingMethod string    `json:"billing_method"`
 }
 
 type auditBatchPayload struct {
@@ -30,13 +30,13 @@ type auditBatchPayload struct {
 }
 
 type triggerPayload struct {
-	SandboxID     string `json:"sandbox_id"`
-	PodID         string `json:"pod_id"`
-	BillingMethod string `json:"billing_method"`
-	Balance       int64  `json:"balance"`
-	ConsumedTotal int64  `json:"consumed_total"`
-	Reason        string `json:"reason,omitempty"`
-	RequestedTopup int64 `json:"requested_topup,omitempty"`
+	SandboxID      string `json:"sandbox_id"`
+	PodID          string `json:"pod_id"`
+	BillingMethod  string `json:"billing_method"`
+	Balance        int64  `json:"balance"`
+	ConsumedTotal  int64  `json:"consumed_total"`
+	Reason         string `json:"reason,omitempty"`
+	RequestedTopup int64  `json:"requested_topup,omitempty"`
 }
 
 // Callbacks posts billing lifecycle signals to the control plane with retries.
@@ -154,19 +154,6 @@ func (c *Callbacks) PostAuditBatch(ctx context.Context, intervals []AuditInterva
 	return c.postJSON(ctx, "v1/runtime/billing/audit-batch", body)
 }
 
-// PostTopupTrigger requests additional prepaid balance from the control plane.
-func (c *Callbacks) PostTopupTrigger(ctx context.Context, balance, consumedTotal int64) error {
-	body := triggerPayload{
-		SandboxID:      c.cfg.SandboxID,
-		PodID:          c.cfg.PodID,
-		BillingMethod:  c.cfg.BillingMethod,
-		Balance:        balance,
-		ConsumedTotal:  consumedTotal,
-		RequestedTopup: c.cfg.TopupAmount,
-	}
-	return c.postJSON(ctx, "v1/runtime/topup-trigger", body)
-}
-
 // PostPauseTrigger asks the control plane to pause the sandbox (out of balance).
 func (c *Callbacks) PostPauseTrigger(ctx context.Context, balance, consumedTotal int64, reason string) error {
 	body := triggerPayload{
@@ -180,13 +167,14 @@ func (c *Callbacks) PostPauseTrigger(ctx context.Context, balance, consumedTotal
 	return c.postJSON(ctx, "v1/runtime/pause-trigger", body)
 }
 
-type topupResponse struct {
+type allocateResponse struct {
 	BalanceDelta int64 `json:"balance_delta"`
 	NewBalance   int64 `json:"new_balance"`
+	ErrorClass   string `json:"error_class,omitempty"`
 }
 
-// PostTopupTriggerApply posts top-up and optionally applies balance_delta / new_balance from JSON body.
-func (c *Callbacks) PostTopupTriggerApply(ctx context.Context, balance, consumedTotal int64, apply func(delta int64, newBal int64)) error {
+// PostCreditAllocateApply requests additional prepaid credits from the control plane (credits path only).
+func (c *Callbacks) PostCreditAllocateApply(ctx context.Context, balance, consumedTotal int64, apply func(delta int64, newBal int64)) error {
 	payload, err := json.Marshal(triggerPayload{
 		SandboxID:      c.cfg.SandboxID,
 		PodID:          c.cfg.PodID,
@@ -238,7 +226,7 @@ func (c *Callbacks) PostTopupTriggerApply(ctx context.Context, balance, consumed
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			c.resetFailure()
 			if apply != nil {
-				var tr topupResponse
+				var tr allocateResponse
 				_ = json.Unmarshal(bodyBytes, &tr)
 				switch {
 				case tr.NewBalance != 0:
@@ -257,4 +245,79 @@ func (c *Callbacks) PostTopupTriggerApply(ctx context.Context, balance, consumed
 	}
 
 	return lastErr
+}
+
+// RuntimeDepositMint is a BOLT11 deposit invoice minted when the sandbox requests prepaid funds over Lightning.
+type RuntimeDepositMint struct {
+	Bolt11        string `json:"bolt11"`
+	PaymentHash   string `json:"payment_hash"`
+	AmountMsats   int64  `json:"amount_msats"`
+	ExpiresAt     string `json:"expires_at"`
+	WarningLevel  string `json:"warning_level,omitempty"`
+	ErrorClass    string `json:"error_class,omitempty"`
+}
+
+type runtimeMintEnvelope struct {
+	ErrorClass string `json:"error_class"`
+	Deposit    struct {
+		Bolt11      string `json:"bolt11"`
+		PaymentHash string `json:"payment_hash"`
+		AmountMsats int64  `json:"amount_msats"`
+		ExpiresAt   string `json:"expires_at"`
+	} `json:"deposit"`
+	WarningLevel string `json:"warning_level,omitempty"`
+}
+
+// PostRuntimeDepositMint asks the control plane to mint a deposit invoice (lightning path only).
+func (c *Callbacks) PostRuntimeDepositMint(ctx context.Context, balance, consumedTotal int64) (*RuntimeDepositMint, error) {
+	payload, err := json.Marshal(triggerPayload{
+		SandboxID:      c.cfg.SandboxID,
+		PodID:          c.cfg.PodID,
+		BillingMethod:  c.cfg.BillingMethod,
+		Balance:        balance,
+		ConsumedTotal:  consumedTotal,
+		RequestedTopup: c.cfg.TopupAmount,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	url := joinURL(c.cfg.ControlPlaneURL, "v1/runtime/topup-trigger")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.cfg.CallbackSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.CallbackSecret)
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.bumpFailure()
+		return nil, err
+	}
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.bumpFailure()
+		return nil, fmt.Errorf("runtime deposit mint callback status=%d", resp.StatusCode)
+	}
+	c.resetFailure()
+	var raw runtimeMintEnvelope
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(raw.Deposit.Bolt11) == "" {
+		return nil, fmt.Errorf("missing deposit in response (%s)", raw.ErrorClass)
+	}
+	return &RuntimeDepositMint{
+		Bolt11:       raw.Deposit.Bolt11,
+		PaymentHash:  raw.Deposit.PaymentHash,
+		AmountMsats:  raw.Deposit.AmountMsats,
+		ExpiresAt:    raw.Deposit.ExpiresAt,
+		WarningLevel: raw.WarningLevel,
+		ErrorClass:   raw.ErrorClass,
+	}, nil
 }
