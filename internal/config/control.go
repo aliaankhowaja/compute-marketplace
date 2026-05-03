@@ -59,6 +59,11 @@ type Control struct {
 
 	// ControlPlanePublicURL is passed to RunPod pods (e.g. https://api.sockt.dev).
 	ControlPlanePublicURL string
+
+	// MCP (Streamable HTTP / JSON-RPC)
+	MCPProxyTimeout       time.Duration
+	MCPRequestBodyLimit   int64
+	MCPDataJWTTTL         time.Duration // 0 = use DataJWTTTL for data_jwt minting on MCP→pod proxy
 }
 
 func envOrDefault(key, def string) string {
@@ -167,6 +172,19 @@ func Load() (*Control, error) {
 	}
 
 	c.DataJWTTTL, err = parseDurationSecs("DATA_JWT_TTL_SECS", time.Hour)
+	if err != nil {
+		return nil, err
+	}
+
+	c.MCPProxyTimeout, err = parseDurationSecs("MCP_PROXY_TIMEOUT_SECS", 120*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	c.MCPRequestBodyLimit, err = parseInt64("MCP_REQUEST_BODY_LIMIT_BYTES", 4<<20)
+	if err != nil {
+		return nil, err
+	}
+	c.MCPDataJWTTTL, err = parseDurationSecs("MCP_DATA_JWT_TTL_SECS", 0)
 	if err != nil {
 		return nil, err
 	}

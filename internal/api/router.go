@@ -7,6 +7,7 @@ import (
 
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 	"github.com/aliaankhowaja/sockt-backend/internal/config"
+	"github.com/aliaankhowaja/sockt-backend/internal/mcp"
 	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/payment"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
@@ -53,17 +54,14 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 		writeJSON(w, http.StatusOK, rows)
 	}))
 
-	// MCP stub
-	mux.Handle("GET /v1/mcp/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":   "ok",
-			"protocol": "streamable-http",
-			"deferred": true,
-		})
-	}))
-
 	jwtAuth := auth.JWTAuth(d.Cfg.SupabaseJWTSecret)
 	rl := auth.NewRateLimiter(300)
+
+	mcpSvc := mcp.NewService(d.Cfg, d.Store, d.PaySvc, d.Orch, nil)
+	mux.Handle("GET /v1/mcp/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, mcp.HealthPayload())
+	}))
+	mux.Handle("POST /v1/mcp", mcp.AuthMiddleware(d.APIKeys, d.Cfg.SupabaseJWTSecret, mint, l402Root, rl.Middleware(mcp.Handler(mcpSvc))))
 
 	// User JWT routes
 	jt := func(h http.Handler) http.Handler {
