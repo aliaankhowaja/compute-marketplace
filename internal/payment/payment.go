@@ -22,9 +22,16 @@ const (
 	defaultPayWait    = 25 * time.Second
 )
 
-// AgentOffers resolves Bolt12/manual routing data for prepaid pull payments.
+// AgentOfferInfo describes how to pull prepaid top-ups for an agent.
+type AgentOfferInfo struct {
+	OfferType        string // bolt12 | manual_bolt11 | lnurl_pay
+	Bolt12Offer      string
+	LightningAddress string // user@domain.com or https://... lnurl
+}
+
+// AgentOffers resolves Bolt12/manual/lnurl routing data for prepaid pull payments.
 type AgentOffers interface {
-	Lookup(ctx context.Context, agentID uuid.UUID) (offerType string, bolt12Offer string, err error)
+	Lookup(ctx context.Context, agentID uuid.UUID) (AgentOfferInfo, error)
 }
 
 // Payment is the façade consumed by billing, L402, and wallet HTTP handlers.
@@ -46,13 +53,19 @@ type Service struct {
 	IDem              *IdempotencyCache
 	Agents            AgentOffers
 	Bolt12            Bolt12Fetcher
+	LNURL             LNURLFetcher
 	Chain             *chaincfg.Params
 	Bolt12FetchWait   time.Duration
 	PaymentSendExpiry time.Duration
 }
 
-// NewService constructs a Service with optional pool (L402) and fetcher (Bolt12).
-func NewService(lnd *Client, pool *InvoicePool, idem *IdempotencyCache, agents AgentOffers, bolt12 Bolt12Fetcher) *Service {
+// LNURLFetcher resolves a lightning address / LNURL-pay endpoint to a BOLT11 invoice.
+type LNURLFetcher interface {
+	FetchInvoice(ctx context.Context, lightningAddressOrLNURL string, amountSats int64) (bolt11 string, err error)
+}
+
+// NewService constructs a Service with optional pool (L402), fetchers (Bolt12/LNURL), and agents resolver.
+func NewService(lnd *Client, pool *InvoicePool, idem *IdempotencyCache, agents AgentOffers, bolt12 Bolt12Fetcher, lnurl LNURLFetcher) *Service {
 	if idem == nil {
 		idem = NewIdempotencyCache()
 	}
@@ -62,6 +75,7 @@ func NewService(lnd *Client, pool *InvoicePool, idem *IdempotencyCache, agents A
 		IDem:   idem,
 		Agents: agents,
 		Bolt12: bolt12,
+		LNURL:  lnurl,
 	}
 }
 
@@ -258,6 +272,6 @@ func (s *Service) GetNodeHealth(ctx context.Context) (NodeHealth, error) {
 	if err != nil {
 		return h, s.classifyRPC(err)
 	}
-	h.LNDKEstimated = s.Bolt12 != nil
+	h.LNDKEstimated = s.Bolt12 != nil || s.LNURL != nil
 	return h, nil
 }

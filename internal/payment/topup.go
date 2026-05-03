@@ -21,17 +21,50 @@ func (s *Service) TopUpBalance(ctx context.Context, agentID uuid.UUID, sats int6
 	if s.Agents == nil {
 		return "", classifyErr(ClassOfferInvalid, errors.New("agents store not wired"))
 	}
-	offerType, offer, err := s.Agents.Lookup(ctx, agentID)
+	info, err := s.Agents.Lookup(ctx, agentID)
 	if err != nil {
 		return "", err
 	}
-	if strings.EqualFold(offerType, "manual_bolt11") {
+	offerType := strings.ToLower(strings.TrimSpace(info.OfferType))
+	switch offerType {
+	case "manual_bolt11":
 		s.IDem.SetFailure(idempotencyKey, ErrManualTopUpRequired, defaultIdemTTL)
 		return "", ErrManualTopUpRequired
+	case "lnurl_pay":
+		addr := strings.TrimSpace(info.LightningAddress)
+		if addr == "" {
+			classed := classifyErr(ClassOfferInvalid, errors.New("missing lightning_address for lnurl_pay"))
+			s.IDem.SetFailure(idempotencyKey, classed, defaultIdemTTL)
+			return "", classed
+		}
+		if s.LNURL == nil {
+			err := classifyErr(ClassOfferInvalid, errors.New("lnurl client not configured"))
+			s.IDem.SetFailure(idempotencyKey, err, defaultIdemTTL)
+			return "", err
+		}
+		inv, err := s.LNURL.FetchInvoice(ctx, addr, sats)
+		if err != nil {
+			s.IDem.SetFailure(idempotencyKey, err, defaultIdemTTL)
+			return "", err
+		}
+		preImgHex, err := s.finalizePaymentRequest(ctx, inv)
+		if err != nil {
+			s.IDem.SetFailure(idempotencyKey, err, defaultIdemTTL)
+			return "", err
+		}
+		s.IDem.SetSuccess(idempotencyKey, preImgHex, defaultIdemTTL)
+		return preImgHex, nil
+	case "bolt12", "":
+		// Primary BOLT12 path (empty offer_type treated as bolt12 for backward compatibility).
+	default:
+		classed := classifyErr(ClassOfferInvalid, fmt.Errorf("unsupported offer_type %q", offerType))
+		s.IDem.SetFailure(idempotencyKey, classed, defaultIdemTTL)
+		return "", classed
 	}
-	o := strings.TrimSpace(offer)
+
+	o := strings.TrimSpace(info.Bolt12Offer)
 	if o == "" {
-		classed := classifyErr(ClassOfferInvalid, errors.New("missing bolt12 offer"))
+		classed := classifyErr(ClassOfferInvalid, errors.New("missing bolt12 offer (set offer_type=lnurl_pay or register an offer)"))
 		s.IDem.SetFailure(idempotencyKey, classed, defaultIdemTTL)
 		return "", classed
 	}

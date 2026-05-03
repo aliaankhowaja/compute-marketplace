@@ -1,0 +1,13 @@
+# sockt control plane (sockt-cp)
+FROM golang:bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/sockt-cp ./cmd/control-plane
+
+FROM alpine:3.20
+RUN adduser -D -H -u 65532 sockt
+COPY --from=build /out/sockt-cp /usr/local/bin/sockt-cp
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/sockt-cp"]

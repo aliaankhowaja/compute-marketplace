@@ -51,6 +51,20 @@ func (p *InvoicePool) Size() int {
 	return len(p.pending)
 }
 
+func (p *InvoicePool) SetSizing(target, refillBelow int) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if target > 0 {
+		p.target = target
+	}
+	if refillBelow > 0 {
+		p.refillBelow = refillBelow
+	}
+}
+
 // Run keeps the invoice pool warm until ctx is canceled.
 func (p *InvoicePool) Run(ctx context.Context) {
 	tick := time.NewTicker(750 * time.Millisecond)
