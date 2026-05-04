@@ -158,16 +158,11 @@ export class ComputeClient {
     }
   }
 
-  async createSandbox(body: {
-    billingMethod: string;
-    template: string;
-    tier?: string;
-  }): Promise<Sandbox> {
+  async createSandbox(body: { billingMethod: string; tier: string }): Promise<Sandbox> {
     const payload: Record<string, unknown> = {
       billing_method: body.billingMethod,
-      template: body.template,
+      tier: body.tier,
     };
-    if (body.tier) payload.tier = body.tier;
     const resp = await this.controlPlaneFetch("POST", "/v1/sandbox/create", {
       body: JSON.stringify(payload),
     });

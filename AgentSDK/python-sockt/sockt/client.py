@@ -142,10 +142,8 @@ class ComputeClient:
 
     # --- public ---
 
-    def create_sandbox(self, *, billing_method: str, template: str, tier: str | None = None, **_: Any) -> Sandbox:
-        body: dict[str, Any] = {"billing_method": billing_method, "template": template}
-        if tier:
-            body["tier"] = tier
+    def create_sandbox(self, *, billing_method: str, tier: str, **_: Any) -> Sandbox:
+        body: dict[str, Any] = {"billing_method": billing_method, "tier": tier}
         resp = self._request_cp("POST", "/v1/sandbox/create", json=body)
         self._raise_for_cp(resp)
         row = resp.json()

@@ -12,7 +12,7 @@ Usage:
 from sockt import ComputeClient
 
 client = ComputeClient(api_url="https://api.sockt.dev", api_key="sockt_live_...")
-sb = client.create_sandbox(billing_method="credits", template="sockt-default")
+sb = client.create_sandbox(billing_method="credits", tier="nano")
 print(sb.pod_id, sb.data_endpoint)
 out = sb.exec("uname -a")
 print(out.stdout)
