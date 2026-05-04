@@ -5,15 +5,42 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
-const protocolVersion = "2025-11"
+const (
+	protocolVersion2024   = "2024-11-05"
+	protocolVersion202506 = "2025-06-18"
+	protocolVersion2025   = "2025-11-25"
+)
+
+// protocolVersionDefault is returned when the client omits protocolVersion on initialize.
+const protocolVersionDefault = protocolVersion2025
+
+var supportedProtocolVersions = []string{
+	protocolVersion2024,
+	protocolVersion202506,
+	protocolVersion2025,
+}
+
+func negotiateProtocolVersion(clientRequested string) (string, error) {
+	c := strings.TrimSpace(clientRequested)
+	if c == "" {
+		return protocolVersionDefault, nil
+	}
+	for _, v := range supportedProtocolVersions {
+		if c == v {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("unsupported protocol version %q (supported: %s)", c, strings.Join(supportedProtocolVersions, ", "))
+}
 
 // HealthPayload is the GET /v1/mcp/health JSON body.
 func HealthPayload() map[string]any {
 	return map[string]any{
 		"status":            "ok",
-		"protocol_version":  protocolVersion,
+		"protocol_version":  protocolVersionDefault,
 		"transport":         "streamable-http",
 		"json_rpc_per_post": true,
 	}

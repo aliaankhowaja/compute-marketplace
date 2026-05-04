@@ -2,22 +2,56 @@ package mcp
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 )
 
-// Handler serves one JSON-RPC 2.0 message per POST (Streamable HTTP MVP).
-func Handler(svc *Service) http.Handler {
+// SSEHandler serves legacy MCP SSE: GET opens a stream advertising the JSON-RPC POST endpoint URL.
+func SSEHandler(postEndpointURL string) http.Handler {
+	postEndpointURL = strings.TrimSpace(postEndpointURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		if postEndpointURL == "" {
+			http.Error(w, "server misconfigured", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", postEndpointURL)
+		fl.Flush()
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				fmt.Fprintf(w, ": ping\n\n")
+				fl.Flush()
+			}
+		}
+	})
+}
+
+// Handler serves one JSON-RPC 2.0 message per POST (Streamable HTTP MVP).
+func Handler(svc *Service) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limit := int64(4 << 20)
 		if svc != nil && svc.Cfg != nil && svc.Cfg.MCPRequestBodyLimit > 0 {
 			limit = svc.Cfg.MCPRequestBodyLimit
@@ -51,10 +85,24 @@ func Handler(svc *Service) http.Handler {
 
 		switch strings.TrimSpace(req.Method) {
 		case "initialize":
+			var initParams struct {
+				ProtocolVersion string `json:"protocolVersion"`
+			}
+			if len(req.Params) > 0 && string(req.Params) != "null" {
+				if err := json.Unmarshal(req.Params, &initParams); err != nil {
+					writeJSON(w, http.StatusOK, rpcErr(req.ID, http.StatusBadRequest, "invalid_params", err.Error(), nil))
+					return
+				}
+			}
+			pv, err := negotiateProtocolVersion(initParams.ProtocolVersion)
+			if err != nil {
+				writeJSON(w, http.StatusOK, rpcErr(req.ID, http.StatusBadRequest, "unsupported_protocol_version", err.Error(), nil))
+				return
+			}
 			sid := uuid.NewString()
 			w.Header().Set("Mcp-Session-Id", sid)
 			writeJSON(w, http.StatusOK, rpcOK(req.ID, map[string]any{
-				"protocolVersion": protocolVersion,
+				"protocolVersion": pv,
 				"capabilities": map[string]any{
 					"tools": map[string]any{},
 				},

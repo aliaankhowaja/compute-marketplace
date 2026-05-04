@@ -20,6 +20,7 @@ func JWTAuth(secret string) func(http.Handler) http.Handler {
 			}
 			raw := bearerToken(r.Header.Get("Authorization"))
 			if raw == "" {
+				SocktBearerWWWAuthenticate(w)
 				http.Error(w, "missing authorization", http.StatusUnauthorized)
 				return
 			}
@@ -30,11 +31,13 @@ func JWTAuth(secret string) func(http.Handler) http.Handler {
 				return sec, nil
 			})
 			if err != nil || !tok.Valid {
+				SocktBearerWWWAuthenticate(w)
 				http.Error(w, "invalid token", http.StatusUnauthorized)
 				return
 			}
 			claims, ok := tok.Claims.(jwt.MapClaims)
 			if !ok {
+				SocktBearerWWWAuthenticate(w)
 				http.Error(w, "invalid claims", http.StatusUnauthorized)
 				return
 			}
@@ -42,6 +45,7 @@ func JWTAuth(secret string) func(http.Handler) http.Handler {
 			sub = strings.TrimSpace(sub)
 			uid, err := uuid.Parse(sub)
 			if err != nil {
+				SocktBearerWWWAuthenticate(w)
 				http.Error(w, "invalid sub", http.StatusUnauthorized)
 				return
 			}
@@ -70,6 +74,7 @@ func BearerSecret(secret string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := bearerToken(r.Header.Get("Authorization"))
 		if sec == "" || got != sec {
+			SocktBearerWWWAuthenticate(w)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

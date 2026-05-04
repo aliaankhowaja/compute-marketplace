@@ -15,7 +15,7 @@ import (
 
 func TestHealthPayload(t *testing.T) {
 	h := HealthPayload()
-	if h["status"] != "ok" || h["protocol_version"] != "2025-11" {
+	if h["status"] != "ok" || h["protocol_version"] != protocolVersionDefault {
 		t.Fatal(h)
 	}
 }
@@ -33,7 +33,7 @@ func TestHandlerInitializeAndToolsList(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11"}}`)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`)
 	res, err := http.Post(srv.URL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -50,7 +50,7 @@ func TestHandlerInitializeAndToolsList(t *testing.T) {
 		t.Fatal(env.Error)
 	}
 	m, _ := env.Result.(map[string]any)
-	if m["protocolVersion"] != protocolVersion {
+	if m["protocolVersion"] != protocolVersion2025 {
 		t.Fatal(m)
 	}
 
@@ -71,6 +71,58 @@ func TestHandlerInitializeAndToolsList(t *testing.T) {
 	tools, _ := rm["tools"].([]any)
 	if len(tools) != 13 {
 		t.Fatalf("tools/list: got %d tools", len(tools))
+	}
+}
+
+func TestHandlerInitializeNegotiates202506(t *testing.T) {
+	cfg := &config.Control{Port: "8080", MCPRequestBodyLimit: 1 << 20}
+	svc := NewService(cfg, nil, nil, nil, nil)
+	h := Handler(svc)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`)
+	res, err := http.Post(srv.URL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var env Response
+	if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error != nil {
+		t.Fatal(env.Error)
+	}
+	m, _ := env.Result.(map[string]any)
+	if m["protocolVersion"] != protocolVersion202506 {
+		t.Fatal(m)
+	}
+}
+
+func TestHandlerInitializeNegotiates2024(t *testing.T) {
+	cfg := &config.Control{Port: "8080", MCPRequestBodyLimit: 1 << 20}
+	svc := NewService(cfg, nil, nil, nil, nil)
+	h := Handler(svc)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`)
+	res, err := http.Post(srv.URL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var env Response
+	if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error != nil {
+		t.Fatal(env.Error)
+	}
+	m, _ := env.Result.(map[string]any)
+	if m["protocolVersion"] != protocolVersion2024 {
+		t.Fatal(m)
 	}
 }
 

@@ -102,11 +102,34 @@ After authentication, sandbox access checks [`canAccessSandbox`](internal/api/ha
 
 ---
 
+### `GET /v1/mcp`
+
+**Auth:** None (legacy MCP SSE handshake only).
+
+**Purpose:** Opens a Server-Sent Events stream that emits one `endpoint` event with the absolute URL of the JSON-RPC POST endpoint (`…/v1/mcp`). The client must send MCP requests via **POST** with credentials; this GET does not authenticate.
+
+---
+
 ### `POST /v1/mcp`
 
-**Auth:** API key (`sockt_live_…`) OR L402 OR Supabase JWT (see [`AuthMiddleware`](internal/mcp/auth.go)). Wrapped with rate limiting.
+**Auth:** API key (`sockt_live_…`) OR L402 OR Supabase JWT (see [`AuthMiddleware`](internal/mcp/auth.go)). Wrapped with rate limiting. Unauthenticated requests return **401** with `WWW-Authenticate: Bearer realm="sockt-mcp"` (plain Bearer; no OAuth metadata so MCP clients use static headers from config).
 
 **Purpose:** Single JSON-RPC 2.0 request per POST — “Streamable HTTP MVP” ([`internal/mcp/handler.go`](internal/mcp/handler.go)). Request body capped by config (`MCPRequestBodyLimit`, default 4 MiB).
+
+**Cursor (and similar clients):** Put your API key in `mcp.json` so every request sends `Authorization: Bearer sockt_live_…`:
+
+```json
+{
+  "mcpServers": {
+    "sockt": {
+      "url": "https://<your-control-plane>/v1/mcp",
+      "headers": {
+        "Authorization": "Bearer sockt_live_..."
+      }
+    }
+  }
+}
+```
 
 **Supported methods:**
 
@@ -472,6 +495,7 @@ Writes an audit row on success.
 | GET | `/healthz` | Public |
 | GET | `/v1/pricing` | Public |
 | GET | `/v1/mcp/health` | Public |
+| GET | `/v1/mcp` | Public (SSE advertises POST URL only) |
 | POST | `/v1/mcp` | API key / L402 / JWT |
 | GET | `/v1/user/profile` | JWT |
 | GET | `/v1/user/credits` | JWT |

@@ -40,6 +40,12 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 	mux.HandleFunc("GET /healthz", handleCPHealth)
 	mux.HandleFunc("GET /health", handleCPHealth)
 
+	// OAuth/OIDC discovery is not supported; explicit 404 avoids ambiguous client behavior.
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", http.NotFound)
+	mux.HandleFunc("HEAD /.well-known/oauth-authorization-server", http.NotFound)
+	mux.HandleFunc("GET /.well-known/openid-configuration", http.NotFound)
+	mux.HandleFunc("HEAD /.well-known/openid-configuration", http.NotFound)
+
 	// Public catalog
 	mux.Handle("GET /v1/pricing", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rows, err := d.Store.ListTierPricing(r.Context())
@@ -54,9 +60,12 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 	rl := auth.NewRateLimiter(300)
 
 	mcpSvc := mcp.NewService(d.Cfg, d.Store, d.PaySvc, d.Orch, nil)
+	postMCPURL := controlPlaneOrigin(d) + "/v1/mcp"
 	mux.Handle("GET /v1/mcp/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mcp.HealthPayload())
 	}))
+	// Legacy SSE: public handshake; POST /v1/mcp still requires auth.
+	mux.Handle("GET /v1/mcp", rl.Middleware(mcp.SSEHandler(postMCPURL)))
 	mux.Handle("POST /v1/mcp", mcp.AuthMiddleware(d.APIKeys, d.Cfg.SupabaseJWTSecret, mint, l402Root, rl.Middleware(mcp.Handler(mcpSvc))))
 
 	// User JWT routes
@@ -97,6 +106,14 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 	mux.Handle("POST /internal/webhooks/stripe", http.HandlerFunc(handleStripeWebhook(d)))
 
 	return recoverReqIDLog(mux)
+}
+
+func controlPlaneOrigin(d RouterDeps) string {
+	base := strings.TrimRight(strings.TrimSpace(d.Cfg.ControlPlanePublicURL), "/")
+	if base == "" {
+		base = "http://127.0.0.1:" + d.Cfg.Port
+	}
+	return base
 }
 
 func eitherAPIKeyOrL402(keys *auth.APIKeyCache, mint auth.Bolt11Mint, root []byte, rl *auth.RateLimiter) func(http.Handler) http.Handler {

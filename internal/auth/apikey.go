@@ -15,6 +15,12 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
 
+// SocktBearerWWWAuthenticate sets an RFC 6750 Bearer challenge without resource_metadata
+// so MCP clients (e.g. Cursor) do not try OAuth discovery / dynamic client registration.
+func SocktBearerWWWAuthenticate(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="sockt-mcp"`)
+}
+
 // APIKeyCache resolves hashed API keys with an LRU fronting Postgres.
 type APIKeyCache struct {
 	St    *store.Store
@@ -71,12 +77,14 @@ func (a *APIKeyCache) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw := bearerToken(r.Header.Get("Authorization"))
 		if raw == "" || !strings.HasPrefix(raw, "sockt_live_") {
+			SocktBearerWWWAuthenticate(w)
 			http.Error(w, "missing api key", http.StatusUnauthorized)
 			return
 		}
 		hash := store.HashAPIKey(raw)
 		k, err := a.get(r.Context(), hash)
 		if err != nil || k == nil || !k.IsActive {
+			SocktBearerWWWAuthenticate(w)
 			http.Error(w, "invalid api key", http.StatusUnauthorized)
 			return
 		}
