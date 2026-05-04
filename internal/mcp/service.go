@@ -158,29 +158,25 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	if bm != "lightning" && bm != "credits" {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing_method must be lightning or credits"}
 	}
-	tplName := argString(args, "template")
-	if tplName == "" {
-		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "template required"}
-	}
-	tpl, err := s.Store.GetTemplateByName(ctx, tplName)
-	if err != nil || tpl == nil {
-		return nil, http.StatusBadRequest, "bad_template", map[string]any{"message": "unknown template"}
-	}
-	tier := argString(args, "tier")
+	tier := strings.TrimSpace(argString(args, "tier"))
 	if tier == "" {
-		tier = tpl.DefaultTier
+		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "tier required"}
 	}
 	pr, err := s.Store.GetTierPricing(ctx, tier)
 	if err != nil || pr == nil {
 		return nil, http.StatusBadRequest, "bad_tier", map[string]any{"message": "unknown tier"}
 	}
+	_, templateLabel, runtime, err := orchestrator.ResolveTier(s.Cfg, tier)
+	if err != nil {
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": err.Error()}
+	}
 
 	sb := &store.Sandbox{
 		BillingMethod: bm,
 		Tier:          tier,
-		Template:      tplName,
+		Template:      templateLabel,
 		Status:        "pending",
-		Runtime:       tpl.Runtime,
+		Runtime:       runtime,
 		ConsumedMsats: 0,
 	}
 
@@ -271,7 +267,7 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	if s.Orch == nil {
 		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "runpod not configured"}
 	}
-	if err := s.Orch.CreateSandbox(ctx, sb, tpl, env); err != nil {
+	if err := s.Orch.CreateSandbox(ctx, sb, env); err != nil {
 		return nil, http.StatusBadGateway, "runpod_error", map[string]any{"message": err.Error()}
 	}
 	sb2, _ := s.Store.GetSandbox(ctx, sb.ID)
@@ -529,10 +525,10 @@ func (s *Service) toolSandboxExtendBalance(ctx context.Context, p *auth.Principa
 			wlvl = ag3.WarningLevel
 		}
 		return map[string]any{
-			"bolt11":         dep.PaymentRequest,
-			"payment_hash":   hex.EncodeToString(dep.RHash),
-			"amount_msats":   dep.AmountMsats,
-			"expires_at":     expRFC,
+			"bolt11":        dep.PaymentRequest,
+			"payment_hash":  hex.EncodeToString(dep.RHash),
+			"amount_msats":  dep.AmountMsats,
+			"expires_at":    expRFC,
 			"warning_level": wlvl,
 		}, 0, "", nil
 	default:
@@ -582,14 +578,14 @@ func (s *Service) toolWalletBalance(ctx context.Context, p *auth.Principal) (any
 		depositURL = cp + "/v1/wallet/deposit"
 	}
 	return map[string]any{
-		"balance_msats":             ag.BalanceMsats,
-		"active_sandboxes":         active,
-		"billing_hint_msats_sec":    rate,
-		"warning_level":             ag.WarningLevel,
-		"next_action":               nextAction,
-		"min_deposit_msats":        minD,
-		"suggested_deposit_msats":  sug,
-		"deposit_url":               depositURL,
+		"balance_msats":           ag.BalanceMsats,
+		"active_sandboxes":        active,
+		"billing_hint_msats_sec":  rate,
+		"warning_level":           ag.WarningLevel,
+		"next_action":             nextAction,
+		"min_deposit_msats":       minD,
+		"suggested_deposit_msats": sug,
+		"deposit_url":             depositURL,
 	}, 0, "", nil
 }
 
@@ -636,10 +632,10 @@ func (s *Service) toolWalletDeposit(ctx context.Context, p *auth.Principal, args
 	}
 	expRFC := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second).Format(time.RFC3339)
 	return map[string]any{
-		"bolt11":         dep.PaymentRequest,
-		"payment_hash":   hex.EncodeToString(dep.RHash),
-		"amount_msats":   dep.AmountMsats,
-		"expires_at":     expRFC,
+		"bolt11":           dep.PaymentRequest,
+		"payment_hash":     hex.EncodeToString(dep.RHash),
+		"amount_msats":     dep.AmountMsats,
+		"expires_at":       expRFC,
 		"min_amount_msats": int64(1000),
 	}, 0, "", nil
 }

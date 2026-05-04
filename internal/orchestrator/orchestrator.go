@@ -65,12 +65,83 @@ func (c *RunPodClient) do(ctx context.Context, method, path string, body any) ([
 	return out, resp.StatusCode, err
 }
 
-// CreatePodRequest is a best-effort shape for RunPod REST /pods.
+// CreatePodRequest matches RunPod REST POST /pods (PodCreateInput); fields are additive over time.
+// See https://docs.runpod.io/api-reference/pods/POST/pods
 type CreatePodRequest struct {
 	TemplateID string            `json:"templateId,omitempty"`
 	Name       string            `json:"name,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
-	// Some deployments expect list form — callers may adapt later.
+
+	ComputeType       string   `json:"computeType,omitempty"` // CPU | GPU
+	CPUFlavorIDs      []string `json:"cpuFlavorIds,omitempty"`
+	CPUFlavorPriority string   `json:"cpuFlavorPriority,omitempty"`
+	VCPUCount         int      `json:"vcpuCount,omitempty"`
+	GPUCount          int      `json:"gpuCount,omitempty"`
+	MinVCPUPerGPU     int      `json:"minVCPUPerGPU,omitempty"`
+	MinRAMPerGPU      int      `json:"minRAMPerGPU,omitempty"`
+}
+
+// ResolveTier maps a pricing tier to RunPod CreatePodRequest fields plus labels stored on sandboxes.
+func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templateLabel string, runtime string, err error) {
+	if cfg == nil {
+		return CreatePodRequest{}, "", "", fmt.Errorf("config is nil")
+	}
+	switch strings.TrimSpace(strings.ToLower(tier)) {
+	case "nano", "micro":
+		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
+		}
+		return CreatePodRequest{
+			TemplateID:        id,
+			ComputeType:       "CPU",
+			CPUFlavorIDs:      []string{"cpu3c"},
+			CPUFlavorPriority: "availability",
+			VCPUCount:         1,
+		}, "sockt-cpu", "runpod_cpu", nil
+
+	case "standard":
+		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
+		}
+		return CreatePodRequest{
+			TemplateID:        id,
+			ComputeType:       "CPU",
+			CPUFlavorIDs:      []string{"cpu3c"},
+			CPUFlavorPriority: "availability",
+			VCPUCount:         4,
+		}, "sockt-cpu", "runpod_cpu", nil
+
+	case "gpu_small":
+		id := strings.TrimSpace(cfg.RunPodTemplateGPUSmallID)
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_GPU_SMALL_ID is required")
+		}
+		return CreatePodRequest{
+			TemplateID:    id,
+			ComputeType:   "GPU",
+			GPUCount:      1,
+			MinVCPUPerGPU: 4,
+			MinRAMPerGPU:  16,
+		}, "sockt-gpu-small", "runpod_gpu", nil
+
+	case "gpu_large":
+		id := strings.TrimSpace(cfg.RunPodTemplateGPULargeID)
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_GPU_LARGE_ID is required")
+		}
+		return CreatePodRequest{
+			TemplateID:    id,
+			ComputeType:   "GPU",
+			GPUCount:      1,
+			MinVCPUPerGPU: 8,
+			MinRAMPerGPU:  80,
+		}, "sockt-gpu-large", "runpod_gpu", nil
+
+	default:
+		return CreatePodRequest{}, "", "", fmt.Errorf("unknown tier %q", tier)
+	}
 }
 
 type podCreateResp struct {
@@ -154,15 +225,17 @@ func (c *RunPodClient) TerminatePod(ctx context.Context, id string) error {
 }
 
 // CreateSandbox boots a pod and records DB metadata.
-func (s *Service) CreateSandbox(ctx context.Context, sb *store.Sandbox, template *store.Template, env map[string]string) error {
-	if s == nil || s.Client == nil || s.Store == nil {
+func (s *Service) CreateSandbox(ctx context.Context, sb *store.Sandbox, env map[string]string) error {
+	if s == nil || s.Client == nil || s.Store == nil || s.Cfg == nil {
 		return fmt.Errorf("orchestrator not configured")
 	}
-	req := CreatePodRequest{
-		TemplateID: strings.TrimSpace(template.RunpodTemplateID),
-		Name:       "sockt-" + sb.ID.String()[:8],
-		Env:        env,
+	partial, _, _, err := ResolveTier(s.Cfg, sb.Tier)
+	if err != nil {
+		return err
 	}
+	req := partial
+	req.Name = "sockt-" + sb.ID.String()[:8]
+	req.Env = env
 	pid, err := s.Client.CreatePod(ctx, req)
 	if err != nil {
 		return err

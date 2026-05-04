@@ -27,7 +27,7 @@ This document describes the HTTP surface exposed by the **sockt control plane** 
 
 ## JSON encoding of persisted models
 
-Types from [`internal/store/store.go`](internal/store/store.go) (`User`, `Sandbox`, `Agent`, `TierPricing`, `Template`, `BillingInterval`, `CreditTxSummary`, etc.) are serialized with **`encoding/json` defaults**: **no struct tags**, so JSON object keys match **Go exported field names** (for example `ID`, `UserID`, `CreditBalanceUSDCents`, `PodProxyURL`). Do not assume `snake_case` for these payloads.
+Types from [`internal/store/store.go`](internal/store/store.go) (`User`, `Sandbox`, `Agent`, `TierPricing`, `BillingInterval`, `CreditTxSummary`, etc.) are serialized with **`encoding/json` defaults**: **no struct tags**, so JSON object keys match **Go exported field names** (for example `ID`, `UserID`, `CreditBalanceUSDCents`, `PodProxyURL`). Do not assume `snake_case` for these payloads.
 
 ---
 
@@ -87,16 +87,6 @@ After authentication, sandbox access checks [`canAccessSandbox`](internal/api/ha
 **Purpose:** Tier pricing rows from the database.
 
 **Response 200:** JSON array of [`TierPricing`](internal/store/store.go) (`Tier`, `MsatsPerSecond`, `USDCentsPerSecondX100`).  
-**Errors:** `store_error` (500).
-
----
-
-### `GET /v1/templates`
-
-**Auth:** None  
-**Purpose:** Sandbox template catalog.
-
-**Response 200:** JSON array of [`Template`](internal/store/store.go).  
 **Errors:** `store_error` (500).
 
 ---
@@ -281,8 +271,7 @@ Empty or missing name defaults to `"default"`.
 ```json
 {
   "billing_method": "lightning | credits",
-  "tier": "optional; defaults from template",
-  "template": "required template name"
+  "tier": "nano | micro | standard | gpu_small | gpu_large"
 }
 ```
 
@@ -290,11 +279,11 @@ Empty or missing name defaults to `"default"`.
 
 - **`credits`:** Caller must authenticate as API key principal; binds `UserID` / `APIKeyID`.
 - **`lightning`:** Caller must authenticate via L402; binds `AgentID`.
-- Validates template and tier pricing; allocates credits server-side when applicable.
+- Validates tier pricing and RunPod tier mapping (`RUNPOD_TEMPLATE_*` env IDs); allocates credits server-side when applicable.
 
-**Response 200:** Full [`Sandbox`](internal/store/store.go) row after orchestrator provisioning (reloaded).
+**Response 200:** Full [`Sandbox`](internal/store/store.go) row after orchestrator provisioning (reloaded). Stored `Template` reflects the canonical label (`sockt-cpu`, `sockt-gpu-small`, `sockt-gpu-large`), not client input.
 
-**Errors (non-exhaustive):** `unauthorized`, `bad_request` (JSON, billing_method, template, tier), `bad_template`, `bad_tier`, `insufficient_credits` (402 credits path), `orchestrator_disabled` (503), `runpod_error` (502), `store_error` (500).
+**Errors (non-exhaustive):** `unauthorized`, `bad_request` (JSON, billing_method, tier), `bad_tier`, `insufficient_credits` (402 credits path), `orchestrator_disabled` (503 RunPod templates misconfigured / unknown tier mapping), `runpod_error` (502), `store_error` (500).
 
 ---
 
@@ -482,7 +471,6 @@ Writes an audit row on success.
 |--------|------|------|
 | GET | `/healthz` | Public |
 | GET | `/v1/pricing` | Public |
-| GET | `/v1/templates` | Public |
 | GET | `/v1/mcp/health` | Public |
 | POST | `/v1/mcp` | API key / L402 / JWT |
 | GET | `/v1/user/profile` | JWT |

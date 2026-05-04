@@ -25,6 +25,10 @@ type Control struct {
 	RunPodAPIKey        string
 	RunPodAPIURL        string
 	RunPodDefaultRegion string
+	// RunPod template IDs for tier-based provisioning (see orchestrator.ResolveTier).
+	RunPodTemplateCPUID      string
+	RunPodTemplateGPUSmallID string
+	RunPodTemplateGPULargeID string
 
 	LNDGRPCHost     string
 	LNDTLSCertPath  string
@@ -61,9 +65,9 @@ type Control struct {
 	ControlPlanePublicURL string
 
 	// MCP (Streamable HTTP / JSON-RPC)
-	MCPProxyTimeout       time.Duration
-	MCPRequestBodyLimit   int64
-	MCPDataJWTTTL         time.Duration // 0 = use DataJWTTTL for data_jwt minting on MCP→pod proxy
+	MCPProxyTimeout     time.Duration
+	MCPRequestBodyLimit int64
+	MCPDataJWTTTL       time.Duration // 0 = use DataJWTTTL for data_jwt minting on MCP→pod proxy
 }
 
 func envOrDefault(key, def string) string {
@@ -113,28 +117,31 @@ func parseDurationSecs(key string, def time.Duration) (time.Duration, error) {
 // Load reads control-plane config from the environment.
 func Load() (*Control, error) {
 	c := &Control{
-		Port:                   envOrDefault("PORT", "8080"),
-		ListenHTTP:             envOrDefault("LISTEN_HTTP", ""),
-		LogLevel:               envOrDefault("LOG_LEVEL", "info"),
-		Environment:            envOrDefault("ENV", "dev"),
-		SupabaseURL:            strings.TrimSpace(os.Getenv("SUPABASE_URL")),
-		SupabaseServiceRoleKey: strings.TrimSpace(os.Getenv("SUPABASE_SERVICE_ROLE_KEY")),
-		SupabaseJWTSecret:      strings.TrimSpace(os.Getenv("SUPABASE_JWT_SECRET")),
-		SupabaseDBTxDSN:        strings.TrimSpace(os.Getenv("SUPABASE_DB_TX_DSN")),
-		SupabaseDBSessionDSN:   strings.TrimSpace(os.Getenv("SUPABASE_DB_SESSION_DSN")),
-		RunPodAPIKey:           strings.TrimSpace(os.Getenv("RUNPOD_API_KEY")),
-		RunPodAPIURL:           envOrDefault("RUNPOD_API_URL", "https://rest.runpod.io/v1"),
-		RunPodDefaultRegion:    envOrDefault("RUNPOD_DEFAULT_REGION", "US-CA-1"),
-		LNDGRPCHost:            strings.TrimSpace(os.Getenv("LND_GRPC_HOST")),
-		LNDTLSCertPath:         strings.TrimSpace(os.Getenv("LND_TLS_CERT_PATH")),
-		LNDMacaroonPath:        strings.TrimSpace(os.Getenv("LND_MACAROON_PATH")),
-		LNDMacaroonHex:         strings.TrimSpace(os.Getenv("LND_MACAROON_HEX")),
-		LNDNetwork:             envOrDefault("LND_NETWORK", "mainnet"),
-		LNDKHTTPURL:            strings.TrimSpace(os.Getenv("LNDK_HTTP_URL")),
-		CallbackSecret:         strings.TrimSpace(os.Getenv("CALLBACK_SECRET")),
-		StripeWebhookSecret:    strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
-		AdminReconcileToken:    strings.TrimSpace(os.Getenv("ADMIN_RECONCILE_TOKEN")),
-		ControlPlanePublicURL:  strings.TrimSpace(os.Getenv("CONTROL_PLANE_URL")),
+		Port:                     envOrDefault("PORT", "8080"),
+		ListenHTTP:               envOrDefault("LISTEN_HTTP", ""),
+		LogLevel:                 envOrDefault("LOG_LEVEL", "info"),
+		Environment:              envOrDefault("ENV", "dev"),
+		SupabaseURL:              strings.TrimSpace(os.Getenv("SUPABASE_URL")),
+		SupabaseServiceRoleKey:   strings.TrimSpace(os.Getenv("SUPABASE_SERVICE_ROLE_KEY")),
+		SupabaseJWTSecret:        strings.TrimSpace(os.Getenv("SUPABASE_JWT_SECRET")),
+		SupabaseDBTxDSN:          strings.TrimSpace(os.Getenv("SUPABASE_DB_TX_DSN")),
+		SupabaseDBSessionDSN:     strings.TrimSpace(os.Getenv("SUPABASE_DB_SESSION_DSN")),
+		RunPodAPIKey:             strings.TrimSpace(os.Getenv("RUNPOD_API_KEY")),
+		RunPodAPIURL:             envOrDefault("RUNPOD_API_URL", "https://rest.runpod.io/v1"),
+		RunPodDefaultRegion:      envOrDefault("RUNPOD_DEFAULT_REGION", "US-CA-1"),
+		RunPodTemplateCPUID:      strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_CPU_ID")),
+		RunPodTemplateGPUSmallID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_SMALL_ID")),
+		RunPodTemplateGPULargeID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_LARGE_ID")),
+		LNDGRPCHost:              strings.TrimSpace(os.Getenv("LND_GRPC_HOST")),
+		LNDTLSCertPath:           strings.TrimSpace(os.Getenv("LND_TLS_CERT_PATH")),
+		LNDMacaroonPath:          strings.TrimSpace(os.Getenv("LND_MACAROON_PATH")),
+		LNDMacaroonHex:           strings.TrimSpace(os.Getenv("LND_MACAROON_HEX")),
+		LNDNetwork:               envOrDefault("LND_NETWORK", "mainnet"),
+		LNDKHTTPURL:              strings.TrimSpace(os.Getenv("LNDK_HTTP_URL")),
+		CallbackSecret:           strings.TrimSpace(os.Getenv("CALLBACK_SECRET")),
+		StripeWebhookSecret:      strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
+		AdminReconcileToken:      strings.TrimSpace(os.Getenv("ADMIN_RECONCILE_TOKEN")),
+		ControlPlanePublicURL:    strings.TrimSpace(os.Getenv("CONTROL_PLANE_URL")),
 	}
 	pem := strings.TrimSpace(os.Getenv("LND_TLS_CERT_PEM"))
 	if pem != "" {

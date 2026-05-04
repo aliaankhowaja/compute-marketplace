@@ -83,15 +83,6 @@ type TierPricing struct {
 	USDCentsPerSecondX100 int64
 }
 
-// Template row.
-type Template struct {
-	ID               uuid.UUID
-	Name             string
-	RunpodTemplateID string
-	Runtime          string
-	DefaultTier      string
-}
-
 // BillingInterval for bulk insert (lightning).
 type BillingInterval struct {
 	SandboxID uuid.UUID

@@ -12,13 +12,12 @@ func toolList() []toolDef {
 	return []toolDef{
 		{
 			Name:        "sandbox_create",
-			Description: "Provision a new sandbox (RunPod). billing_method: lightning | credits. Requires L402 (lightning) or API key (credits).",
+			Description: "Provision a new sandbox (RunPod). billing_method: lightning | credits; tier: nano|micro|standard|gpu_small|gpu_large (maps to sockt templates + specs). Requires L402 (lightning) or API key (credits).",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
-				"required": ["billing_method", "template"],
+				"required": ["billing_method", "tier"],
 				"properties": {
 					"billing_method": {"type": "string", "enum": ["lightning", "credits"]},
-					"template": {"type": "string"},
 					"tier": {"type": "string"},
 					"duration_secs": {"type": "integer"},
 					"egress": {"type": "boolean"},

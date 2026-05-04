@@ -49,14 +49,6 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 		}
 		writeJSON(w, http.StatusOK, rows)
 	}))
-	mux.Handle("GET /v1/templates", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rows, err := d.Store.ListTemplates(r.Context())
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, rows)
-	}))
 
 	jwtAuth := auth.JWTAuth(d.Cfg.SupabaseJWTSecret)
 	rl := auth.NewRateLimiter(300)

@@ -12,9 +12,11 @@ import (
 
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 	"github.com/aliaankhowaja/sockt-backend/internal/lightningwallet"
+	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/payment"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
+
 func canAccessSandbox(p *auth.Principal, sb *store.Sandbox) bool {
 	if p == nil || sb == nil {
 		return false
@@ -310,7 +312,6 @@ func handleWalletDepositStatus(d RouterDeps) func(http.ResponseWriter, *http.Req
 type createSandboxBody struct {
 	BillingMethod string `json:"billing_method"`
 	Tier          string `json:"tier"`
-	Template      string `json:"template"`
 }
 
 func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) {
@@ -330,32 +331,28 @@ func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			writeErr(w, http.StatusBadRequest, "bad_request", "billing_method")
 			return
 		}
-		tplName := strings.TrimSpace(body.Template)
-		if tplName == "" {
-			writeErr(w, http.StatusBadRequest, "bad_request", "template required")
-			return
-		}
-		tpl, err := d.Store.GetTemplateByName(r.Context(), tplName)
-		if err != nil || tpl == nil {
-			writeErr(w, http.StatusBadRequest, "bad_template", "unknown template")
-			return
-		}
 		tier := strings.TrimSpace(body.Tier)
 		if tier == "" {
-			tier = tpl.DefaultTier
+			writeErr(w, http.StatusBadRequest, "bad_request", "tier required")
+			return
 		}
 		pr, err := d.Store.GetTierPricing(r.Context(), tier)
 		if err != nil || pr == nil {
 			writeErr(w, http.StatusBadRequest, "bad_tier", "unknown tier")
 			return
 		}
+		_, templateLabel, runtime, err := orchestrator.ResolveTier(d.Cfg, tier)
+		if err != nil {
+			writeErr(w, http.StatusServiceUnavailable, "orchestrator_disabled", err.Error())
+			return
+		}
 
 		sb := &store.Sandbox{
 			BillingMethod: bm,
 			Tier:          tier,
-			Template:      tplName,
+			Template:      templateLabel,
 			Status:        "pending",
-			Runtime:       tpl.Runtime,
+			Runtime:       runtime,
 			ConsumedMsats: 0,
 		}
 
@@ -434,7 +431,7 @@ func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			writeErr(w, http.StatusServiceUnavailable, "orchestrator_disabled", "runpod not configured")
 			return
 		}
-		if err := d.Orch.CreateSandbox(r.Context(), sb, tpl, env); err != nil {
+		if err := d.Orch.CreateSandbox(r.Context(), sb, env); err != nil {
 			writeErr(w, http.StatusBadGateway, "runpod_error", err.Error())
 			return
 		}
@@ -627,10 +624,10 @@ func handleExtendBalance(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			}
 			expRFC := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second).Format(time.RFC3339)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"bolt11":         dep.PaymentRequest,
-				"payment_hash":   hex.EncodeToString(dep.RHash),
-				"amount_msats":   dep.AmountMsats,
-				"expires_at":     expRFC,
+				"bolt11":        dep.PaymentRequest,
+				"payment_hash":  hex.EncodeToString(dep.RHash),
+				"amount_msats":  dep.AmountMsats,
+				"expires_at":    expRFC,
 				"warning_level": wLvl,
 			})
 		default:

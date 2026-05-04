@@ -36,33 +36,3 @@ func (s *Store) ListTierPricing(ctx context.Context) ([]TierPricing, error) {
 	}
 	return out, rows.Err()
 }
-
-func (s *Store) GetTemplateByName(ctx context.Context, name string) (*Template, error) {
-	q := `SELECT id, name, runpod_template_id, runtime, default_tier FROM public.templates WHERE name = $1`
-	var t Template
-	err := s.Tx.QueryRow(ctx, q, name).Scan(&t.ID, &t.Name, &t.RunpodTemplateID, &t.Runtime, &t.DefaultTier)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &t, nil
-}
-
-func (s *Store) ListTemplates(ctx context.Context) ([]Template, error) {
-	rows, err := s.Tx.Query(ctx, `SELECT id, name, runpod_template_id, runtime, default_tier FROM public.templates ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Template
-	for rows.Next() {
-		var t Template
-		if err := rows.Scan(&t.ID, &t.Name, &t.RunpodTemplateID, &t.Runtime, &t.DefaultTier); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
-	}
-	return out, rows.Err()
-}
