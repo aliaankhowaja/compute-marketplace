@@ -117,6 +117,9 @@ func credForUser(username string) (*syscall.SysProcAttr, error) {
 	if err != nil {
 		return nil, err
 	}
+	if uid64 == 0 {
+		return nil, nil
+	}
 	gid64, err := strconv.ParseUint(u.Gid, 10, 32)
 	if err != nil {
 		return nil, err

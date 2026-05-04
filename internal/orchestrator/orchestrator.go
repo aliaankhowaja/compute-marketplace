@@ -248,6 +248,13 @@ func (s *Service) CreateSandbox(ctx context.Context, sb *store.Sandbox, env map[
 	if err := s.Store.UpdateSandboxPod(ctx, sb.ID, strPtr(pid), strPtr(proxy), sb.NetworkVolumeID); err != nil {
 		return err
 	}
+	if err := s.waitForRuntime(ctx, proxy); err != nil {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		_ = s.Client.TerminatePod(cleanCtx, pid)
+		_ = s.Store.TerminateSandbox(cleanCtx, sb.ID)
+		return fmt.Errorf("runtime not ready: %w", err)
+	}
 	if err := s.Store.UpdateSandboxStatus(ctx, sb.ID, "running"); err != nil {
 		return err
 	}
@@ -271,6 +278,10 @@ func (s *Service) PauseSandbox(ctx context.Context, podID string, sandboxID uuid
 func (s *Service) ResumeSandbox(ctx context.Context, podID string, sandboxID uuid.UUID) error {
 	if err := s.Client.StartPod(ctx, podID); err != nil {
 		return err
+	}
+	proxy := RunPodProxyURL(podID)
+	if err := s.waitForRuntime(ctx, proxy); err != nil {
+		return fmt.Errorf("runtime not ready after resume: %w", err)
 	}
 	return s.Store.UpdateSandboxStatus(ctx, sandboxID, "running")
 }

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -117,6 +118,9 @@ func ShellHandler(cfg *Config, meter *Meter, cb *Callbacks) http.Handler {
 		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 		cmd.Dir = cfg.SandboxRoot
 
+		if cred == nil {
+			cred = &syscall.SysProcAttr{}
+		}
 		cred.Setsid = true
 		cmd.SysProcAttr = cred
 

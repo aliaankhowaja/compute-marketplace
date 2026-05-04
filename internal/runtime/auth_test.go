@@ -42,3 +42,20 @@ func TestVerifyTokenAudience(t *testing.T) {
 		t.Fatal("expected audience error")
 	}
 }
+
+func TestVerifyTokenPodIDOptionalWhenCfgPodIDEmpty(t *testing.T) {
+	sec := []byte("01234567890123456789012345678901")
+	tok, err := auth.MintDataJWT(sec, "sb1", "pod1", "exec", time.Hour, auth.DataJWTAudience)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{
+		SandboxID:   "sb1",
+		PodID:       "",
+		JWTSecret:   sec,
+		JWTAudience: auth.DataJWTAudience,
+	}
+	if _, err := VerifyToken(tok, cfg, ScopeExec); err != nil {
+		t.Fatalf("valid token with cfg.PodID empty should not require pod_id match: %v", err)
+	}
+}

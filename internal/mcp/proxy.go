@@ -171,12 +171,9 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 	if err != nil {
 		return nil, http.StatusServiceUnavailable, "host_unreachable", map[string]any{"message": err.Error()}
 	}
-	_, textErr := decodeJSONOrText(raw, code)
 	if code < 200 || code >= 300 {
-		if textErr != "" {
-			return nil, http.StatusBadGateway, "host_error", map[string]any{"message": textErr, "status": code}
-		}
-		return nil, http.StatusBadGateway, "host_error", map[string]any{"body": string(raw), "status": code}
+		st, ex := hostHTTPFailure(code, raw)
+		return nil, st, "host_error", ex
 	}
 	var out execRuntimeResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -197,6 +194,42 @@ func decodeJSONOrText(raw []byte, httpCode int) (map[string]any, string) {
 		return m, ""
 	}
 	return nil, strings.TrimSpace(string(raw))
+}
+
+// statusFromDataPlane maps runtime HTTP codes to MCP-facing statuses so mapHTTPToRPC
+// yields sensible JSON-RPC error codes (e.g. 404 → not found, not unavailable).
+func statusFromDataPlane(code int) int {
+	switch code {
+	case http.StatusBadRequest:
+		return http.StatusBadRequest
+	case http.StatusUnauthorized:
+		return http.StatusUnauthorized
+	case http.StatusForbidden:
+		return http.StatusForbidden
+	case http.StatusNotFound:
+		return http.StatusNotFound
+	case http.StatusTooManyRequests:
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusBadGateway
+	}
+}
+
+func hostHTTPFailure(code int, raw []byte) (httpStatus int, extra map[string]any) {
+	_, textErr := decodeJSONOrText(raw, code)
+	msg := strings.TrimSpace(textErr)
+	if msg == "" {
+		msg = strings.TrimSpace(string(raw))
+	}
+	if msg == "" {
+		msg = fmt.Sprintf("HTTP %d", code)
+	}
+	ex := map[string]any{"message": msg, "status": code}
+	st := statusFromDataPlane(code)
+	if code == http.StatusNotFound {
+		ex["hint"] = "Path sandbox id must match the runtime SANDBOX_ID. Check PodProxyURL/pod_id for this sandbox row, or reprovision if the pod was swapped."
+	}
+	return st, ex
 }
 
 func (s *Service) toolWriteFile(ctx context.Context, sb *store.Sandbox, args map[string]any) (any, int, string, map[string]any) {
@@ -240,7 +273,8 @@ func (s *Service) toolWriteFile(ctx context.Context, sb *store.Sandbox, args map
 		return nil, http.StatusServiceUnavailable, "host_unreachable", map[string]any{"message": err.Error()}
 	}
 	if code < 200 || code >= 300 {
-		return nil, http.StatusBadGateway, "host_error", map[string]any{"message": string(raw), "status": code}
+		st, ex := hostHTTPFailure(code, raw)
+		return nil, st, "host_error", ex
 	}
 	bw := int64(len(b64)) // approx bytes on wire
 	return map[string]any{
@@ -279,7 +313,8 @@ func (s *Service) toolReadFile(ctx context.Context, sb *store.Sandbox, args map[
 		return nil, http.StatusServiceUnavailable, "host_unreachable", map[string]any{"message": err.Error()}
 	}
 	if code < 200 || code >= 300 {
-		return nil, http.StatusBadGateway, "host_error", map[string]any{"message": string(raw), "status": code}
+		st, ex := hostHTTPFailure(code, raw)
+		return nil, st, "host_error", ex
 	}
 	var rf readFileRuntimeResponse
 	if err := json.Unmarshal(raw, &rf); err != nil {
@@ -340,7 +375,8 @@ func (s *Service) toolListFiles(ctx context.Context, sb *store.Sandbox, args map
 		return nil, http.StatusServiceUnavailable, "host_unreachable", map[string]any{"message": err.Error()}
 	}
 	if code < 200 || code >= 300 {
-		return nil, http.StatusBadGateway, "host_error", map[string]any{"message": string(raw), "status": code}
+		st, ex := hostHTTPFailure(code, raw)
+		return nil, st, "host_error", ex
 	}
 	var lr listFilesRuntimeResponse
 	if err := json.Unmarshal(raw, &lr); err != nil {

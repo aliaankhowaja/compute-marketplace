@@ -38,7 +38,7 @@ func requireSandbox(cfg *Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSpace(r.PathValue("id"))
 		if id == "" || id != cfg.SandboxID {
-			http.Error(w, "not found", http.StatusNotFound)
+			http.Error(w, "sandbox id does not match this runtime", http.StatusNotFound)
 			return
 		}
 		next.ServeHTTP(w, r)

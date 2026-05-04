@@ -71,7 +71,7 @@ func VerifyToken(tokenStr string, cfg *Config, requiredScope string) (*DataJWTCl
 	if claims.SandboxID != cfg.SandboxID {
 		return nil, ErrSandboxMismatch
 	}
-	if claims.PodID != cfg.PodID {
+	if cfg.PodID != "" && claims.PodID != cfg.PodID {
 		return nil, ErrPodMismatch
 	}
 

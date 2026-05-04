@@ -13,6 +13,22 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 )
 
+func rpcErrMessageFromExtra(slug string, extra map[string]any) string {
+	if extra == nil {
+		return slug
+	}
+	if m, ok := extra["message"].(string); ok && strings.TrimSpace(m) != "" {
+		return strings.TrimSpace(m)
+	}
+	if b, ok := extra["body"].(string); ok && strings.TrimSpace(b) != "" {
+		return strings.TrimSpace(b)
+	}
+	if extra["status"] != nil {
+		return fmt.Sprintf("%s (HTTP %v)", slug, extra["status"])
+	}
+	return slug
+}
+
 // SSEHandler serves legacy MCP SSE: GET opens a stream advertising the JSON-RPC POST endpoint URL.
 func SSEHandler(postEndpointURL string) http.Handler {
 	postEndpointURL = strings.TrimSpace(postEndpointURL)
@@ -143,12 +159,7 @@ func Handler(svc *Service) http.Handler {
 				return
 			}
 			if st != 0 {
-				msg := slug
-				if extra != nil && extra["message"] != nil {
-					if m, ok := extra["message"].(string); ok && m != "" {
-						msg = m
-					}
-				}
+				msg := rpcErrMessageFromExtra(slug, extra)
 				writeJSON(w, http.StatusOK, rpcErr(req.ID, st, slug, msg, extra))
 				return
 			}

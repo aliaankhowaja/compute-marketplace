@@ -4,10 +4,19 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/aliaankhowaja/sockt-backend/internal/config"
 )
+
+// configurePoolerSafeConn disables pgx server-side named prepared statements (stmtcache_*),
+// which conflict with transaction-pooling proxies (e.g. Supabase pooler port 6543).
+func configurePoolerSafeConn(cc *pgx.ConnConfig) {
+	cc.StatementCacheCapacity = 0
+	cc.DescriptionCacheCapacity = 0
+	cc.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+}
 
 // New connects tx and session pools from config.
 func New(ctx context.Context, cfg *config.Control) (*Store, error) {
@@ -15,6 +24,7 @@ func New(ctx context.Context, cfg *config.Control) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse tx dsn: %w", err)
 	}
+	configurePoolerSafeConn(txCfg.ConnConfig)
 	txCfg.MaxConns = cfg.DBMaxConns
 	txCfg.MinConns = cfg.DBMinConns
 	txCfg.MaxConnLifetime = cfg.DBMaxConnLifetime
@@ -34,6 +44,7 @@ func New(ctx context.Context, cfg *config.Control) (*Store, error) {
 		txPool.Close()
 		return nil, fmt.Errorf("parse session dsn: %w", err)
 	}
+	configurePoolerSafeConn(sessCfg.ConnConfig)
 	sessCfg.MaxConns = cfg.DBMaxConns
 	sessCfg.MinConns = cfg.DBMinConns
 	sessCfg.MaxConnLifetime = cfg.DBMaxConnLifetime

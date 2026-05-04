@@ -72,6 +72,13 @@ type Control struct {
 	MCPProxyTimeout     time.Duration
 	MCPRequestBodyLimit int64
 	MCPDataJWTTTL       time.Duration // 0 = use DataJWTTTL for data_jwt minting on MCP→pod proxy
+
+	// SandboxReadyTimeout is the max time to wait for sockt-runtime /healthz after pod create or resume (SANDBOX_READY_TIMEOUT_SECS).
+	SandboxReadyTimeout time.Duration
+	// SandboxReadyPollInterval is the delay between readiness probes (SANDBOX_READY_POLL_INTERVAL_MS).
+	SandboxReadyPollInterval time.Duration
+	// SandboxReadyProbeTimeout is the per-request HTTP timeout for each GET /healthz (SANDBOX_READY_PROBE_TIMEOUT_SECS).
+	SandboxReadyProbeTimeout time.Duration
 }
 
 func envOrDefault(key, def string) string {
@@ -116,6 +123,21 @@ func parseDurationSecs(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
 	return time.Duration(n) * time.Second, nil
+}
+
+func parseDurationMillis(key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s: must be >= 0", key)
+	}
+	return time.Duration(n) * time.Millisecond, nil
 }
 
 // Load reads control-plane config from the environment.
@@ -205,6 +227,19 @@ func Load() (*Control, error) {
 		return nil, err
 	}
 	c.MCPDataJWTTTL, err = parseDurationSecs("MCP_DATA_JWT_TTL_SECS", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	c.SandboxReadyTimeout, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_SECS", 120*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	c.SandboxReadyPollInterval, err = parseDurationMillis("SANDBOX_READY_POLL_INTERVAL_MS", 750*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	c.SandboxReadyProbeTimeout, err = parseDurationSecs("SANDBOX_READY_PROBE_TIMEOUT_SECS", 8*time.Second)
 	if err != nil {
 		return nil, err
 	}

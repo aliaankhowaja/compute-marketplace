@@ -252,7 +252,6 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 
 	env := map[string]string{
 		"SANDBOX_ID":             sb.ID.String(),
-		"POD_ID":                 "",
 		"CONTROL_PLANE_URL":      cp,
 		"JWT_SECRET":             string(s.Cfg.WSSJWTSecret),
 		"JWT_AUDIENCE":           s.Cfg.DataJWTAudience,
@@ -542,28 +541,50 @@ func (s *Service) toolWalletBalance(ctx context.Context, p *auth.Principal) (any
 	if p == nil {
 		return nil, http.StatusUnauthorized, "unauthorized", nil
 	}
-	var ag *store.Agent
-	var err error
 	switch p.Kind {
 	case auth.KindL402:
 		if p.AgentID == nil {
 			return nil, http.StatusUnauthorized, "unauthorized", nil
 		}
-		ag, err = s.Store.GetAgentByID(ctx, *p.AgentID)
+		ag, err := s.Store.GetAgentByID(ctx, *p.AgentID)
+		if err != nil {
+			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
+		}
+		if ag == nil {
+			return nil, http.StatusNotFound, "not_found", map[string]any{"message": "register wallet first"}
+		}
+		return s.walletBalanceLightning(ctx, ag)
 	case auth.KindUserJWT, auth.KindAPIKey:
 		if p.UserID == nil {
 			return nil, http.StatusUnauthorized, "unauthorized", nil
 		}
-		ag, err = s.Store.GetAgentByJWTSub(ctx, *p.UserID)
+		ag, err := s.Store.GetAgentByJWTSub(ctx, *p.UserID)
+		if err != nil {
+			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
+		}
+		if ag != nil {
+			return s.walletBalanceLightning(ctx, ag)
+		}
+		u, err := s.Store.GetUserByID(ctx, *p.UserID)
+		if err != nil {
+			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
+		}
+		if u == nil {
+			return nil, http.StatusNotFound, "not_found", map[string]any{"message": "no billing profile for this credential"}
+		}
+		active, _ := s.Store.CountRunningSandboxesByUser(ctx, *p.UserID)
+		return map[string]any{
+			"billing":                  "credits",
+			"credit_balance_usd_cents": u.CreditBalanceUSDCents,
+			"active_sandboxes":         active,
+			"warning_level":            u.WarningLevel,
+		}, 0, "", nil
 	default:
 		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "unsupported principal kind"}
 	}
-	if err != nil {
-		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
-	}
-	if ag == nil {
-		return nil, http.StatusNotFound, "not_found", map[string]any{"message": "register wallet first"}
-	}
+}
+
+func (s *Service) walletBalanceLightning(ctx context.Context, ag *store.Agent) (any, int, string, map[string]any) {
 	rate, _ := s.Store.MaxMsatsPerSecondRunningSandboxesForAgent(ctx, ag.ID)
 	if rate <= 0 {
 		pr, err2 := s.Store.GetTierPricing(ctx, "nano")
@@ -580,6 +601,7 @@ func (s *Service) toolWalletBalance(ctx context.Context, p *auth.Principal) (any
 		depositURL = cp + "/v1/wallet/deposit"
 	}
 	return map[string]any{
+		"billing":                 "lightning",
 		"balance_msats":           ag.BalanceMsats,
 		"active_sandboxes":        active,
 		"billing_hint_msats_sec":  rate,

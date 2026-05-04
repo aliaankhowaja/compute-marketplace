@@ -12,7 +12,7 @@ func toolList() []toolDef {
 	return []toolDef{
 		{
 			Name:        "sandbox_create",
-			Description: "Provision a new sandbox (RunPod). billing_method: lightning | credits; tier: nano|micro|standard|gpu_small|gpu_large (maps to sockt templates + specs). Requires L402 (lightning) or API key (credits).",
+			Description: "Provision a new sandbox (RunPod). May take up to ~2 minutes while the runtime starts and becomes reachable. billing_method: lightning | credits; tier: nano|micro|standard|gpu_small|gpu_large (maps to sockt templates + specs). Requires L402 (lightning) or API key (credits).",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["billing_method", "tier"],
@@ -145,7 +145,7 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "wallet_balance",
-			Description: "Lightning prepaid balance plus next_action / suggested deposit sizing for polling.",
+			Description: "Billing overview: Lightning prepaid (msats, deposit hints) when a Lightning agent is linked; otherwise API key / user JWT returns credits balance (USD cents).",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {}

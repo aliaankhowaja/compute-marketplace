@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -69,7 +70,7 @@ func (c *Config) ShellCheckOrigin(r *http.Request) bool {
 func Load() (*Config, error) {
 	c := &Config{
 		SandboxID:       strings.TrimSpace(os.Getenv("SANDBOX_ID")),
-		PodID:           strings.TrimSpace(os.Getenv("POD_ID")),
+		PodID:           strings.TrimSpace(envOrDefault("POD_ID", strings.TrimSpace(os.Getenv("RUNPOD_POD_ID")))),
 		ControlPlaneURL: strings.TrimSpace(os.Getenv("CONTROL_PLANE_URL")),
 		JWTSecret:       []byte(strings.TrimSpace(os.Getenv("JWT_SECRET"))),
 		JWTAudience:     strings.TrimSpace(os.Getenv("JWT_AUDIENCE")),
@@ -78,7 +79,7 @@ func Load() (*Config, error) {
 		ListenAddr:      envOrDefault("LISTEN_ADDR", ":8443"),
 		TLSCertFile:     strings.TrimSpace(os.Getenv("TLS_CERT_FILE")),
 		TLSKeyFile:      strings.TrimSpace(os.Getenv("TLS_KEY_FILE")),
-		SandboxUser:     envOrDefault("SANDBOX_USER", "sandbox"),
+		SandboxUser:     envOrDefault("SANDBOX_USER", "root"),
 		SandboxRoot:     filepath.Clean(strings.TrimSpace(envOrDefault("SANDBOX_ROOT", "/home/sandbox"))),
 	}
 
@@ -147,7 +148,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SANDBOX_ID is required")
 	}
 	if c.PodID == "" {
-		return nil, fmt.Errorf("POD_ID is required")
+		log.Printf("sockt-runtime: POD_ID unset; jwt pod_id binding disabled (tokens still require sandbox_id)")
 	}
 	if c.ControlPlaneURL == "" {
 		return nil, fmt.Errorf("CONTROL_PLANE_URL is required")
