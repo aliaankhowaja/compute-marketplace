@@ -11,10 +11,14 @@ import (
 func NewServer(cfg *Config, meter *Meter, cb *Callbacks) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	// Cloud Run reserves some paths ending in "z"; /healthz never reaches the container.
+	// See https://cloud.google.com/run/docs/known-issues#ah
+	rtHealth := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "sockt-runtime"})
-	})
+	}
+	mux.HandleFunc("GET /healthz", rtHealth)
+	mux.HandleFunc("GET /health", rtHealth)
 
 	wrap := func(h http.Handler) http.Handler {
 		return requireSandbox(cfg, h)

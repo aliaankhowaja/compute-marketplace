@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 RUN apk add --no-cache ca-certificates git
@@ -15,7 +13,7 @@ RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -u 1000 -s /bin/bash sandbox
+RUN useradd -m -u 1001 -s /bin/bash sandbox
 
 COPY --from=build /sockt-runtime /sockt-runtime
 

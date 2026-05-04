@@ -132,20 +132,9 @@ func (c *RunPodClient) UpdatePodEnv(ctx context.Context, id string, env map[stri
 		return nil
 	}
 	body := map[string]any{"env": env}
-	_, code, err := c.do(ctx, http.MethodPut, "/pods/"+id, body)
+	_, code, err := c.do(ctx, http.MethodPost, "/pods/"+id+"/update", body)
 	if err != nil {
 		return err
-	}
-	// Some deployments use PATCH; allow 200-299 or 404 (caller may need different path).
-	if code == http.StatusNotFound {
-		_, code2, err2 := c.do(ctx, http.MethodPatch, "/pods/"+id, body)
-		if err2 != nil {
-			return err2
-		}
-		if code2 >= 200 && code2 < 300 {
-			return nil
-		}
-		return fmt.Errorf("runpod patch env: status=%d", code2)
 	}
 	if code < 200 || code >= 300 {
 		return fmt.Errorf("runpod put env: status=%d", code)

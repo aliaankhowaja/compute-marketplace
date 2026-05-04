@@ -27,14 +27,18 @@ type RouterDeps struct {
 func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	// Cloud Run reserves some paths ending in "z"; /healthz never reaches the container.
+	// See https://cloud.google.com/run/docs/known-issues#ah — use /health for probes on Run.
+	handleCPHealth := func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":                true,
 			"lnd_connected":     d.PaySvc != nil && d.PaySvc.LND != nil,
 			"supabase_ok":       d.Cfg != nil && strings.TrimSpace(d.Cfg.SupabaseDBTxDSN) != "",
 			"runpod_configured": d.Cfg != nil && strings.TrimSpace(d.Cfg.RunPodAPIKey) != "",
 		})
-	})
+	}
+	mux.HandleFunc("GET /healthz", handleCPHealth)
+	mux.HandleFunc("GET /health", handleCPHealth)
 
 	// Public catalog
 	mux.Handle("GET /v1/pricing", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -16,19 +16,23 @@ func TestHealthzThroughRouter(t *testing.T) {
 	h := NewRouter(RouterDeps{Cfg: cfg, Store: st}, nil, []byte("01234567890123456789012345678901"))
 	srv := httptest.NewServer(h)
 	defer srv.Close()
-	res, err := http.Get(srv.URL + "/healthz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		t.Fatalf("status %d", res.StatusCode)
-	}
-	var out map[string]any
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out["ok"] != true {
-		t.Fatal(out)
+	for _, path := range []string{"/healthz", "/health"} {
+		t.Run(path, func(t *testing.T) {
+			res, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != 200 {
+				t.Fatalf("status %d", res.StatusCode)
+			}
+			var out map[string]any
+			if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+				t.Fatal(err)
+			}
+			if out["ok"] != true {
+				t.Fatal(out)
+			}
+		})
 	}
 }
