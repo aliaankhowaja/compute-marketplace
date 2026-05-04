@@ -2,24 +2,25 @@ package payment
 
 import (
 	"context"
+	"encoding/hex"
 	"log/slog"
+	"strings"
 	"time"
 
-	"github.com/lightningnetwork/lnd/lnrpc"
-
+	"github.com/aliaankhowaja/sockt-backend/internal/payment/lnbot"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
 
-// DepositSettlerBackground polls pending manual BOLT11 deposits and confirms settlement via LND.
+// DepositSettlerBackground polls pending manual BOLT11 deposits and confirms settlement via LNBOT.
 type DepositSettlerBackground struct {
 	Store    *store.Store
-	LND      *Client
+	LNBot    *lnbot.Client
 	Interval time.Duration
 }
 
 // Run blocks until ctx is cancelled.
 func (w *DepositSettlerBackground) Run(ctx context.Context) {
-	if w == nil || w.Store == nil || w.LND == nil {
+	if w == nil || w.Store == nil || w.LNBot == nil {
 		return
 	}
 	tick := w.Interval
@@ -45,15 +46,20 @@ func (w *DepositSettlerBackground) pollOnce(ctx context.Context) {
 		return
 	}
 	for _, r := range rows {
-		inv, err := w.LND.LookupInvoice(ctx, r.PayHash)
+		phHex := hex.EncodeToString(r.PayHash)
+		inv, err := w.LNBot.GetInvoiceByPaymentHash(ctx, phHex)
 		if err != nil || inv == nil {
 			continue
 		}
-		if inv.State != lnrpc.Invoice_SETTLED {
+		if inv.Status != "settled" {
 			continue
 		}
-		preimage := inv.RPreimage
-		if len(preimage) != 32 {
+		rawPre := strings.TrimSpace(inv.PreimageHex)
+		if rawPre == "" {
+			continue
+		}
+		preimage, err := hex.DecodeString(rawPre)
+		if err != nil || len(preimage) != 32 {
 			continue
 		}
 		if err := w.Store.SettlePendingDeposit(ctx, store.PendingDepositRow{

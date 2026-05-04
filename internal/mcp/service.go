@@ -500,8 +500,8 @@ func (s *Service) toolSandboxExtendBalance(ctx context.Context, p *auth.Principa
 		default:
 			return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "agent context required"}
 		}
-		if s.PaySvc == nil {
-			return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lnd not configured"}
+		if s.PaySvc == nil || !s.PaySvc.HasLightning() {
+			return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning wallet not configured"}
 		}
 		sats := int64(argFloat(args, "sats"))
 		if sats <= 0 {
@@ -632,8 +632,8 @@ func resolveAgentUUID(ctx context.Context, s *Service, p *auth.Principal) (uuid.
 }
 
 func (s *Service) toolWalletDeposit(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
-	if s.PaySvc == nil || s.PaySvc.LND == nil {
-		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lnd not configured"}
+	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
+		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning wallet not configured"}
 	}
 	agentID, err := resolveAgentUUID(ctx, s, p)
 	if err != nil {

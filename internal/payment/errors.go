@@ -4,8 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"github.com/aliaankhowaja/sockt-backend/internal/payment/lnbot"
 )
 
 // Classification matches MVP payment error taxonomy.
@@ -14,14 +13,14 @@ type Classification string
 const (
 	ClassUnknown Classification = ""
 
-	ClassRoutingFailure      Classification = "routing_failure"
-	ClassOfferUnreachable    Classification = "offer_unreachable"
-	ClassInvoiceExpired      Classification = "invoice_expired"
-	ClassPaymentRejected     Classification = "payment_rejected"
-	ClassOfferInvalid        Classification = "offer_invalid"
-	ClassLNDUnavailable      Classification = "lnd_unavailable"
-	ClassManualTopUpRequired Classification = "manual_topup_required"
-	ClassAmountBelowMinimum  Classification = "amount_below_minimum"
+	ClassRoutingFailure       Classification = "routing_failure"
+	ClassOfferUnreachable     Classification = "offer_unreachable"
+	ClassInvoiceExpired       Classification = "invoice_expired"
+	ClassPaymentRejected      Classification = "payment_rejected"
+	ClassOfferInvalid         Classification = "offer_invalid"
+	ClassLightningUnavailable Classification = "lightning_unavailable"
+	ClassManualTopUpRequired  Classification = "manual_topup_required"
+	ClassAmountBelowMinimum   Classification = "amount_below_minimum"
 )
 
 // Classifier is attached to sentinel errors via errors.As.
@@ -45,14 +44,14 @@ func classifyErr(class Classification, err error) error {
 
 // Sentinel errors consumed by handlers.
 var (
-	ErrRoutingFailure      = classifyErr(ClassRoutingFailure, errors.New("routing failure"))
-	ErrOfferUnreachable    = classifyErr(ClassOfferUnreachable, errors.New("offer unreachable"))
-	ErrInvoiceExpired      = classifyErr(ClassInvoiceExpired, errors.New("invoice expired"))
-	ErrPaymentRejected     = classifyErr(ClassPaymentRejected, errors.New("payment rejected"))
-	ErrOfferInvalid        = classifyErr(ClassOfferInvalid, errors.New("offer invalid"))
-	ErrLNDUnavailable      = classifyErr(ClassLNDUnavailable, errors.New("lnd unavailable"))
-	ErrManualTopUpRequired = classifyErr(ClassManualTopUpRequired, errors.New("manual top-up required"))
-	ErrAmountBelowMinimum  = classifyErr(ClassAmountBelowMinimum, errors.New("amount below offer minimum"))
+	ErrRoutingFailure       = classifyErr(ClassRoutingFailure, errors.New("routing failure"))
+	ErrOfferUnreachable     = classifyErr(ClassOfferUnreachable, errors.New("offer unreachable"))
+	ErrInvoiceExpired       = classifyErr(ClassInvoiceExpired, errors.New("invoice expired"))
+	ErrPaymentRejected      = classifyErr(ClassPaymentRejected, errors.New("payment rejected"))
+	ErrOfferInvalid         = classifyErr(ClassOfferInvalid, errors.New("offer invalid"))
+	ErrLightningUnavailable = classifyErr(ClassLightningUnavailable, errors.New("lightning wallet unavailable"))
+	ErrManualTopUpRequired  = classifyErr(ClassManualTopUpRequired, errors.New("manual top-up required"))
+	ErrAmountBelowMinimum   = classifyErr(ClassAmountBelowMinimum, errors.New("amount below offer minimum"))
 
 	// ErrMissingPaymentHash signals a decoded BOLT11 missing its payment_hash field.
 	ErrMissingPaymentHash = errors.New("bolt11 invoice missing payment hash")
@@ -65,17 +64,16 @@ func Classify(err error) Classification {
 		return c.Class
 	}
 
-	st, ok := status.FromError(err)
-	if ok {
-		switch st.Code() {
-		case codes.Unavailable, codes.DeadlineExceeded:
-			return ClassLNDUnavailable
-		case codes.Canceled:
-			return ClassOfferUnreachable
-		case codes.InvalidArgument:
+	var he *lnbot.HTTPError
+	if errors.As(err, &he) {
+		switch {
+		case he.StatusCode == 429 || he.StatusCode >= 500:
+			return ClassLightningUnavailable
+		case he.StatusCode == 401 || he.StatusCode == 403:
 			return ClassOfferInvalid
+		case he.StatusCode >= 400:
+			return ClassRoutingFailure
 		}
-		return ClassRoutingFailure
 	}
 
 	return ClassUnknown

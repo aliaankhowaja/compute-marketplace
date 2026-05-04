@@ -2,19 +2,18 @@ package payment
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/google/uuid"
-	"github.com/lightningnetwork/lnd/lnrpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+
+	"github.com/aliaankhowaja/sockt-backend/internal/payment/lnbot"
 )
 
 const defaultPayWait = 25 * time.Second
@@ -31,7 +30,7 @@ type Payment interface {
 
 // Service implements Payment.
 type Service struct {
-	LND               *Client
+	LNBOT             *lnbot.Client
 	Pool              *InvoicePool
 	IDem              *IdempotencyCache
 	PendingDeps       PendingDepositRecorder
@@ -40,16 +39,21 @@ type Service struct {
 }
 
 // NewService constructs a Service with optional pool (L402) and pending-deposit persistence.
-func NewService(lnd *Client, pool *InvoicePool, idem *IdempotencyCache, pending PendingDepositRecorder) *Service {
+func NewService(nb *lnbot.Client, pool *InvoicePool, idem *IdempotencyCache, pending PendingDepositRecorder) *Service {
 	if idem == nil {
 		idem = NewIdempotencyCache()
 	}
 	return &Service{
-		LND:         lnd,
+		LNBOT:       nb,
 		Pool:        pool,
 		IDem:        idem,
 		PendingDeps: pending,
 	}
+}
+
+// HasLightning reports whether outbound/inbound Lightning wallet operations are configured.
+func (s *Service) HasLightning() bool {
+	return s != nil && s.LNBOT != nil
 }
 
 // Compile-time assertion.
@@ -89,13 +93,16 @@ func (s *Service) paymentTimeout() time.Duration {
 	return defaultPayWait
 }
 
-func (s *Service) classifyRPC(err error) error {
-	st, ok := status.FromError(err)
-	if ok {
-		switch st.Code() {
-		case codes.Unavailable, codes.DeadlineExceeded:
-			return fmt.Errorf("%w: %w", ErrLNDUnavailable, err)
+func (s *Service) classifyBackend(err error) error {
+	var he *lnbot.HTTPError
+	if errors.As(err, &he) {
+		switch {
+		case he.StatusCode == http.StatusTooManyRequests || he.StatusCode >= http.StatusInternalServerError:
+			return fmt.Errorf("%w: %w", ErrLightningUnavailable, err)
+		case he.StatusCode == http.StatusUnauthorized || he.StatusCode == http.StatusForbidden:
+			return classifyErr(ClassOfferInvalid, err)
 		}
+		return classifyErr(ClassRoutingFailure, err)
 	}
 	return err
 }
@@ -108,8 +115,11 @@ func (s *Service) decodePayHash(invoice string) ([]byte, error) {
 	return ph, nil
 }
 
-// PayInvoice routes a payment_request through LND with idempotent replay keyed by caller.
+// PayInvoice routes a payment_request through LNBOT with idempotent replay keyed by caller.
 func (s *Service) PayInvoice(ctx context.Context, invoice string, idempotencyKey string) (string, error) {
+	if s.LNBOT == nil {
+		return "", classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
+	}
 	if replay, ok := s.IDem.Get(idempotencyKey); ok && replay != nil && replay.err == nil && replay.preimageHex != "" {
 		return replay.preimageHex, nil
 	}
@@ -123,7 +133,10 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, idempotencyKey
 	}
 	phHex := hex.EncodeToString(phPreview)
 
-	preHex, ferr := s.finalizePaymentRequest(ctx, invoice)
+	ctx, cancel := context.WithTimeout(ctx, s.paymentTimeout())
+	defer cancel()
+
+	preHex, ferr := s.finalizePaymentRequest(ctx, invoice, strings.TrimSpace(idempotencyKey))
 	if ferr != nil {
 		s.IDem.SetFailure(phHex+"|"+idempotencyKey, ferr, defaultIdemTTL)
 		s.IDem.SetFailure(idempotencyKey, ferr, defaultIdemTTL)
@@ -134,16 +147,16 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, idempotencyKey
 	return preHex, nil
 }
 
-func (s *Service) finalizePaymentRequest(ctx context.Context, invoice string) (string, error) {
+func (s *Service) finalizePaymentRequest(ctx context.Context, invoice string, idempotencyKey string) (string, error) {
 	phBytes, err := s.decodePayHash(invoice)
 	if err != nil {
 		return "", err
 	}
-	payment, payErr := s.LND.SendPaymentViaRouter(ctx, strings.TrimSpace(invoice), s.paymentTimeout())
+	preHex, payErr := s.LNBOT.SendPayment(ctx, strings.TrimSpace(invoice), idempotencyKey)
 	if payErr != nil {
-		return "", classifyForPay(payment, payErr)
+		return "", classifyForPay(payErr)
 	}
-	preImg, err := hex.DecodeString(strings.TrimSpace(payment.PaymentPreimage))
+	preImg, err := hex.DecodeString(strings.TrimSpace(preHex))
 	if err != nil || len(preImg) != 32 {
 		return "", classifyErr(ClassRoutingFailure, errors.New("missing preimage"))
 	}
@@ -153,42 +166,61 @@ func (s *Service) finalizePaymentRequest(ctx context.Context, invoice string) (s
 	return hex.EncodeToString(preImg), nil
 }
 
-func classifyForPay(p *lnrpc.Payment, payErr error) error {
+func classifyForPay(payErr error) error {
 	var cl *Classifier
 	if errors.As(payErr, &cl) {
 		return payErr
 	}
-	if p != nil {
-		return classifyPaymentFailure(p)
+	var pf *lnbot.PaymentFailedError
+	if errors.As(payErr, &pf) {
+		r := strings.ToLower(pf.FailureReason)
+		switch {
+		case strings.Contains(r, "timeout"):
+			return classifyErr(ClassOfferUnreachable, payErr)
+		case strings.Contains(r, "expired"), strings.Contains(r, "incorrect"):
+			return classifyErr(ClassInvoiceExpired, payErr)
+		case strings.Contains(r, "route"), strings.Contains(r, "balance"), strings.Contains(r, "liquidity"):
+			return classifyErr(ClassRoutingFailure, payErr)
+		case strings.Contains(r, "cancel"):
+			return classifyErr(ClassPaymentRejected, payErr)
+		default:
+			return classifyErr(ClassRoutingFailure, payErr)
+		}
 	}
 	return classifyErr(ClassRoutingFailure, payErr)
 }
 
 // CreateBOLT11Invoice backs prepaid deposit onboarding flows.
+// expirySeconds is advisory only; LNBOT fixes invoice lifetime server-side (~60 minutes per API docs).
 func (s *Service) CreateBOLT11Invoice(ctx context.Context, amountSats int64, memo string, expirySeconds int64) (*Bolt11Invoice, error) {
+	if s.LNBOT == nil {
+		return nil, classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
+	}
 	if amountSats <= 0 {
 		return nil, classifyErr(ClassOfferInvalid, errors.New("amount must be positive"))
 	}
 	if expirySeconds <= 0 {
 		expirySeconds = 3600
 	}
-	resp, err := s.LND.AddMintedInvoice(ctx, &lnrpc.Invoice{
-		Value:   amountSats,
-		Memo:    memo,
-		Expiry:  expirySeconds,
-		Private: true,
-	})
+	bolt11, err := s.LNBOT.CreateInvoice(ctx, amountSats, memo, "")
 	if err != nil {
-		return nil, s.classifyRPC(err)
+		return nil, s.classifyBackend(err)
+	}
+	ph, err := DecodeBolt11(bolt11, s.chainParams())
+	if err != nil {
+		return nil, classifyErr(ClassOfferInvalid, err)
 	}
 	return &Bolt11Invoice{
-		PaymentRequest: resp.GetPaymentRequest(),
-		RHash:          resp.GetRHash(),
+		PaymentRequest: bolt11,
+		RHash:          ph,
 	}, nil
 }
 
-// MintL402Invoice pops a warm preimage invoice or performs a synchronous AddInvoice fallback.
+// MintL402Invoice pops a warm invoice from the pool or mints synchronously via LNBOT.
 func (s *Service) MintL402Invoice(ctx context.Context) (*Bolt11Invoice, []byte, error) {
+	if s.LNBOT == nil {
+		return nil, nil, classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
+	}
 	if s.Pool != nil {
 		if ent, ok := s.Pool.Pop(ctx); ok && ent != nil {
 			return &Bolt11Invoice{
@@ -197,36 +229,45 @@ func (s *Service) MintL402Invoice(ctx context.Context) (*Bolt11Invoice, []byte, 
 			}, ent.Preimage, nil
 		}
 	}
-	preimage := make([]byte, 32)
-	if _, err := rand.Read(preimage); err != nil {
-		return nil, nil, err
-	}
-	resp, err := s.LND.AddMintedInvoice(ctx, &lnrpc.Invoice{
-		RPreimage: preimage,
-		ValueMsat: l402SatMsat,
-		Memo:      l402PoolMemo,
-		Expiry:    int64(defaultPoolInvoiceTTL / time.Second),
-	})
+	bolt11, err := s.LNBOT.CreateInvoice(ctx, 1, l402PoolMemo, "")
 	if err != nil {
-		return nil, nil, s.classifyRPC(err)
+		return nil, nil, s.classifyBackend(err)
 	}
-	return &Bolt11Invoice{
-			PaymentRequest: resp.GetPaymentRequest(),
-			RHash:          resp.GetRHash(),
-		},
-		preimage,
-		nil
+	ph, err := DecodeBolt11(bolt11, s.chainParams())
+	if err != nil {
+		return nil, nil, classifyErr(ClassOfferInvalid, err)
+	}
+	return &Bolt11Invoice{PaymentRequest: bolt11, RHash: ph}, nil, nil
 }
 
 func (s *Service) GetNodeBalance(ctx context.Context) (BalanceInfo, error) {
-	return s.LND.GetNodeBalance(ctx)
+	if s.LNBOT == nil {
+		return BalanceInfo{}, classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
+	}
+	w, err := s.LNBOT.GetWallet(ctx)
+	if err != nil {
+		return BalanceInfo{}, s.classifyBackend(err)
+	}
+	var out BalanceInfo
+	out.WalletConfirmedSats = w.Available
+	if out.WalletConfirmedSats <= 0 && w.Balance > 0 {
+		out.WalletConfirmedSats = w.Balance
+	}
+	out.PendingHTLCSats = w.OnHold
+	return out, nil
 }
 
 func (s *Service) GetNodeHealth(ctx context.Context) (NodeHealth, error) {
-	h, err := s.LND.GetNodeHealth(ctx)
-	if err != nil {
-		return h, s.classifyRPC(err)
+	var h NodeHealth
+	if s.LNBOT == nil {
+		return h, classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
 	}
-	h.LNDKEstimated = false
+	if _, err := s.LNBOT.Me(ctx); err != nil {
+		return h, s.classifyBackend(err)
+	}
+	h.LightningReachable = true
+	if w, err := s.LNBOT.GetWallet(ctx); err == nil && w != nil {
+		h.Alias = w.WalletID
+	}
 	return h, nil
 }

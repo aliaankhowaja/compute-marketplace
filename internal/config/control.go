@@ -30,23 +30,23 @@ type Control struct {
 	RunPodTemplateGPUSmallID string
 	RunPodTemplateGPULargeID string
 
-	LNDGRPCHost     string
-	LNDTLSCertPath  string
-	LNDTLSCertPEM   string
-	LNDMacaroonPath string
-	LNDMacaroonHex  string
-	LNDNetwork      string // mainnet | testnet (for offer validation)
+	// LightningNetwork is mainnet | testnet — used for BOLT11 decode / validation only (not node RPC).
+	LightningNetwork string
 
-	LNDKHTTPURL          string
+	LNBOTAPIBaseURL  string // default https://api.ln.bot
+	LNBOTAPIKey      string // Bearer uk_... or wk_...
+	LNBOTWalletID    string // optional wal_...; empty uses /v1/wallets/current with wk_
+	LNBOTHTTPTimeout time.Duration
+
 	LNURLHTTPTimeoutSecs int
 
-	WSSJWTSecret        []byte
-	L402RootKey         []byte // 32 bytes; macaroon root
-	DataJWTTTL          time.Duration
+	WSSJWTSecret []byte
+	L402RootKey  []byte // 32 bytes; macaroon root
+	DataJWTTTL   time.Duration
 	// DataJWTAudience is the JWT aud claim minted onto data_jwt; must match sockt-runtime JWT_AUDIENCE.
 	DataJWTAudience string
 	// RuntimeSandboxRoot is injected as SANDBOX_ROOT into RunPod pods (path jail + default cwd).
-	RuntimeSandboxRoot string
+	RuntimeSandboxRoot  string
 	CallbackSecret      string
 	StripeWebhookSecret string
 
@@ -158,23 +158,25 @@ func Load() (*Control, error) {
 		RunPodTemplateCPUID:      strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_CPU_ID")),
 		RunPodTemplateGPUSmallID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_SMALL_ID")),
 		RunPodTemplateGPULargeID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_LARGE_ID")),
-		LNDGRPCHost:              strings.TrimSpace(os.Getenv("LND_GRPC_HOST")),
-		LNDTLSCertPath:           strings.TrimSpace(os.Getenv("LND_TLS_CERT_PATH")),
-		LNDMacaroonPath:          strings.TrimSpace(os.Getenv("LND_MACAROON_PATH")),
-		LNDMacaroonHex:           strings.TrimSpace(os.Getenv("LND_MACAROON_HEX")),
-		LNDNetwork:               envOrDefault("LND_NETWORK", "mainnet"),
-		LNDKHTTPURL:              strings.TrimSpace(os.Getenv("LNDK_HTTP_URL")),
+		LightningNetwork:         envOrDefault("LIGHTNING_NETWORK", envOrDefault("LND_NETWORK", "mainnet")),
+		LNBOTAPIBaseURL:          strings.TrimSpace(os.Getenv("LNBOT_API_BASE_URL")),
+		LNBOTAPIKey:              strings.TrimSpace(os.Getenv("LNBOT_API_KEY")),
+		LNBOTWalletID:            strings.TrimSpace(os.Getenv("LNBOT_WALLET_ID")),
 		CallbackSecret:           strings.TrimSpace(os.Getenv("CALLBACK_SECRET")),
 		StripeWebhookSecret:      strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
 		AdminReconcileToken:      strings.TrimSpace(os.Getenv("ADMIN_RECONCILE_TOKEN")),
 		ControlPlanePublicURL:    strings.TrimSpace(os.Getenv("CONTROL_PLANE_URL")),
 	}
-	pem := strings.TrimSpace(os.Getenv("LND_TLS_CERT_PEM"))
-	if pem != "" {
-		c.LNDTLSCertPEM = pem
-	}
 
 	var err error
+	if c.LNBOTAPIBaseURL == "" {
+		c.LNBOTAPIBaseURL = "https://api.ln.bot"
+	}
+	c.LNBOTHTTPTimeout, err = parseDurationSecs("LNBOT_HTTP_TIMEOUT_SECS", 45*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
 	c.LNURLHTTPTimeoutSecs, err = parseInt("LNURL_HTTP_TIMEOUT_SECS", 8)
 	if err != nil {
 		return nil, err

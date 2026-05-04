@@ -157,7 +157,7 @@ func handleTopupTrigger(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 		bm := strings.ToLower(strings.TrimSpace(body.BillingMethod))
 		switch bm {
 		case "lightning":
-			if sb.AgentID == nil || d.PaySvc == nil {
+			if sb.AgentID == nil || d.PaySvc == nil || !d.PaySvc.HasLightning() {
 				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "disabled"})
 				return
 			}
@@ -200,10 +200,10 @@ func handleTopupTrigger(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 				"error_class":   "deposit_required",
 				"warning_level": wlvl,
 				"deposit": map[string]any{
-					"bolt11":        dep.PaymentRequest,
+					"bolt11":       dep.PaymentRequest,
 					"payment_hash": fmt.Sprintf("%x", dep.RHash),
-					"amount_msats":  dep.AmountMsats,
-					"expires_at":    expRFC,
+					"amount_msats": dep.AmountMsats,
+					"expires_at":   expRFC,
 				},
 			})
 		case "credits":

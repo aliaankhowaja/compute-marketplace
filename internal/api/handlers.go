@@ -233,8 +233,8 @@ func handleWalletDeposit(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "")
 			return
 		}
-		if d.PaySvc == nil || d.PaySvc.LND == nil {
-			writeErr(w, http.StatusServiceUnavailable, "payment_disabled", "lnd not configured")
+		if d.PaySvc == nil || !d.PaySvc.HasLightning() {
+			writeErr(w, http.StatusServiceUnavailable, "payment_disabled", "lightning wallet not configured")
 			return
 		}
 		ag, err := d.Store.GetAgentByJWTSub(r.Context(), *p.UserID)
@@ -600,7 +600,7 @@ func handleExtendBalance(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			}
 			writeJSON(w, http.StatusOK, map[string]int64{"allocated_cents": a, "balance_after_cents": after})
 		case "lightning":
-			if d.PaySvc == nil || p == nil || p.AgentID == nil {
+			if d.PaySvc == nil || !d.PaySvc.HasLightning() || p == nil || p.AgentID == nil {
 				writeErr(w, http.StatusBadRequest, "bad_request", "")
 				return
 			}

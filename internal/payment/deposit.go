@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// PendingDepositRecorder persists Bolt11 invoices awaiting inbound settlement (Sockt LND holds preimage).
+// PendingDepositRecorder persists Bolt11 invoices awaiting inbound settlement (custodial wallet via LNBOT).
 type PendingDepositRecorder interface {
 	InsertPendingDeposit(ctx context.Context, agentID uuid.UUID, payHash []byte, bolt11 string, amountMsats int64) error
 }
@@ -33,10 +33,10 @@ type depositIdemSnap struct {
 
 const depositIdemPrefix = "depmint:"
 
-// RequestDepositInvoice mints a BOLT11 payable to Sockt's node and records a pending row until settled.
+// RequestDepositInvoice mints a BOLT11 payable to the Sockt treasury wallet and records a pending row until settled.
 func (s *Service) RequestDepositInvoice(ctx context.Context, agentID uuid.UUID, amountSats int64, expirySeconds int64, memo string, idempotencyKey string) (*DepositMintResult, error) {
-	if s == nil || s.LND == nil {
-		return nil, classifyErr(ClassOfferInvalid, errors.New("lnd not configured"))
+	if s == nil || s.LNBOT == nil {
+		return nil, classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
 	}
 	if s.PendingDeps == nil {
 		return nil, classifyErr(ClassOfferInvalid, errors.New("deposit recorder not wired"))

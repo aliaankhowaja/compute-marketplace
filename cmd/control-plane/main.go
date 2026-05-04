@@ -18,6 +18,7 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/config"
 	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/payment"
+	"github.com/aliaankhowaja/sockt-backend/internal/payment/lnbot"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
 
@@ -43,43 +44,33 @@ func main() {
 	}
 	defer st.Close()
 
-	var lnd *payment.Client
-	if cfg.LNDGRPCHost != "" {
-		lnd, err = payment.DialLND(ctx, payment.LNDConfig{
-			Address:      cfg.LNDGRPCHost,
-			TLSCertPath:  cfg.LNDTLSCertPath,
-			TLSCertPEM:   []byte(cfg.LNDTLSCertPEM),
-			MacaroonPath: cfg.LNDMacaroonPath,
-			MacaroonHex:  cfg.LNDMacaroonHex,
-		})
-		if err != nil {
-			slog.Warn("lnd_dial_failed", "err", err)
-		} else {
-			defer lnd.Close()
-		}
+	var lnBot *lnbot.Client
+	if strings.TrimSpace(cfg.LNBOTAPIKey) != "" {
+		lnBot = lnbot.New(cfg.LNBOTAPIBaseURL, cfg.LNBOTAPIKey, cfg.LNBOTWalletID, cfg.LNBOTHTTPTimeout)
 	} else {
-		slog.Info("lnd_disabled")
+		slog.Info("lnbot_disabled")
 	}
 
 	net := &chaincfg.MainNetParams
-	if strings.EqualFold(cfg.LNDNetwork, "testnet") {
+	if strings.EqualFold(cfg.LightningNetwork, "testnet") {
 		net = &chaincfg.TestNet3Params
 	}
 
 	var paySvc *payment.Service
 	var payIface payment.Payment
 	var mint auth.Bolt11Mint
-	if lnd != nil {
-		pool := payment.NewInvoicePool(lnd)
+	if lnBot != nil {
+		issuer := &payment.LNBotInvoiceIssuer{Client: lnBot, Net: net}
+		pool := payment.NewInvoicePool(issuer)
 		pool.SetSizing(cfg.InvoicePoolTarget, cfg.InvoicePoolRefillBelow)
 		go pool.Run(ctx)
 
-		paySvc = payment.NewService(lnd, pool, nil, st)
+		paySvc = payment.NewService(lnBot, pool, nil, st)
 		paySvc.Chain = net
 		payIface = paySvc
 		mint = paySvc
 
-		deps := &payment.DepositSettlerBackground{Store: st, LND: lnd, Interval: 15 * time.Second}
+		deps := &payment.DepositSettlerBackground{Store: st, LNBot: lnBot, Interval: 15 * time.Second}
 		go deps.Run(ctx)
 	}
 

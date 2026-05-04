@@ -2,12 +2,13 @@ package payment
 
 import (
 	"context"
-	"crypto/rand"
 	"log"
 	"sync"
 	"time"
 
-	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/btcsuite/btcd/chaincfg"
+
+	"github.com/aliaankhowaja/sockt-backend/internal/payment/lnbot"
 )
 
 const (
@@ -16,16 +17,41 @@ const (
 	// MVPL402PoolRefillBelow — refill pool when size drops under 40.
 	MVPL402PoolRefillBelow = 40
 	l402PoolMemo           = "L402-pool"
-	l402SatMsat            = int64(1000) // 1 sat
 	defaultPoolInvoiceTTL  = 3600 * time.Second
 )
 
+// LNBotInvoiceIssuer mints pool invoices via LNBOT and derives payment hashes via local BOLT11 decode.
+type LNBotInvoiceIssuer struct {
+	Client *lnbot.Client
+	Net    *chaincfg.Params
+}
+
+func (w *LNBotInvoiceIssuer) MintBolt11(ctx context.Context, amountSats int64, memo string, _ int64) (bolt11 string, rhash []byte, err error) {
+	bolt11, err = w.Client.CreateInvoice(ctx, amountSats, memo, "")
+	if err != nil {
+		return "", nil, err
+	}
+	net := w.Net
+	if net == nil {
+		net = &chaincfg.MainNetParams
+	}
+	ph, err := DecodeBolt11(bolt11, net)
+	if err != nil {
+		return "", nil, err
+	}
+	return bolt11, ph, nil
+}
+
+func (w *LNBotInvoiceIssuer) CancelInvoice(ctx context.Context, paymentHash []byte) error {
+	return w.Client.CancelInvoice(ctx, paymentHash)
+}
+
 type invoiceIssuer interface {
-	AddMintedInvoice(ctx context.Context, inv *lnrpc.Invoice) (*lnrpc.AddInvoiceResponse, error)
+	MintBolt11(ctx context.Context, amountSats int64, memo string, expirySeconds int64) (bolt11 string, rhash []byte, err error)
 	CancelInvoice(ctx context.Context, paymentHash []byte) error
 }
 
-// InvoicePool maintains warm 1‑sat preimage invoices for L402 challenges.
+// InvoicePool maintains warm 1‑sat invoices for L402 challenges.
 type InvoicePool struct {
 	mu          sync.Mutex
 	pending     []*PoolEntry
@@ -35,7 +61,7 @@ type InvoicePool struct {
 }
 
 // NewInvoicePool wires the pool defaults for the MVP sizing policy.
-func NewInvoicePool(client *Client) *InvoicePool {
+func NewInvoicePool(client invoiceIssuer) *InvoicePool {
 	return &InvoicePool{
 		client:      client,
 		target:      MVPL402PoolTarget,
@@ -112,24 +138,15 @@ func (p *InvoicePool) refill(ctx context.Context) {
 }
 
 func (p *InvoicePool) mintIntoPool(ctx context.Context) error {
-	preimage := make([]byte, 32)
-	if _, err := rand.Read(preimage); err != nil {
-		return err
-	}
 	expiresAt := time.Now().Add(defaultPoolInvoiceTTL)
-	resp, err := p.client.AddMintedInvoice(ctx, &lnrpc.Invoice{
-		RPreimage: preimage,
-		ValueMsat: l402SatMsat,
-		Memo:      l402PoolMemo,
-		Expiry:    int64(defaultPoolInvoiceTTL / time.Second),
-	})
+	bolt11, rhash, err := p.client.MintBolt11(ctx, 1, l402PoolMemo, int64(defaultPoolInvoiceTTL/time.Second))
 	if err != nil {
 		return err
 	}
 	entry := &PoolEntry{
-		BOLT11:      resp.GetPaymentRequest(),
-		PaymentHash: append([]byte(nil), resp.GetRHash()...),
-		Preimage:    append([]byte(nil), preimage...),
+		BOLT11:      bolt11,
+		PaymentHash: append([]byte(nil), rhash...),
+		Preimage:    nil,
 		ExpiresAt:   expiresAt,
 	}
 	p.mu.Lock()

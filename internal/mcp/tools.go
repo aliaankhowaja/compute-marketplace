@@ -153,7 +153,7 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "wallet_deposit",
-			Description: "Mint a BOLT11 invoice to deposit sats against your prepaid Sockt balance (paid to Sockt LND).",
+			Description: "Mint a BOLT11 invoice to deposit sats against your prepaid Sockt balance (paid via LNBOT treasury wallet).",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {

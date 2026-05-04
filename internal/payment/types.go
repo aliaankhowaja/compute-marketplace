@@ -2,36 +2,35 @@ package payment
 
 import "time"
 
-// BalanceInfo summarizes on-node liquidity (lnrpc aggregates).
+// BalanceInfo summarizes liquidity signals for dashboards (custodial wallet or legacy node fields).
 type BalanceInfo struct {
 	WalletConfirmedSats   int64
 	WalletUnconfirmedSats int64
-	ChannelLocalSats      int64 // sum of balances we can spend
+	ChannelLocalSats      int64 // unused for LNBOT; kept for API shape compatibility
 	PendingOpenSats       int64
-	PendingHTLCSats       int64 // sum of unresolved HTLCs (local unsettled balance)
+	PendingHTLCSats       int64
 	ActiveChannels        int32
 	InactiveChannels      int32
 }
 
-// NodeHealth is a lightweight readiness snapshot for control-plane healthz.
+// NodeHealth is a lightweight readiness snapshot for optional probes.
 type NodeHealth struct {
-	LNDConnected  bool
-	SyncedToChain bool
-	SyncedToGraph bool
-	BlockHeight   uint32
-	Alias         string
-	IdentityPub   string // hex
-	LNDKEstimated bool // deprecated hint; always false when Bolt12 bridge removed
-	IsTestNet     bool
+	LightningReachable bool
+	SyncedToChain      bool
+	SyncedToGraph      bool
+	BlockHeight        uint32
+	Alias              string
+	IdentityPub        string
+	IsTestNet          bool
 }
 
-// Bolt11Invoice is a minted LN invoice (typically BOLT11; may encode blinded path data).
+// Bolt11Invoice is a minted LN invoice (BOLT11).
 type Bolt11Invoice struct {
-	PaymentRequest string // encoded payment string for SendPayment / macaroon binding
+	PaymentRequest string // encoded payment string for payment + macaroon binding
 	RHash          []byte // payment hash, 32 bytes
 }
 
-// PoolEntry holds a warm L402 preimage invoice from the invoice pool.
+// PoolEntry holds a warm L402 invoice from the invoice pool.
 type PoolEntry struct {
 	BOLT11      string
 	PaymentHash []byte
