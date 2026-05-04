@@ -38,7 +38,12 @@ type Meter struct {
 	pendingAudit []AuditInterval
 	tickCount    int64
 
-	pauseSent bool
+	// Billing is frozen after a successful pause-trigger callback (until balance tops up).
+	meterHalted bool
+	// oobNotified gates a single out_of_balance broadcast per low-balance episode.
+	oobNotified bool
+	// pauseTriggerInFlight prevents overlapping pause-trigger HTTP calls.
+	pauseTriggerInFlight bool
 
 	subMu sync.RWMutex
 	subs  map[chan MeterEvent]struct{}
@@ -81,7 +86,8 @@ func (m *Meter) ApplyBalanceDelta(delta int64) {
 	m.balance.Balance += delta
 	m.balance.TopupInFlight = false
 	if m.balance.Balance > m.cfg.SafetyFloor {
-		m.pauseSent = false
+		m.meterHalted = false
+		m.oobNotified = false
 	}
 	b := m.balance.Balance
 	m.mu.Unlock()
@@ -94,7 +100,8 @@ func (m *Meter) ApplyNewBalance(newBal int64) {
 	m.balance.Balance = newBal
 	m.balance.TopupInFlight = false
 	if m.balance.Balance > m.cfg.SafetyFloor {
-		m.pauseSent = false
+		m.meterHalted = false
+		m.oobNotified = false
 	}
 	m.mu.Unlock()
 	m.broadcast(MeterEvent{Type: "topup", Balance: newBal, Message: "balance_set"})
@@ -149,6 +156,14 @@ func (m *Meter) Start(ctx context.Context) {
 }
 
 func (m *Meter) tick(parentCtx context.Context) {
+	m.mu.RLock()
+	halted := m.meterHalted
+	m.mu.RUnlock()
+	if halted {
+		m.flushAudit(parentCtx)
+		return
+	}
+
 	now := time.Now().UTC()
 
 	m.mu.Lock()
@@ -223,21 +238,38 @@ func (m *Meter) tick(parentCtx context.Context) {
 	}
 
 	if bal <= floor {
+		var notifyOOB, firePause bool
 		m.mu.Lock()
-		shouldPause := !m.pauseSent
-		if shouldPause {
-			m.pauseSent = true
+		if !m.oobNotified {
+			m.oobNotified = true
+			notifyOOB = true
+		}
+		if !m.pauseTriggerInFlight {
+			m.pauseTriggerInFlight = true
+			firePause = true
 		}
 		m.mu.Unlock()
 
-		if shouldPause {
+		if notifyOOB {
 			m.broadcast(MeterEvent{Type: "out_of_balance", Balance: bal})
+		}
+		if firePause {
 			go func(b0, c0 int64) {
 				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
+				defer func() {
+					m.mu.Lock()
+					m.pauseTriggerInFlight = false
+					m.mu.Unlock()
+				}()
 				if err := m.cb.PostPauseTrigger(ctx, b0, c0, "out_of_balance"); err != nil {
 					log.Printf("runtime/meter: pause-trigger failed: %v", err)
+					return
 				}
+				m.mu.Lock()
+				m.meterHalted = true
+				m.mu.Unlock()
+				m.flushAudit(context.Background())
 			}(bal, consumed)
 		}
 	}

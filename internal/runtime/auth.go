@@ -34,6 +34,8 @@ var (
 	ErrSandboxMismatch = errors.New("sandbox_id mismatch")
 	// ErrPodMismatch is returned when pod_id does not match this pod.
 	ErrPodMismatch = errors.New("pod_id mismatch")
+	// ErrJWTAudience is returned when aud does not match the configured audience.
+	ErrJWTAudience = errors.New("invalid data_jwt audience")
 	// ErrMissingScope is returned when the token lacks the required scope.
 	ErrMissingScope = errors.New("missing scope")
 )
@@ -60,6 +62,10 @@ func VerifyToken(tokenStr string, cfg *Config, requiredScope string) (*DataJWTCl
 	}
 	if !token.Valid {
 		return nil, ErrTokenInvalid
+	}
+
+	if cfg.JWTAudience != "" && !claims.VerifyAudience(cfg.JWTAudience, true) {
+		return nil, ErrJWTAudience
 	}
 
 	if claims.SandboxID != cfg.SandboxID {

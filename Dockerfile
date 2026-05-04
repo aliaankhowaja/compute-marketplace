@@ -15,8 +15,13 @@ RUN apt-get update \
 
 RUN useradd -m -u 1001 -s /bin/bash sandbox
 
-COPY --from=build /sockt-runtime /sockt-runtime
+COPY --from=build /sockt-runtime /usr/local/bin/sockt-runtime
+
+RUN chmod 755 /usr/local/bin/sockt-runtime \
+  && mkdir -p /home/sandbox \
+  && chown sandbox:sandbox /home/sandbox
 
 EXPOSE 8443
-USER root
-ENTRYPOINT ["/sockt-runtime"]
+USER sandbox
+WORKDIR /home/sandbox
+ENTRYPOINT ["/usr/local/bin/sockt-runtime"]

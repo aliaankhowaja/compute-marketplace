@@ -56,7 +56,7 @@ func FilesWriteHandler(cfg *Config) http.Handler {
 			return
 		}
 
-		path, err := safeSandboxPath(req.Path)
+		path, err := resolveSandboxPath(cfg.SandboxRoot, req.Path)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -103,7 +103,7 @@ func FilesReadHandler(cfg *Config) http.Handler {
 			return
 		}
 
-		path, err := safeSandboxPath(r.URL.Query().Get("path"))
+		path, err := resolveSandboxPath(cfg.SandboxRoot, r.URL.Query().Get("path"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -141,7 +141,7 @@ func FilesListHandler(cfg *Config) http.Handler {
 			dir = "/"
 		}
 
-		path, err := safeSandboxPath(dir)
+		path, err := resolveSandboxPath(cfg.SandboxRoot, dir)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -169,26 +169,4 @@ func FilesListHandler(cfg *Config) http.Handler {
 
 		writeJSON(w, http.StatusOK, resp)
 	})
-}
-
-func safeSandboxPath(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", os.ErrInvalid
-	}
-
-	clean := filepath.Clean(raw)
-	if filepath.IsAbs(clean) {
-		if strings.Contains(clean, "..") {
-			return "", os.ErrInvalid
-		}
-		return clean, nil
-	}
-
-	joined := filepath.Clean(filepath.Join("/", clean))
-	if strings.Contains(joined, "..") {
-		return "", os.ErrInvalid
-	}
-
-	return joined, nil
 }

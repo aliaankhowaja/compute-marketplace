@@ -39,12 +39,26 @@ type ServerFrame struct {
 	ExpiresAt             string `json:"expires_at,omitempty"`
 }
 
-var shellUpgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+var (
+	shellSeatMu sync.Mutex
+	shellSeatN  int
+)
+
+func tryAcquireShellSlot(maxConcurrent int) (release func(), ok bool) {
+	if maxConcurrent <= 0 {
+		return func() {}, true
+	}
+	shellSeatMu.Lock()
+	defer shellSeatMu.Unlock()
+	if shellSeatN >= maxConcurrent {
+		return nil, false
+	}
+	shellSeatN++
+	return func() {
+		shellSeatMu.Lock()
+		shellSeatN--
+		shellSeatMu.Unlock()
+	}, true
 }
 
 // ShellHandler upgrades to websocket and attaches an interactive PTY as SANDBOX_USER.
@@ -65,11 +79,27 @@ func ShellHandler(cfg *Config, meter *Meter, cb *Callbacks) http.Handler {
 			return
 		}
 
-		conn, err := shellUpgrader.Upgrade(w, r, nil)
+		releaseSeat, okSeat := tryAcquireShellSlot(cfg.ShellMaxConcurrent)
+		if !okSeat {
+			http.Error(w, "too many concurrent shell sessions", http.StatusTooManyRequests)
+			return
+		}
+		defer releaseSeat()
+
+		upgrader := websocket.Upgrader{
+			ReadBufferSize:  4096,
+			WriteBufferSize: 4096,
+			CheckOrigin: func(r *http.Request) bool {
+				return cfg.ShellCheckOrigin(r)
+			},
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("runtime/shell: upgrade failed: %v", err)
 			return
 		}
+		conn.SetReadLimit(cfg.ShellWSMaxMessageBytes)
 
 		sub := meter.Subscribe(32)
 		ctx, cancel := context.WithCancel(r.Context())
@@ -85,7 +115,7 @@ func ShellHandler(cfg *Config, meter *Meter, cb *Callbacks) http.Handler {
 
 		cmd := exec.CommandContext(ctx, "/bin/bash", "-l")
 		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-		cmd.Dir = "/"
+		cmd.Dir = cfg.SandboxRoot
 
 		cred.Setsid = true
 		cmd.SysProcAttr = cred

@@ -8,8 +8,15 @@ import (
 	"github.com/golang-jwt/jwt/v4"
 )
 
+// DataJWTAudience is the JWT "aud" claim for data-plane tokens consumed by sockt-runtime.
+const DataJWTAudience = "sockt-runtime"
+
 // MintDataJWT returns an HS256 token compatible with runtime.DataJWTClaims.
-func MintDataJWT(secret []byte, sandboxID, podID, scope string, ttl time.Duration) (string, error) {
+// audience is copied into the JWT "aud" claim; empty string defaults to DataJWTAudience.
+func MintDataJWT(secret []byte, sandboxID, podID, scope string, ttl time.Duration, audience string) (string, error) {
+	if strings.TrimSpace(audience) == "" {
+		audience = DataJWTAudience
+	}
 	if len(secret) == 0 {
 		return "", fmt.Errorf("missing secret")
 	}
@@ -29,6 +36,7 @@ func MintDataJWT(secret []byte, sandboxID, podID, scope string, ttl time.Duratio
 		"sandbox_id": sandboxID,
 		"pod_id":     podID,
 		"scope":      scope,
+		"aud":        audience,
 		"iat":        now.Unix(),
 		"nbf":        now.Unix(),
 		"exp":        now.Add(ttl).Unix(),

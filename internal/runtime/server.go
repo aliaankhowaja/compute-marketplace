@@ -64,6 +64,8 @@ func writeAuthError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrTokenExpired):
 		http.Error(w, "data_jwt_expired", http.StatusUnauthorized)
+	case errors.Is(err, ErrJWTAudience):
+		http.Error(w, ErrJWTAudience.Error(), http.StatusUnauthorized)
 	case errors.Is(err, ErrMissingScope):
 		http.Error(w, ErrMissingScope.Error(), http.StatusForbidden)
 	case errors.Is(err, ErrSandboxMismatch), errors.Is(err, ErrPodMismatch):

@@ -255,6 +255,8 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 		"POD_ID":                 "",
 		"CONTROL_PLANE_URL":      cp,
 		"JWT_SECRET":             string(s.Cfg.WSSJWTSecret),
+		"JWT_AUDIENCE":           s.Cfg.DataJWTAudience,
+		"SANDBOX_ROOT":           s.Cfg.RuntimeSandboxRoot,
 		"CALLBACK_SECRET":        s.Cfg.CallbackSecret,
 		"BILLING_METHOD":         bm,
 		"RATE_PER_SECOND":        fmt.Sprintf("%d", rate),

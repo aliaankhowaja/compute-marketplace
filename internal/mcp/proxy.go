@@ -42,7 +42,7 @@ func (s *Service) proxyDataJWT(sb *store.Sandbox, scope string) (string, error) 
 	if s.Cfg.MCPDataJWTTTL > 0 {
 		ttl = s.Cfg.MCPDataJWTTTL
 	}
-	return auth.MintDataJWT(s.Cfg.WSSJWTSecret, sb.ID.String(), strings.TrimSpace(*sb.PodID), scope, ttl)
+	return auth.MintDataJWT(s.Cfg.WSSJWTSecret, sb.ID.String(), strings.TrimSpace(*sb.PodID), scope, ttl, s.Cfg.DataJWTAudience)
 }
 
 type execRuntimeRequest struct {

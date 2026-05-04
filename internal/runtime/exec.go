@@ -70,10 +70,18 @@ func ExecHandler(cfg *Config) http.Handler {
 			return
 		}
 
-		cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
+		workDir := cfg.SandboxRoot
 		if cwd := strings.TrimSpace(req.CWD); cwd != "" {
-			cmd.Dir = cwd
+			d, err := resolveSandboxPath(cfg.SandboxRoot, cwd)
+			if err != nil {
+				http.Error(w, "invalid cwd", http.StatusBadRequest)
+				return
+			}
+			workDir = d
 		}
+
+		cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
+		cmd.Dir = workDir
 		cmd.SysProcAttr = cred
 
 		var stdout, stderr bytes.Buffer

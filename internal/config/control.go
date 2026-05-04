@@ -43,6 +43,10 @@ type Control struct {
 	WSSJWTSecret        []byte
 	L402RootKey         []byte // 32 bytes; macaroon root
 	DataJWTTTL          time.Duration
+	// DataJWTAudience is the JWT aud claim minted onto data_jwt; must match sockt-runtime JWT_AUDIENCE.
+	DataJWTAudience string
+	// RuntimeSandboxRoot is injected as SANDBOX_ROOT into RunPod pods (path jail + default cwd).
+	RuntimeSandboxRoot string
 	CallbackSecret      string
 	StripeWebhookSecret string
 
@@ -181,6 +185,15 @@ func Load() (*Control, error) {
 	c.DataJWTTTL, err = parseDurationSecs("DATA_JWT_TTL_SECS", time.Hour)
 	if err != nil {
 		return nil, err
+	}
+
+	c.DataJWTAudience = strings.TrimSpace(os.Getenv("JWT_AUDIENCE"))
+	if c.DataJWTAudience == "" {
+		c.DataJWTAudience = "sockt-runtime" // keep in sync with auth.DataJWTAudience (runtime data_jwt)
+	}
+	c.RuntimeSandboxRoot = strings.TrimSpace(os.Getenv("RUNTIME_SANDBOX_ROOT"))
+	if c.RuntimeSandboxRoot == "" {
+		c.RuntimeSandboxRoot = "/home/sandbox"
 	}
 
 	c.MCPProxyTimeout, err = parseDurationSecs("MCP_PROXY_TIMEOUT_SECS", 120*time.Second)

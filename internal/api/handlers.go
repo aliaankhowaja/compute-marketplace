@@ -418,6 +418,8 @@ func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			"POD_ID":                 "", // filled after create
 			"CONTROL_PLANE_URL":      cp,
 			"JWT_SECRET":             string(d.Cfg.WSSJWTSecret),
+			"JWT_AUDIENCE":           d.Cfg.DataJWTAudience,
+			"SANDBOX_ROOT":           d.Cfg.RuntimeSandboxRoot,
 			"CALLBACK_SECRET":        d.Cfg.CallbackSecret,
 			"BILLING_METHOD":         bm,
 			"RATE_PER_SECOND":        fmt.Sprintf("%d", rate),
@@ -553,7 +555,7 @@ func handleRefreshDataJWT(d RouterDeps) func(http.ResponseWriter, *http.Request)
 			writeErr(w, http.StatusBadRequest, "pod_missing", "no pod yet")
 			return
 		}
-		tok, err := auth.MintDataJWT(d.Cfg.WSSJWTSecret, sb.ID.String(), *sb.PodID, "all", d.Cfg.DataJWTTTL)
+		tok, err := auth.MintDataJWT(d.Cfg.WSSJWTSecret, sb.ID.String(), *sb.PodID, "all", d.Cfg.DataJWTTTL, d.Cfg.DataJWTAudience)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "token_error", err.Error())
 			return
