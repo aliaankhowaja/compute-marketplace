@@ -24,7 +24,7 @@ type RouterDeps struct {
 }
 
 // NewRouter builds the HTTP mux.
-func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler {
+func NewRouter(d RouterDeps) http.Handler {
 	mux := http.NewServeMux()
 
 	// Cloud Run reserves some paths ending in "z"; /healthz never reaches the container.
@@ -57,16 +57,16 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 	}))
 
 	jwtAuth := auth.JWTAuth(d.Cfg.SupabaseJWTSecret)
-	rl := auth.NewRateLimiter(300)
+	rl := auth.NewRateLimiter(d.Cfg.MCPRPM)
 
 	mcpSvc := mcp.NewService(d.Cfg, d.Store, d.PaySvc, d.Orch, nil)
 	postMCPURL := controlPlaneOrigin(d) + "/v1/mcp"
 	mux.Handle("GET /v1/mcp/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mcp.HealthPayload())
 	}))
-	// Legacy SSE: public handshake; POST /v1/mcp still requires auth.
+	// Legacy SSE: public handshake; POST /v1/mcp still requires its own auth.
 	mux.Handle("GET /v1/mcp", rl.Middleware(mcp.SSEHandler(postMCPURL)))
-	mux.Handle("POST /v1/mcp", mcp.AuthMiddleware(d.APIKeys, d.Cfg.SupabaseJWTSecret, mint, l402Root, rl.Middleware(mcp.Handler(mcpSvc))))
+	mux.Handle("POST /v1/mcp", mcp.AuthMiddleware(d.APIKeys, d.Store, rl.Middleware(mcp.Handler(mcpSvc))))
 
 	// User JWT routes
 	jt := func(h http.Handler) http.Handler {
@@ -79,23 +79,16 @@ func NewRouter(d RouterDeps, mint auth.Bolt11Mint, l402Root []byte) http.Handler
 	mux.Handle("GET /v1/user/api-keys", jt(http.HandlerFunc(handleListAPIKeys(d))))
 	mux.Handle("DELETE /v1/user/api-keys/{id}", jt(http.HandlerFunc(handleRevokeAPIKey(d))))
 
-	// Wallet (JWT)
-	mux.Handle("POST /v1/wallet/offer", jt(http.HandlerFunc(handleWalletOffer(d))))
-	mux.Handle("GET /v1/wallet/balance", jt(http.HandlerFunc(handleWalletBalance(d))))
-	mux.Handle("POST /v1/wallet/deposit", jt(http.HandlerFunc(handleWalletDeposit(d))))
-	mux.Handle("GET /v1/wallet/deposits/{payment_hash}", jt(http.HandlerFunc(handleWalletDepositStatus(d))))
-
-	// Sandbox lifecycle — API key (credits) or L402 (lightning)
-	sandboxBase := eitherAPIKeyOrL402(d.APIKeys, mint, l402Root, rl)
-
-	mux.Handle("POST /v1/sandbox/create", sandboxBase(http.HandlerFunc(handleCreateSandbox(d))))
-	mux.Handle("GET /v1/sandbox/{id}", sandboxBase(http.HandlerFunc(handleGetSandbox(d))))
-	mux.Handle("POST /v1/sandbox/{id}/pause", sandboxBase(http.HandlerFunc(handlePauseSandbox(d))))
-	mux.Handle("POST /v1/sandbox/{id}/resume", sandboxBase(http.HandlerFunc(handleResumeSandbox(d))))
-	mux.Handle("DELETE /v1/sandbox/{id}", sandboxBase(http.HandlerFunc(handleDeleteSandbox(d))))
-	mux.Handle("POST /v1/sandbox/{id}/refresh-data-jwt", sandboxBase(http.HandlerFunc(handleRefreshDataJWT(d))))
-	mux.Handle("POST /v1/sandbox/{id}/extend-balance", sandboxBase(http.HandlerFunc(handleExtendBalance(d))))
-	mux.Handle("GET /v1/sandbox/{id}/billing", sandboxBase(http.HandlerFunc(handleSandboxBilling(d))))
+	// Sandbox lifecycle — API key (credits) only on REST. Lightning sandboxes are managed via MCP.
+	apiKey := func(h http.Handler) http.Handler { return rl.Middleware(d.APIKeys.Middleware(h)) }
+	mux.Handle("POST /v1/sandbox/create", apiKey(http.HandlerFunc(handleCreateSandbox(d))))
+	mux.Handle("GET /v1/sandbox/{id}", apiKey(http.HandlerFunc(handleGetSandbox(d))))
+	mux.Handle("POST /v1/sandbox/{id}/pause", apiKey(http.HandlerFunc(handlePauseSandbox(d))))
+	mux.Handle("POST /v1/sandbox/{id}/resume", apiKey(http.HandlerFunc(handleResumeSandbox(d))))
+	mux.Handle("DELETE /v1/sandbox/{id}", apiKey(http.HandlerFunc(handleDeleteSandbox(d))))
+	mux.Handle("POST /v1/sandbox/{id}/refresh-data-jwt", apiKey(http.HandlerFunc(handleRefreshDataJWT(d))))
+	mux.Handle("POST /v1/sandbox/{id}/extend-balance", apiKey(http.HandlerFunc(handleExtendBalance(d))))
+	mux.Handle("GET /v1/sandbox/{id}/billing", apiKey(http.HandlerFunc(handleSandboxBilling(d))))
 
 	// Runtime callbacks
 	mux.Handle("POST /v1/runtime/billing/audit-batch", auth.BearerSecret(d.Cfg.CallbackSecret, http.HandlerFunc(handleAuditBatch(d))))
@@ -114,19 +107,4 @@ func controlPlaneOrigin(d RouterDeps) string {
 		base = "http://127.0.0.1:" + d.Cfg.Port
 	}
 	return base
-}
-
-func eitherAPIKeyOrL402(keys *auth.APIKeyCache, mint auth.Bolt11Mint, root []byte, rl *auth.RateLimiter) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		apih := keys.Middleware(next)
-		l402h := auth.L402Middleware(mint, root, next)
-		return rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw := auth.BearerFromRequest(r)
-			if strings.HasPrefix(raw, "sockt_live_") {
-				apih.ServeHTTP(w, r)
-				return
-			}
-			l402h.ServeHTTP(w, r)
-		}))
-	}
 }

@@ -41,7 +41,6 @@ type Control struct {
 	LNURLHTTPTimeoutSecs int
 
 	WSSJWTSecret []byte
-	L402RootKey  []byte // 32 bytes; macaroon root
 	DataJWTTTL   time.Duration
 	// DataJWTAudience is the JWT aud claim minted onto data_jwt; must match sockt-runtime JWT_AUDIENCE.
 	DataJWTAudience string
@@ -53,8 +52,6 @@ type Control struct {
 	BalanceLowWaterSecs     int
 	BalanceTopupChunkSecs   int
 	LowCreditThresholdCents int64
-	InvoicePoolTarget       int
-	InvoicePoolRefillBelow  int
 
 	APIKeyCacheSize int
 
@@ -72,6 +69,13 @@ type Control struct {
 	MCPProxyTimeout     time.Duration
 	MCPRequestBodyLimit int64
 	MCPDataJWTTTL       time.Duration // 0 = use DataJWTTTL for data_jwt minting on MCP→pod proxy
+	// MCPRPM is per-principal-or-IP requests per minute for POST /v1/mcp.
+	MCPRPM int
+
+	// SandboxPrepaySecs is how many seconds of compute one sandbox-scoped BOLT11 prepays.
+	SandboxPrepaySecs int
+	// SandboxTopupTriggerSecs is how few seconds of remaining balance triggers a top-up mint.
+	SandboxTopupTriggerSecs int
 
 	// SandboxReadyTimeout is the max time to wait for sockt-runtime /healthz after pod create or resume (SANDBOX_READY_TIMEOUT_SECS).
 	SandboxReadyTimeout time.Duration
@@ -79,6 +83,21 @@ type Control struct {
 	SandboxReadyPollInterval time.Duration
 	// SandboxReadyProbeTimeout is the per-request HTTP timeout for each GET /healthz (SANDBOX_READY_PROBE_TIMEOUT_SECS).
 	SandboxReadyProbeTimeout time.Duration
+}
+
+func parseBool(key string, def bool) (bool, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s: invalid boolean", key)
+	}
 }
 
 func envOrDefault(key, def string) string {
@@ -193,14 +212,6 @@ func Load() (*Control, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.InvoicePoolTarget, err = parseInt("INVOICE_POOL_TARGET", 100)
-	if err != nil {
-		return nil, err
-	}
-	c.InvoicePoolRefillBelow, err = parseInt("INVOICE_POOL_REFILL_BELOW", 40)
-	if err != nil {
-		return nil, err
-	}
 	c.APIKeyCacheSize, err = parseInt("API_KEY_CACHE_SIZE", 10000)
 	if err != nil {
 		return nil, err
@@ -231,6 +242,25 @@ func Load() (*Control, error) {
 	c.MCPDataJWTTTL, err = parseDurationSecs("MCP_DATA_JWT_TTL_SECS", 0)
 	if err != nil {
 		return nil, err
+	}
+
+	c.MCPRPM, err = parseInt("MCP_RPM", 300)
+	if err != nil {
+		return nil, err
+	}
+	c.SandboxPrepaySecs, err = parseInt("SANDBOX_PREPAY_SECS", 30)
+	if err != nil {
+		return nil, err
+	}
+	if c.SandboxPrepaySecs < 5 {
+		c.SandboxPrepaySecs = 5
+	}
+	c.SandboxTopupTriggerSecs, err = parseInt("SANDBOX_TOPUP_TRIGGER_SECS", 5)
+	if err != nil {
+		return nil, err
+	}
+	if c.SandboxTopupTriggerSecs < 1 {
+		c.SandboxTopupTriggerSecs = 1
 	}
 
 	c.SandboxReadyTimeout, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_SECS", 120*time.Second)
@@ -273,32 +303,6 @@ func Load() (*Control, error) {
 		return nil, fmt.Errorf("WSS_JWT_SECRET is required")
 	}
 	c.WSSJWTSecret = []byte(k)
-
-	lk := strings.TrimSpace(os.Getenv("L402_ROOT_KEY"))
-	if lk != "" {
-		// hex 64 chars = 32 bytes
-		if len(lk) != 64 {
-			return nil, fmt.Errorf("L402_ROOT_KEY must be 64 hex chars (32 bytes)")
-		}
-		var b [32]byte
-		for i := 0; i < 32; i++ {
-			v, err := strconv.ParseUint(lk[2*i:2*i+2], 16, 8)
-			if err != nil {
-				return nil, fmt.Errorf("L402_ROOT_KEY hex: %w", err)
-			}
-			b[i] = byte(v)
-		}
-		c.L402RootKey = b[:]
-	} else {
-		// derive from WSS secret via copy (MVP fallback — user should set L402_ROOT_KEY in prod)
-		if len(c.WSSJWTSecret) >= 32 {
-			c.L402RootKey = append([]byte(nil), c.WSSJWTSecret[:32]...)
-		} else {
-			pad := make([]byte, 32)
-			copy(pad, c.WSSJWTSecret)
-			c.L402RootKey = pad
-		}
-	}
 
 	if c.SupabaseDBTxDSN == "" {
 		return nil, fmt.Errorf("SUPABASE_DB_TX_DSN is required")

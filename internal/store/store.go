@@ -36,7 +36,7 @@ func (s *Store) PingTx(ctx context.Context) error {
 // Agent row (lightning path principal).
 type Agent struct {
 	ID           uuid.UUID
-	JWTSub       uuid.UUID
+	JWTSub       *uuid.UUID // nil for MCP anonymous-L402 agents until linked to a dashboard user
 	BalanceMsats int64
 	WarningLevel string
 }
@@ -74,6 +74,14 @@ type Sandbox struct {
 	PodProxyURL     *string
 	NetworkVolumeID *string
 	ConsumedMsats   int64
+
+	// Per-sandbox lightning prepay (sandbox-token path).
+	SandboxToken              *string
+	PrepaidBalanceMsats       int64
+	PendingInvoiceBolt11      *string
+	PendingInvoicePaymentHash []byte
+	PendingInvoiceAmountMsats *int64
+	PendingInvoiceExpiresAt   *time.Time
 }
 
 // TierPricing row.

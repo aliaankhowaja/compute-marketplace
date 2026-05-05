@@ -153,7 +153,7 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 	if sec > 300 {
 		sec = 300
 	}
-	cwd := "/workspace"
+	cwd := "."
 	if v, ok := args["working_dir"].(string); ok && strings.TrimSpace(v) != "" {
 		cwd = v
 	}

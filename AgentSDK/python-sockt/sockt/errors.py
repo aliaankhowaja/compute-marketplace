@@ -11,7 +11,7 @@ class SocktError(Exception):
 
 
 class AuthenticationError(SocktError):
-    """JWT / API key / L402 authentication failure."""
+    """JWT / API key / sandbox-token authentication failure."""
 
 
 class SandboxNotRunningError(SocktError):

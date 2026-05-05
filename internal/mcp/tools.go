@@ -1,6 +1,78 @@
 package mcp
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/aliaankhowaja/sockt-backend/internal/auth"
+)
+
+const defaultSandboxRoot = "/home/sandbox"
+
+// sandboxInstructions returns MCP initialize preamble text so clients know sandbox layout and path rules.
+func sandboxInstructions(svc *Service) string {
+	root := defaultSandboxRoot
+	if svc != nil && svc.Cfg != nil {
+		if r := strings.TrimSpace(svc.Cfg.RuntimeSandboxRoot); r != "" {
+			root = filepath.Clean(r)
+		}
+	}
+	exSub := filepath.Join(root, "myproject")
+	return fmt.Sprintf(`Sockt sandbox environment:
+- The sandbox home directory (SANDBOX_ROOT) and default working directory for sandbox_exec is %q.
+- Omit sandbox_exec's working_dir or use "." to run commands from the sandbox home; only set working_dir when you need a subdirectory.
+- working_dir is a logical path under SANDBOX_ROOT: "." and "/" refer to the sandbox home; a relative segment like "myproject" maps to %q. An absolute path is accepted only when it equals SANDBOX_ROOT or lies under it (e.g. %q).
+- sandbox_write_file, sandbox_read_file, and sandbox_list_files use the same logical path rules for their path argument.
+- New sandboxes start with an empty filesystem; use sandbox_list_files to inspect before assuming files exist.
+
+See result.sockt for Sockt authentication and billing hints.`,
+		root, exSub, root)
+}
+
+// sessionHints returns structured MCP initialize hints describing auth + onboarding for the caller.
+func sessionHints(svc *Service, p *auth.Principal) map[string]any {
+	out := map[string]any{}
+	if svc != nil && svc.Cfg != nil {
+		cp := strings.TrimRight(strings.TrimSpace(svc.Cfg.ControlPlanePublicURL), "/")
+		if cp != "" {
+			out["control_plane_public_url"] = cp
+		}
+	}
+
+	if p != nil {
+		out["auth_state"] = "authenticated"
+		out["principal_kind"] = string(p.Kind)
+		switch p.Kind {
+		case auth.KindAPIKey:
+			out["billing"] = "API key (credits): sandbox_create with billing_method=credits charges your USD credit balance."
+		case auth.KindSandbox:
+			out["billing"] = "Sandbox token: this credential is bound to a single Lightning sandbox; pay any pending_invoice in sandbox_status to keep it running."
+			if p.SandboxID != nil {
+				out["sandbox_id"] = p.SandboxID.String()
+			}
+		default:
+			out["billing"] = "See tool descriptions for this credential type."
+		}
+		return out
+	}
+
+	prepay := 30
+	if svc != nil && svc.Cfg != nil && svc.Cfg.SandboxPrepaySecs > 0 {
+		prepay = svc.Cfg.SandboxPrepaySecs
+	}
+	out["auth_state"] = "unauthenticated"
+	out["billing"] = "Without credentials, sandbox_create with billing_method=lightning returns a BOLT11 + sandbox_token. Pay the invoice and call subsequent tools with Authorization: Bearer <sandbox_token> (or pass sandbox_token as a tool argument)."
+	out["lightning_prepay_secs"] = prepay
+	out["onboarding_steps"] = []string{
+		`tools/call sandbox_create with billing_method "lightning" and tier (nano|micro|standard|gpu_small|gpu_large).`,
+		fmt.Sprintf("Server returns sandbox_id, sandbox_token (sbx_…), and a BOLT11 prepaying %d seconds of compute. Pay it from any LN wallet.", prepay),
+		`Once paid, the sandbox boots automatically. Poll sandbox_status with sandbox_id+sandbox_token until status="running".`,
+		`When sandbox_status shows a pending_invoice, pay it to keep running; otherwise the sandbox auto-pauses when prepaid balance hits zero.`,
+	}
+	return out
+}
 
 type toolDef struct {
 	Name        string          `json:"name"`
@@ -8,32 +80,35 @@ type toolDef struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
-func toolList() []toolDef {
+func toolList(svc *Service, p *auth.Principal) []toolDef {
+	_ = svc
+	createDesc := "Provision a new sandbox (RunPod). May take up to ~2 minutes for credits sandboxes; lightning sandboxes return an invoice + sandbox_token immediately and boot once you pay. billing_method: lightning (no credentials needed) or credits (API key required). Tier: nano|micro|standard|gpu_small|gpu_large."
+	if p == nil {
+		createDesc = "[Without credentials, billing_method defaults to \"lightning\". The response includes a BOLT11 invoice and a sandbox_token; pay the invoice, then send Authorization: Bearer <sandbox_token> on subsequent calls or pass sandbox_token as a tool argument.] " + createDesc
+	}
 	return []toolDef{
 		{
 			Name:        "sandbox_create",
-			Description: "Provision a new sandbox (RunPod). May take up to ~2 minutes while the runtime starts and becomes reachable. billing_method: lightning | credits; tier: nano|micro|standard|gpu_small|gpu_large (maps to sockt templates + specs). Requires L402 (lightning) or API key (credits).",
+			Description: createDesc,
 			InputSchema: json.RawMessage(`{
 				"type": "object",
-				"required": ["billing_method", "tier"],
+				"required": ["tier"],
 				"properties": {
 					"billing_method": {"type": "string", "enum": ["lightning", "credits"]},
-					"tier": {"type": "string"},
-					"duration_secs": {"type": "integer"},
-					"egress": {"type": "boolean"},
-					"label": {"type": "string"},
-					"idempotency_key": {"type": "string"}
+					"tier": {"type": "string", "enum": ["nano", "micro", "standard", "gpu_small", "gpu_large"]},
+					"label": {"type": "string"}
 				}
 			}`),
 		},
 		{
 			Name:        "sandbox_exec",
-			Description: "Run a shell command in the sandbox via the data plane (proxied with data_jwt).",
+			Description: "Run a shell command in the sandbox. working_dir defaults to SANDBOX_ROOT. Pass sandbox_token if not using bearer auth.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id", "command"],
 				"properties": {
 					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"},
 					"command": {"type": "string"},
 					"timeout_ms": {"type": "integer"},
 					"env": {"type": "object"},
@@ -43,12 +118,13 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "sandbox_write_file",
-			Description: "Write a file inside the sandbox (base64 on wire to runtime).",
+			Description: "Write a file inside the sandbox (base64 on wire to runtime). Pass sandbox_token if not using bearer auth.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id", "path", "content"],
 				"properties": {
 					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"},
 					"path": {"type": "string"},
 					"content": {"type": "string"},
 					"encoding": {"type": "string", "enum": ["utf8", "base64"]},
@@ -58,12 +134,13 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "sandbox_read_file",
-			Description: "Read a file from the sandbox.",
+			Description: "Read a file from the sandbox. Pass sandbox_token if not using bearer auth.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id", "path"],
 				"properties": {
 					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"},
 					"path": {"type": "string"},
 					"encoding": {"type": "string", "enum": ["utf8", "base64"]},
 					"max_bytes": {"type": "integer"}
@@ -72,12 +149,13 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "sandbox_list_files",
-			Description: "List files in a directory inside the sandbox.",
+			Description: "List files in a directory inside the sandbox. Pass sandbox_token if not using bearer auth.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id"],
 				"properties": {
 					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"},
 					"path": {"type": "string"},
 					"recursive": {"type": "boolean"},
 					"max_depth": {"type": "integer"}
@@ -86,12 +164,13 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "sandbox_status",
-			Description: "Sandbox row from control plane plus optional live runtime status.",
+			Description: "Sandbox row plus optional live runtime status. For lightning sandboxes, includes prepaid_balance_msats, seconds_remaining, and pending_invoice when one is outstanding.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id"],
 				"properties": {
-					"sandbox_id": {"type": "string"}
+					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"}
 				}
 			}`),
 		},
@@ -102,7 +181,8 @@ func toolList() []toolDef {
 				"type": "object",
 				"required": ["sandbox_id"],
 				"properties": {
-					"sandbox_id": {"type": "string"}
+					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"}
 				}
 			}`),
 		},
@@ -113,7 +193,8 @@ func toolList() []toolDef {
 				"type": "object",
 				"required": ["sandbox_id"],
 				"properties": {
-					"sandbox_id": {"type": "string"}
+					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"}
 				}
 			}`),
 		},
@@ -125,51 +206,8 @@ func toolList() []toolDef {
 				"required": ["sandbox_id", "confirm"],
 				"properties": {
 					"sandbox_id": {"type": "string"},
+					"sandbox_token": {"type": "string"},
 					"confirm": {"type": "boolean"}
-				}
-			}`),
-		},
-		{
-			Name:        "sandbox_extend_balance",
-			Description: "Lightning: mint a BOLT11 deposit invoice for this sandbox. Credits: allocate more cents into the sandbox local balance.",
-			InputSchema: json.RawMessage(`{
-				"type": "object",
-				"required": ["sandbox_id"],
-				"properties": {
-					"sandbox_id": {"type": "string"},
-					"sats": {"type": "integer"},
-					"cents": {"type": "integer"},
-					"idempotency_key": {"type": "string"}
-				}
-			}`),
-		},
-		{
-			Name:        "wallet_balance",
-			Description: "Billing overview: Lightning prepaid (msats, deposit hints) when a Lightning agent is linked; otherwise API key / user JWT returns credits balance (USD cents).",
-			InputSchema: json.RawMessage(`{
-				"type": "object",
-				"properties": {}
-			}`),
-		},
-		{
-			Name:        "wallet_deposit",
-			Description: "Mint a BOLT11 invoice to deposit sats against your prepaid Sockt balance (paid via LNBOT treasury wallet).",
-			InputSchema: json.RawMessage(`{
-				"type": "object",
-				"properties": {
-					"amount_sats": {"type": "integer"},
-					"idempotency_key": {"type": "string"}
-				}
-			}`),
-		},
-		{
-			Name:        "wallet_deposit_status",
-			Description: "Poll pending/settled status for a deposit by payment_hash (hex).",
-			InputSchema: json.RawMessage(`{
-				"type": "object",
-				"required": ["payment_hash"],
-				"properties": {
-					"payment_hash": {"type": "string"}
 				}
 			}`),
 		},

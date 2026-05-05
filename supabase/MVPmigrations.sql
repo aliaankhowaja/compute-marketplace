@@ -289,3 +289,8 @@ create trigger on_auth_user_created
   for each row
   execute procedure public.handle_new_user();
 
+-- === supabase/migrations/20260505120000_agents_anonymous.sql ===
+-- Allow Lightning agents created via MCP anonymous L402 (no Supabase user linkage yet).
+
+alter table public.agents alter column jwt_sub drop not null;
+

@@ -7,23 +7,28 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 )
 
-// AuthMiddleware tries API key, L402, then Supabase JWT (in that order).
-func AuthMiddleware(keys *auth.APIKeyCache, jwtSecret string, mint auth.Bolt11Mint, l402Root []byte, next http.Handler) http.Handler {
-	jwtH := auth.JWTAuth(jwtSecret)(next)
-	l402H := auth.L402Middleware(mint, l402Root, next)
+// AuthMiddleware routes POST /v1/mcp authentication based on the bearer prefix:
+//
+//   - `sockt_live_…` → API-key middleware (credits path).
+//   - `sbx_…`        → sandbox-token middleware (per-sandbox lightning prepay).
+//   - anything else  → pass through anonymously (the handler may serve unauthenticated
+//     calls such as `initialize`, `tools/list`, or anonymous `sandbox_create`).
+//
+// JWT bearer tokens for the dashboard are intentionally not accepted on the MCP
+// surface; the MCP path is reserved for autonomous agents (API key or sandbox token).
+func AuthMiddleware(keys *auth.APIKeyCache, sandboxTokens auth.SandboxTokenLookup, next http.Handler) http.Handler {
 	apiH := keys.Middleware(next)
+	sbxH := auth.SandboxTokenMiddleware(sandboxTokens, next)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw := auth.BearerFromRequest(r)
-		authz := strings.TrimSpace(r.Header.Get("Authorization"))
-
 		switch {
 		case strings.HasPrefix(raw, "sockt_live_"):
 			apiH.ServeHTTP(w, r)
-		case strings.HasPrefix(strings.ToUpper(authz), "L402 "):
-			l402H.ServeHTTP(w, r)
+		case auth.IsSandboxToken(raw):
+			sbxH.ServeHTTP(w, r)
 		default:
-			jwtH.ServeHTTP(w, r)
+			next.ServeHTTP(w, r)
 		}
 	})
 }

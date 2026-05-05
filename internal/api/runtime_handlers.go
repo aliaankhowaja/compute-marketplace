@@ -44,18 +44,34 @@ func handleAuditBatch(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 
 		switch strings.ToLower(strings.TrimSpace(body.BillingMethod)) {
 		case "lightning":
+			var total int64
+			for _, iv := range body.Intervals {
+				if iv.Consumed > 0 {
+					total += iv.Consumed
+				}
+			}
+			if sb.SandboxToken != nil {
+				if total > 0 {
+					if _, err := d.Store.IncrementSandboxPrepaidMsats(r.Context(), sid, -total); err != nil {
+						writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
+						return
+					}
+				}
+				newConsumed := sb.ConsumedMsats + total
+				_ = d.Store.SetSandboxConsumedMsats(r.Context(), sid, newConsumed)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 			if sb.AgentID == nil {
-				writeErr(w, http.StatusBadRequest, "bad_request", "no agent")
+				writeErr(w, http.StatusBadRequest, "bad_request", "lightning sandbox missing token and agent")
 				return
 			}
 			var rows []store.BillingInterval
-			var total int64
 			for _, iv := range body.Intervals {
 				ms := iv.Consumed
 				if ms <= 0 {
 					continue
 				}
-				total += ms
 				rows = append(rows, store.BillingInterval{
 					SandboxID: sid,
 					AgentID:   *sb.AgentID,
@@ -157,7 +173,15 @@ func handleTopupTrigger(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 		bm := strings.ToLower(strings.TrimSpace(body.BillingMethod))
 		switch bm {
 		case "lightning":
-			if sb.AgentID == nil || d.PaySvc == nil || !d.PaySvc.HasLightning() {
+			if d.PaySvc == nil || !d.PaySvc.HasLightning() {
+				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "disabled"})
+				return
+			}
+			if sb.SandboxToken != nil {
+				handleSandboxLightningTopup(w, r, d, sb, &body)
+				return
+			}
+			if sb.AgentID == nil {
 				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "disabled"})
 				return
 			}
@@ -226,6 +250,100 @@ func handleTopupTrigger(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "billing_method"})
 		}
 	}
+}
+
+// handleSandboxLightningTopup implements the new sandbox-scoped Lightning topup flow:
+//  1. If the persisted prepaid balance is ahead of the runtime's snapshot, return a balance delta so
+//     the meter catches up to the post-settlement number.
+//  2. Otherwise, if a pending invoice exists and is still in the freshness window, return that one.
+//  3. Otherwise, mint a new BOLT11, persist it on the sandbox row, and return it.
+func handleSandboxLightningTopup(w http.ResponseWriter, r *http.Request, d RouterDeps, sb *store.Sandbox, body *triggerPayload) {
+	now := time.Now().UTC()
+
+	if sb.PrepaidBalanceMsats > body.Balance {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"balance_delta": sb.PrepaidBalanceMsats - body.Balance,
+			"new_balance":   sb.PrepaidBalanceMsats,
+		})
+		return
+	}
+
+	if sb.PendingInvoiceBolt11 != nil && sb.PendingInvoiceExpiresAt != nil && now.Before(*sb.PendingInvoiceExpiresAt) {
+		amt := int64(0)
+		if sb.PendingInvoiceAmountMsats != nil {
+			amt = *sb.PendingInvoiceAmountMsats
+		}
+		ph := ""
+		if sb.PendingInvoicePaymentHash != nil {
+			ph = fmt.Sprintf("%x", sb.PendingInvoicePaymentHash)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"balance_delta": int64(0),
+			"error_class":   "deposit_required",
+			"deposit": map[string]any{
+				"bolt11":       *sb.PendingInvoiceBolt11,
+				"payment_hash": ph,
+				"amount_msats": amt,
+				"expires_at":   sb.PendingInvoiceExpiresAt.Format(time.RFC3339),
+			},
+		})
+		return
+	}
+
+	chunkMsats := body.RequestedTopup
+	if chunkMsats <= 0 {
+		prepay := int64(d.Cfg.SandboxPrepaySecs)
+		if prepay <= 0 {
+			prepay = 30
+		}
+		pr, _ := d.Store.GetTierPricing(r.Context(), sb.Tier)
+		if pr != nil && pr.MsatsPerSecond > 0 {
+			chunkMsats = prepay * pr.MsatsPerSecond
+		}
+	}
+	sats := chunkMsats / 1000
+	if chunkMsats%1000 != 0 {
+		sats++
+	}
+	if sats <= 0 {
+		sats = 30
+	}
+
+	expirySecs := int64(3600)
+	idem := fmt.Sprintf("sandbox-mint:%s:%s:%d", sb.ID.String(), strings.TrimSpace(body.PodID), body.ConsumedTotal/1_000_000_000)
+	memo := fmt.Sprintf("sandbox-prepay:%s", sb.ID.String())
+	dep, err := d.PaySvc.RequestSandboxDepositInvoice(r.Context(), sb.ID, sats, expirySecs, memo, idem)
+	if err != nil || dep == nil {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"balance_delta": int64(0),
+			"error_class":   "deposit_mint_failed",
+			"message":       msg,
+		})
+		return
+	}
+	expRFC := now.Add(time.Duration(dep.ExpirySeconds) * time.Second)
+	if err := d.Store.SetSandboxPendingInvoice(r.Context(), sb.ID, dep.PaymentRequest, dep.RHash, dep.AmountMsats, expRFC); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"balance_delta": int64(0),
+			"error_class":   "store_error",
+			"message":       err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"balance_delta": int64(0),
+		"error_class":   "deposit_required",
+		"deposit": map[string]any{
+			"bolt11":       dep.PaymentRequest,
+			"payment_hash": fmt.Sprintf("%x", dep.RHash),
+			"amount_msats": dep.AmountMsats,
+			"expires_at":   expRFC.Format(time.RFC3339),
+		},
+	})
 }
 
 func handlePauseTrigger(d RouterDeps) func(http.ResponseWriter, *http.Request) {

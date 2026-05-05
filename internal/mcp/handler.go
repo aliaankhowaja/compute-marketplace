@@ -129,11 +129,13 @@ func Handler(svc *Service) http.Handler {
 				"session": map[string]any{
 					"id": sid,
 				},
+				"instructions": sandboxInstructions(svc),
+				"sockt":        sessionHints(svc, p),
 			}))
 
 		case "tools/list":
 			writeJSON(w, http.StatusOK, rpcOK(req.ID, map[string]any{
-				"tools": toolList(),
+				"tools": toolList(svc, p),
 			}))
 
 		case "tools/call":
@@ -160,7 +162,7 @@ func Handler(svc *Service) http.Handler {
 			}
 			if st != 0 {
 				msg := rpcErrMessageFromExtra(slug, extra)
-				writeJSON(w, http.StatusOK, rpcErr(req.ID, st, slug, msg, extra))
+				writeJSON(w, http.StatusOK, rpcOK(req.ID, toolErrorResult(slug, msg, extra)))
 				return
 			}
 			writeJSON(w, http.StatusOK, rpcOK(req.ID, rewrapToolResult(res)))

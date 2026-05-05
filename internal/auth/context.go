@@ -15,6 +15,7 @@ const (
 	KindAPIKey   Kind = "api_key"
 	KindUserJWT  Kind = "user_jwt"
 	KindCallback Kind = "callback"
+	KindSandbox  Kind = "sandbox"
 )
 
 // Principal is stored in context after successful auth.
@@ -23,6 +24,7 @@ type Principal struct {
 	UserID     *uuid.UUID
 	AgentID    *uuid.UUID
 	APIKeyID   *uuid.UUID
+	SandboxID  *uuid.UUID // present when authenticated by per-sandbox bearer token
 	JWTSub     *uuid.UUID // Supabase sub (UUID string from JWT)
 	Caveats    map[string]string
 	BalanceKey string // stable key for rate limiting

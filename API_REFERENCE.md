@@ -21,7 +21,7 @@ This document describes the HTTP surface exposed by the **sockt control plane** 
 
 - **Plain-text errors:** [`JWTAuth`](internal/auth/jwt.go) rejects missing/invalid JWTs with [`http.Error`](https://pkg.go.dev/net/http#Error) bodies (plain text such as `"missing authorization"`, `"invalid token"`), not JSON. Plan clients accordingly.
 
-- **Rate limiting:** JWT-protected routes, MCP POST, and the outer wrapper around sandbox/API-key+L402 routing use [`auth.NewRateLimiter(300)`](internal/api/router.go) — approximately **300 requests per minute per limiter key**, with burst derived from RPM ([`internal/auth/ratelimit.go`](internal/auth/ratelimit.go)). Excess requests receive **429** with body `rate limited` (plain text). The limit key is [`Principal.BalanceKey`](internal/auth/context.go); where the principal is not set yet inside the sandbox route wrapper, requests share the **`anon`** key.
+- **Rate limiting:** Sandbox REST + MCP POST share a single [`auth.NewRateLimiter(MCP_RPM)`](internal/api/router.go) (default **120 rpm per key**, with burst derived from RPM ([`internal/auth/ratelimit.go`](internal/auth/ratelimit.go))). Excess requests receive **429** with body `rate limited` (plain text). For authenticated principals the key is [`Principal.BalanceKey`](internal/auth/context.go); for anonymous MCP requests the key is `ip:<client_ip>`.
 
 ---
 
@@ -35,27 +35,26 @@ Types from [`internal/store/store.go`](internal/store/store.go) (`User`, `Sandbo
 
 ```mermaid
 flowchart LR
-  subgraph sandbox_routes [/v1/sandbox paths]
-    A["Authorization Bearer"]
-    A --> B{"prefix sockt_live_?"}
-    B -->|"yes"| C[API key principal]
-    B -->|"no"| D[L402 macaroon + preimage]
-  end
+  A["POST /v1/mcp Authorization"]
+  A --> B{"prefix?"}
+  B -->|"sockt_live_…"| C[API key principal]
+  B -->|"sbx_…"| D[Sandbox-token principal]
+  B -->|"empty"| E[Anonymous: only sandbox_create works]
 ```
 
 | Mechanism | When | Headers / behavior |
 |-----------|------|---------------------|
 | **None** | Public catalog and health | No auth. |
-| **User JWT** | `/v1/user/*`, `/v1/wallet/*` | `Authorization: Bearer <jwt>`. HS256, `sub` claim must be user UUID ([`JWTAuth`](internal/auth/jwt.go)). |
-| **API key** | Sandbox routes when bearer token starts with `sockt_live_` | Same `Bearer` header; validated via API key middleware ([`internal/auth/apikey.go`](internal/auth/apikey.go)). Credits sandboxes require this path. |
-| **L402** | Sandbox routes when Bearer is **not** an API key | `Authorization: L402 <base64_macaroon>:<preimage_hex>` ([`parseL402Auth`](internal/auth/l402.go)). First request without credentials: **`X-Agent-Id`** header (UUID) + missing/invalid Authorization → **402** JSON body: `macaroon`, `invoice`, `payment_hash`, `expires_at`. Lightning billing sandboxes require L402 principal. |
-| **MCP composite** | `POST /v1/mcp` | Order: API key → L402 → user JWT ([`AuthMiddleware`](internal/mcp/auth.go)). |
+| **User JWT** | `/v1/user/*` | `Authorization: Bearer <jwt>`. HS256, `sub` claim must be user UUID ([`JWTAuth`](internal/auth/jwt.go)). |
+| **API key** | REST `/v1/sandbox/*` and MCP POST | `Authorization: Bearer sockt_live_…` ([`internal/auth/apikey.go`](internal/auth/apikey.go)). Credits sandboxes require this path. |
+| **Sandbox token** | MCP POST | `Authorization: Bearer sbx_…` ([`internal/auth/sandboxtoken.go`](internal/auth/sandboxtoken.go)). Issued by the control plane in the result of `tools/call sandbox_create` for Lightning sandboxes; the LLM uses it (or passes `sandbox_token` as a tool argument) to call subsequent tools on that sandbox. |
+| **Anonymous** | MCP POST | No `Authorization` header. `initialize`, `tools/list`, and `tools/call sandbox_create` are allowed; every other tool returns `forbidden` until a `sandbox_token` is presented. |
 | **Callback secret** | Runtime POST callbacks | `Authorization: Bearer <CALLBACK_SECRET>` ([`BearerSecret`](internal/auth/jwt.go)). |
 | **Stripe signing** | `POST /internal/webhooks/stripe` | **`Stripe-Signature`** on raw webhook body; verifies HMAC ([`verifyStripePayload`](internal/api/stripe.go)). |
 
 ### Sandbox ownership
 
-After authentication, sandbox access checks [`canAccessSandbox`](internal/api/handlers.go): **credits/API-key** callers must match `sandbox.UserID`; **Lightning/L402** callers must match `sandbox.AgentID`. Mismatches yield **403** `forbidden` on affected routes.
+After authentication, sandbox access checks [`canAccessSandbox`](internal/api/handlers.go): **credits/API-key** callers must match `sandbox.UserID`. Lightning sandboxes are accessed through MCP only; the matching check is the `sandbox_token` (bearer or arg) — see [`Service.principalCanAccess`](internal/mcp/service.go). Mismatches yield **403** `forbidden`.
 
 ---
 
@@ -112,7 +111,13 @@ After authentication, sandbox access checks [`canAccessSandbox`](internal/api/ha
 
 ### `POST /v1/mcp`
 
-**Auth:** API key (`sockt_live_…`) OR L402 OR Supabase JWT (see [`AuthMiddleware`](internal/mcp/auth.go)). Wrapped with rate limiting. Unauthenticated requests return **401** with `WWW-Authenticate: Bearer realm="sockt-mcp"` (plain Bearer; no OAuth metadata so MCP clients use static headers from config).
+**Auth:** One of:
+
+- `Authorization: Bearer sockt_live_…` — API-key principal (credits sandboxes).
+- `Authorization: Bearer sbx_…` — sandbox-token principal (Lightning sandbox the token is bound to).
+- *No* `Authorization` header — anonymous; only `initialize`, `tools/list`, and `tools/call sandbox_create` succeed. Every other tool returns `forbidden` until a `sandbox_token` is supplied (header or `arguments.sandbox_token`).
+
+Single rate limit (`MCP_RPM`, default 120 rpm): keyed on the principal's `BalanceKey` when authenticated, or `ip:<client_ip>` when anonymous.
 
 **Purpose:** Single JSON-RPC 2.0 request per POST — “Streamable HTTP MVP” ([`internal/mcp/handler.go`](internal/mcp/handler.go)). Request body capped by config (`MCPRequestBodyLimit`, default 4 MiB).
 
@@ -142,7 +147,31 @@ After authentication, sandbox access checks [`canAccessSandbox`](internal/api/ha
 
 **Errors:** Always HTTP **200** for parseable JSON-RPC wrappers; RPC errors appear in `.error`. Parse failures use JSON-RPC `-32700` / `-32600` style codes ([`internal/mcp/mcp.go`](internal/mcp/mcp.go)).
 
-**Tool names:** `sandbox_create`, `sandbox_exec`, `sandbox_write_file`, `sandbox_read_file`, `sandbox_list_files`, `sandbox_status`, `sandbox_pause`, `sandbox_resume`, `sandbox_terminate`, `sandbox_extend_balance`, `wallet_balance`, `wallet_deposit`, `wallet_deposit_status` — authoritative JSON Schemas: [`internal/mcp/tools.go`](internal/mcp/tools.go).
+**Tool names:** `sandbox_create`, `sandbox_exec`, `sandbox_write_file`, `sandbox_read_file`, `sandbox_list_files`, `sandbox_status`, `sandbox_pause`, `sandbox_resume`, `sandbox_terminate` — authoritative JSON Schemas: [`internal/mcp/tools.go`](internal/mcp/tools.go).
+
+For Lightning (anonymous) flows, every per-sandbox tool accepts an optional `sandbox_token` argument (`sbx_…`) so a single MCP session can drive multiple sandboxes.
+
+`sandbox_create` with `billing_method=lightning` (or no auth) returns:
+
+```json
+{
+  "status": "awaiting_payment",
+  "sandbox_id": "…",
+  "sandbox_token": "sbx_…",
+  "billing_method": "lightning",
+  "tier": "nano",
+  "invoice": "lnbc…",
+  "payment_hash": "…",
+  "amount_msats": 30000,
+  "amount_sats": 30,
+  "msats_per_second": 1000,
+  "prepaid_seconds": 30,
+  "expires_at": "…",
+  "next_step": "Pay this BOLT11 then call sandbox_status with sandbox_id+sandbox_token."
+}
+```
+
+`sandbox_status` for Lightning sandboxes also surfaces `prepaid_balance_msats`, `seconds_remaining`, `warning_level` (`ok` / `low_balance` / `out_of_balance` / `awaiting_payment`), and a `pending_invoice` block (`bolt11`, `payment_hash`, `amount_msats`, `expires_at`) whenever the runtime has minted a top-up that the LLM still needs to pay.
 
 Notifications (no JSON-RPC `id` / `null` id): **204 No Content**.
 
@@ -232,77 +261,20 @@ Empty or missing name defaults to `"default"`.
 
 ---
 
-### `POST /v1/wallet/offer`
-
-**Auth:** JWT  
-**Purpose:** Ensure a Lightning **`Agent`** row exists for `sub` ([`JWTSub`](internal/store/store.go) / dashboard user linkage). Accepts arbitrary JSON body (decoded but not required for logic).
-
-**Response 200:** [`Agent`](internal/store/store.go) — existing or newly created.  
-**Errors:** `unauthorized` (401), `store_error` (500).
-
----
-
-### `GET /v1/wallet/balance`
-
-**Auth:** JWT  
-**Purpose:** Prepaid Lightning balance and sizing hints ([`composeDepositHintURL`](internal/api/wallet_lightning.go), [`lightningwallet.Hints`](internal/lightningwallet/hints.go)).
-
-**Response 200 (fields include):**
-
-- `agent_id`, `balance_msats`, `warning_level`, `next_action`, `min_deposit_msats`, `suggested_deposit_msats`, `deposit_url`, `billing_hint_msats_sec`.
-
-**Errors:** `unauthorized` (401), `not_found` (404 if agent not registered), `store_error` (500).
-
----
-
-### `POST /v1/wallet/deposit`
-
-**Auth:** JWT  
-**Purpose:** Mint a BOLT11 invoice to top up prepaid Lightning balance.
-
-**Request body:**
-
-```json
-{
-  "amount_sats": 0,
-  "idempotency_key": "optional-stable-string"
-}
-```
-
-**Response 200:** `bolt11`, `payment_hash` (hex), `amount_msats`, `expires_at` (RFC3339), `min_amount_msats`.
-
-**Errors:** `unauthorized` (401), `payment_disabled` (503 if LND missing), `not_found` (404 if no agent), `invoice_failed` (502), `invoice_bad_hash` (502).
-
----
-
-### `GET /v1/wallet/deposits/{payment_hash}`
-
-**Auth:** JWT  
-**Purpose:** Poll deposit invoice status (`payment_hash` path segment: **64 hex chars**, 32 bytes).
-
-**Response 200:** `status`, `amount_msats`, `settled_at` (RFC3339 or null), `bolt11` (optional).  
-**Errors:** `unauthorized` (401), `not_found`, `bad_request` (bad hash), `store_error`.
-
----
-
 ### `POST /v1/sandbox/create`
 
-**Auth:** API key **or** L402 ( [`eitherAPIKeyOrL402`](internal/api/router.go)).
+**Auth:** API key (credits only). For Lightning sandboxes, use `tools/call sandbox_create` over MCP instead — REST does **not** mint Lightning sandboxes.
 
 **Request body:**
 
 ```json
 {
-  "billing_method": "lightning | credits",
+  "billing_method": "credits",
   "tier": "nano | micro | standard | gpu_small | gpu_large"
 }
 ```
 
-**Rules:**
-
-- **`credits`:** Caller must authenticate as API key principal; binds `UserID` / `APIKeyID`.
-- **`lightning`:** Caller must authenticate via L402; binds `AgentID`.
-- Validates tier pricing and RunPod tier mapping (`RUNPOD_TEMPLATE_*` env IDs); allocates credits server-side when applicable.
+`billing_method` is optional and defaults to `credits`; sending `lightning` over REST returns `bad_request`. Validates tier pricing and RunPod tier mapping (`RUNPOD_TEMPLATE_*` env IDs) and allocates credits server-side.
 
 **Response 200:** Full [`Sandbox`](internal/store/store.go) row after orchestrator provisioning (reloaded). Stored `Template` reflects the canonical label (`sockt-cpu`, `sockt-gpu-small`, `sockt-gpu-large`), not client input.
 
@@ -312,7 +284,7 @@ Empty or missing name defaults to `"default"`.
 
 ### `GET /v1/sandbox/{id}`
 
-**Auth:** API key or L402.  
+**Auth:** API key.  
 **Path:** `{id}` = sandbox UUID.
 
 **Response 200:** [`Sandbox`](internal/store/store.go).  
@@ -322,7 +294,7 @@ Empty or missing name defaults to `"default"`.
 
 ### `POST /v1/sandbox/{id}/pause`
 
-**Auth:** API key or L402.  
+**Auth:** API key.  
 **Purpose:** Pause RunPod workload.
 
 **Response:** **204 No Content**.
@@ -333,7 +305,7 @@ Empty or missing name defaults to `"default"`.
 
 ### `POST /v1/sandbox/{id}/resume`
 
-**Auth:** API key or L402.
+**Auth:** API key.
 
 **Response:** **204 No Content**.
 
@@ -343,7 +315,7 @@ Empty or missing name defaults to `"default"`.
 
 ### `DELETE /v1/sandbox/{id}`
 
-**Auth:** API key or L402.  
+**Auth:** API key.  
 **Purpose:** Terminate sandbox / pod.
 
 **Response:** **204 No Content**.
@@ -354,7 +326,7 @@ Empty or missing name defaults to `"default"`.
 
 ### `POST /v1/sandbox/{id}/refresh-data-jwt`
 
-**Auth:** API key or L402.  
+**Auth:** API key.  
 **Purpose:** Mint fresh **data-plane** JWT.
 
 **Response 200:**
@@ -372,7 +344,7 @@ Empty or missing name defaults to `"default"`.
 
 ### `POST /v1/sandbox/{id}/extend-balance`
 
-**Auth:** API key or L402.
+**Auth:** API key (credits only).
 
 **Request body:**
 
@@ -380,23 +352,22 @@ Empty or missing name defaults to `"default"`.
 { "cents": 0 }
 ```
 
-**Credits sandboxes (`billing_method == "credits"`):**  
 `cents` is **USD cents** to allocate upward; if omitted/`<= 0`, defaults from server config (`LowCreditThresholdCents * 10`).
 
 ```json
 { "allocated_cents": 0, "balance_after_cents": 0 }
 ```
 
-**Lightning sandboxes:** The same JSON field **`cents` is overloaded** — the handler reads it into a variable treated as **`sats`** (satoshis) for invoice sizing (`<= 0` defaults to **50_000** sats). Response includes invoice fields (`bolt11`, `payment_hash`, …) and `warning_level`.
+For Lightning sandboxes: top up by paying the BOLT11 surfaced in `sandbox_status.pending_invoice` (or in any tool result that includes a billing block). The runtime/control plane mints the next invoice automatically when the sandbox has roughly `SANDBOX_TOPUP_TRIGGER_SECS` of compute remaining.
 
-**Errors:** `forbidden`, `unauthorized`, `insufficient_credits` (402), invoice / payment classification errors (`bad_gateway`-class), etc.
+**Errors:** `forbidden`, `unauthorized`, `insufficient_credits` (402), `bad_request` (non-credits sandbox).
 
 ---
 
 ### `GET /v1/sandbox/{id}/billing`
 
-**Auth:** API key or L402.  
-**Purpose:** Billing interval history for Lightning agents (sandbox must have `AgentID`).
+**Auth:** API key.  
+**Purpose:** Reserved for future credits billing history.
 
 **Response 200:**
 
@@ -404,7 +375,7 @@ Empty or missing name defaults to `"default"`.
 { "intervals": [] }
 ```
 
-If `sandbox.AgentID` nil: **`intervals` is empty**. Otherwise up to **100** rows from [`ListBillingIntervalsByAgent`](internal/store/billing.go) (each [`BillingInterval`](internal/store/store.go): `SandboxID`, `AgentID`, `Start`, `End`, `Msats` — time fields as JSON-marshaled from interfaces).
+Currently returns an empty list. Per-second billing for Lightning sandboxes lives entirely in `sandbox.prepaid_balance_msats` / `sandbox.consumed_msats` (no row-per-second history).
 
 ---
 
@@ -461,7 +432,13 @@ Interval layout matches [`runtime.AuditInterval`](internal/runtime/callbacks.go)
 }
 ```
 
-**Semantics:** Matches [`triggerPayload`](internal/api/runtime_handlers.go). Responses are often **HTTP 200** with JSON payloads that include `balance_delta`, `error_class`, and Lightning `deposit / bolt11 / payment_hash…` wrappers — **`error_class`** discriminates flows (`deposit_required`, `insufficient_credits`, `deposit_mint_failed`, etc.; see handler).
+**Semantics (HTTP 200):** Matches [`triggerPayload`](internal/api/runtime_handlers.go). Lightning sandbox-scoped flow (`sandbox.sandbox_token` is non-null):
+
+1. Persisted balance is ahead of the runtime's snapshot (i.e. a deposit just settled) ⇒ `{ "balance_delta": …, "new_balance": … }`. The runtime calls `ApplyBalanceDelta` / `ApplyNewBalance` and continues.
+2. A pending invoice is still fresh ⇒ `{ "error_class": "deposit_required", "deposit": { "bolt11", "payment_hash", "amount_msats", "expires_at" } }`. The runtime broadcasts `deposit_required` over the shell WSS and backs off polling for ~5s.
+3. Otherwise ⇒ mint a new BOLT11 (sized for `SANDBOX_PREPAY_SECS * msats_per_second`), persist `pending_invoice_*` on the sandbox row, return the same `deposit_required` envelope.
+
+Credits flow returns `{ "balance_delta": cents, "new_balance": after }` or `{ "error_class": "insufficient_credits" }`.
 
 ---
 
@@ -496,25 +473,21 @@ Writes an audit row on success.
 | GET | `/v1/pricing` | Public |
 | GET | `/v1/mcp/health` | Public |
 | GET | `/v1/mcp` | Public (SSE advertises POST URL only) |
-| POST | `/v1/mcp` | API key / L402 / JWT |
+| POST | `/v1/mcp` | API key / sandbox token / anonymous |
 | GET | `/v1/user/profile` | JWT |
 | GET | `/v1/user/credits` | JWT |
 | GET | `/v1/user/credits/history` | JWT |
 | POST | `/v1/user/api-keys` | JWT |
 | GET | `/v1/user/api-keys` | JWT |
 | DELETE | `/v1/user/api-keys/{id}` | JWT |
-| POST | `/v1/wallet/offer` | JWT |
-| GET | `/v1/wallet/balance` | JWT |
-| POST | `/v1/wallet/deposit` | JWT |
-| GET | `/v1/wallet/deposits/{payment_hash}` | JWT |
-| POST | `/v1/sandbox/create` | API key or L402 |
-| GET | `/v1/sandbox/{id}` | API key or L402 |
-| POST | `/v1/sandbox/{id}/pause` | API key or L402 |
-| POST | `/v1/sandbox/{id}/resume` | API key or L402 |
-| DELETE | `/v1/sandbox/{id}` | API key or L402 |
-| POST | `/v1/sandbox/{id}/refresh-data-jwt` | API key or L402 |
-| POST | `/v1/sandbox/{id}/extend-balance` | API key or L402 |
-| GET | `/v1/sandbox/{id}/billing` | API key or L402 |
+| POST | `/v1/sandbox/create` | API key |
+| GET | `/v1/sandbox/{id}` | API key |
+| POST | `/v1/sandbox/{id}/pause` | API key |
+| POST | `/v1/sandbox/{id}/resume` | API key |
+| DELETE | `/v1/sandbox/{id}` | API key |
+| POST | `/v1/sandbox/{id}/refresh-data-jwt` | API key |
+| POST | `/v1/sandbox/{id}/extend-balance` | API key |
+| GET | `/v1/sandbox/{id}/billing` | API key |
 | POST | `/v1/runtime/billing/audit-batch` | Bearer callback secret |
 | POST | `/v1/runtime/topup-trigger` | Bearer callback secret |
 | POST | `/v1/runtime/pause-trigger` | Bearer callback secret |

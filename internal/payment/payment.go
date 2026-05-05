@@ -18,12 +18,12 @@ import (
 
 const defaultPayWait = 25 * time.Second
 
-// Payment is the façade consumed by billing, L402, and wallet HTTP handlers.
+// Payment is the façade consumed by billing and wallet HTTP handlers.
 type Payment interface {
 	PayInvoice(ctx context.Context, invoice string, idempotencyKey string) (preimageHex string, err error)
 	CreateBOLT11Invoice(ctx context.Context, amountSats int64, memo string, expirySeconds int64) (*Bolt11Invoice, error)
 	RequestDepositInvoice(ctx context.Context, agentID uuid.UUID, amountSats int64, expirySeconds int64, memo string, idempotencyKey string) (*DepositMintResult, error)
-	MintL402Invoice(ctx context.Context) (*Bolt11Invoice, []byte, error)
+	RequestSandboxDepositInvoice(ctx context.Context, sandboxID uuid.UUID, amountSats int64, expirySeconds int64, memo string, idempotencyKey string) (*DepositMintResult, error)
 	GetNodeBalance(ctx context.Context) (BalanceInfo, error)
 	GetNodeHealth(ctx context.Context) (NodeHealth, error)
 }
@@ -31,21 +31,19 @@ type Payment interface {
 // Service implements Payment.
 type Service struct {
 	LNBOT             *lnbot.Client
-	Pool              *InvoicePool
 	IDem              *IdempotencyCache
 	PendingDeps       PendingDepositRecorder
 	Chain             *chaincfg.Params
 	PaymentSendExpiry time.Duration
 }
 
-// NewService constructs a Service with optional pool (L402) and pending-deposit persistence.
-func NewService(nb *lnbot.Client, pool *InvoicePool, idem *IdempotencyCache, pending PendingDepositRecorder) *Service {
+// NewService constructs a Service with optional pending-deposit persistence.
+func NewService(nb *lnbot.Client, idem *IdempotencyCache, pending PendingDepositRecorder) *Service {
 	if idem == nil {
 		idem = NewIdempotencyCache()
 	}
 	return &Service{
 		LNBOT:       nb,
-		Pool:        pool,
 		IDem:        idem,
 		PendingDeps: pending,
 	}
@@ -214,30 +212,6 @@ func (s *Service) CreateBOLT11Invoice(ctx context.Context, amountSats int64, mem
 		PaymentRequest: bolt11,
 		RHash:          ph,
 	}, nil
-}
-
-// MintL402Invoice pops a warm invoice from the pool or mints synchronously via LNBOT.
-func (s *Service) MintL402Invoice(ctx context.Context) (*Bolt11Invoice, []byte, error) {
-	if s.LNBOT == nil {
-		return nil, nil, classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
-	}
-	if s.Pool != nil {
-		if ent, ok := s.Pool.Pop(ctx); ok && ent != nil {
-			return &Bolt11Invoice{
-				PaymentRequest: ent.BOLT11,
-				RHash:          ent.PaymentHash,
-			}, ent.Preimage, nil
-		}
-	}
-	bolt11, err := s.LNBOT.CreateInvoice(ctx, 1, l402PoolMemo, "")
-	if err != nil {
-		return nil, nil, s.classifyBackend(err)
-	}
-	ph, err := DecodeBolt11(bolt11, s.chainParams())
-	if err != nil {
-		return nil, nil, classifyErr(ClassOfferInvalid, err)
-	}
-	return &Bolt11Invoice{PaymentRequest: bolt11, RHash: ph}, nil, nil
 }
 
 func (s *Service) GetNodeBalance(ctx context.Context) (BalanceInfo, error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -20,14 +21,22 @@ func TestHealthPayload(t *testing.T) {
 	}
 }
 
+const sandboxToolCount = 9
+
 func TestToolListCount(t *testing.T) {
-	if n := len(toolList()); n != 13 {
-		t.Fatalf("expected 13 tools, got %d", n)
+	cfg := &config.Control{Port: "8080"}
+	if n := len(toolList(NewService(cfg, nil, nil, nil, nil), nil)); n != sandboxToolCount {
+		t.Fatalf("expected %d tools, got %d", sandboxToolCount, n)
 	}
 }
 
 func TestHandlerInitializeAndToolsList(t *testing.T) {
-	cfg := &config.Control{Port: "8080", MCPRequestBodyLimit: 1 << 20}
+	cfg := &config.Control{
+		Port:                  "8080",
+		MCPRequestBodyLimit:   1 << 20,
+		ControlPlanePublicURL: "https://cp.example",
+		SandboxPrepaySecs:     30,
+	}
 	svc := NewService(cfg, nil, nil, nil, nil)
 	h := Handler(svc)
 	srv := httptest.NewServer(h)
@@ -53,6 +62,24 @@ func TestHandlerInitializeAndToolsList(t *testing.T) {
 	if m["protocolVersion"] != protocolVersion2025 {
 		t.Fatal(m)
 	}
+	inst, _ := m["instructions"].(string)
+	if !strings.Contains(inst, "/home/sandbox") {
+		t.Fatalf("initialize instructions missing default SANDBOX_ROOT: %q", inst)
+	}
+	if !strings.Contains(inst, "result.sockt") {
+		t.Fatalf("initialize instructions should point at result.sockt: %q", inst)
+	}
+	sockt, _ := m["sockt"].(map[string]any)
+	if sockt["auth_state"] != "unauthenticated" {
+		t.Fatalf("sockt.auth_state: %#v", sockt["auth_state"])
+	}
+	if sockt["control_plane_public_url"] != "https://cp.example" {
+		t.Fatalf("sockt.control_plane_public_url: %#v", sockt["control_plane_public_url"])
+	}
+	steps, _ := sockt["onboarding_steps"].([]any)
+	if len(steps) < 3 {
+		t.Fatalf("onboarding_steps: %#v", steps)
+	}
 
 	body2 := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	res2, err := http.Post(srv.URL, "application/json", bytes.NewReader(body2))
@@ -69,7 +96,7 @@ func TestHandlerInitializeAndToolsList(t *testing.T) {
 	}
 	rm, _ := env2.Result.(map[string]any)
 	tools, _ := rm["tools"].([]any)
-	if len(tools) != 13 {
+	if len(tools) != sandboxToolCount {
 		t.Fatalf("tools/list: got %d tools", len(tools))
 	}
 }
@@ -131,7 +158,7 @@ func TestHandlerUnknownTool(t *testing.T) {
 	svc := NewService(cfg, nil, nil, nil, nil)
 	h := Handler(svc)
 	id := uuid.New()
-	p := &auth.Principal{Kind: auth.KindL402, AgentID: &id, BalanceKey: "test"}
+	p := &auth.Principal{Kind: auth.KindSandbox, SandboxID: &id, BalanceKey: "test"}
 	body := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"not_a_real_tool","arguments":{}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/mcp", bytes.NewReader(body))
 	req = req.WithContext(auth.WithPrincipal(req.Context(), p))

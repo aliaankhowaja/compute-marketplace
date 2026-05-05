@@ -13,7 +13,7 @@ import (
 func TestHealthzThroughRouter(t *testing.T) {
 	cfg := &config.Control{Port: "8080", SupabaseDBTxDSN: "postgres://x"}
 	st := &store.Store{}
-	h := NewRouter(RouterDeps{Cfg: cfg, Store: st}, nil, []byte("01234567890123456789012345678901"))
+	h := NewRouter(RouterDeps{Cfg: cfg, Store: st})
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	for _, path := range []string{"/healthz", "/health"} {

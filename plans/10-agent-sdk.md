@@ -3,19 +3,22 @@
 ## v2 changelog
 
 - The SDK now reads `data_endpoint` and `data_jwt` from the `sandbox_create` response and uses them for **every** data-plane call (`exec`, `read_file`, `write_file`, `list_files`, `shell`). Control-plane calls (`pause`, `resume`, `terminate`, `status` summary, billing history) continue to use the main API URL.
-- The SDK transparently refreshes `data_jwt` (and the underlying `data_endpoint`, in case the sandbox migrated to a new host) by calling `POST /v1/sandbox/{id}/refresh-data-jwt` when the JWT has < 10 min remaining or when a 401 `data_jwt_expired` is returned.
-- The L402 retry loop is replaced with **one-shot top-up handling**: the SDK pays one initial L402 challenge at registration time and then never sees a 402 again. All subsequent funding flows through the platform's prepaid balance + threshold top-up; the SDK observes `low_balance` events on the WSS but does not perform L402 payments per call.
-- Streamable HTTP MCP transport replaces SSE in the npm `@sockt/mcp-server` package (lockstep with Component 7).
-- Per-sandbox WebSocket shell connects directly to the host-agent URL (`wss://api.sockt.dev/h/{host_id}/sandbox/{id}/shell?token={data_jwt}`).
+- The SDK transparently refreshes `data_jwt` by calling `POST /v1/sandbox/{id}/refresh-data-jwt` when the JWT has < 10 min remaining or when a 401 `data_jwt_expired` is returned.
+- L402 / macaroon / BOLT12 / Lexe code is removed. Auth is now strictly:
+  1. `SOCKT_API_KEY=sockt_live_…` (credits, fiat users).
+  2. Sandbox-scoped bearer `sbx_…` issued by `tools/call sandbox_create` (Lightning, autonomous LLMs). The MCP proxy auto-captures it; typed clients accept it via `sandbox_token` / `SOCKT_SANDBOX_TOKEN`.
+  3. Supabase JWT for `/v1/user/*` only.
+- Streamable HTTP MCP transport in `@sockt/mcp-server`.
+- Per-sandbox WebSocket shell connects to the host-agent URL using the sandbox's `data_jwt`.
 - New SDK error class `HostUnreachableError` for transient host-data-plane failures (typically resolved by `data_jwt` refresh, which the SDK does automatically with one retry before raising).
 
 ---
 
 ## Overview
 
-The Agent SDK is a set of client libraries that abstract the Sockt API, the L402 onboarding flow, BOLT12 wallet integration, and host-data-plane discovery into a simple interface consumable by AI agents. Two packages are maintained: a **Python SDK** for agents built with Python frameworks (LangChain, LlamaIndex, custom), and a **TypeScript/JavaScript SDK** for Node.js-based agents.
+The Agent SDK is a set of client libraries that abstract the Sockt API and host-data-plane discovery into a simple interface consumable by AI agents. Two packages are maintained: a **Python SDK** for Python frameworks (LangChain, LlamaIndex, custom), and a **TypeScript/JavaScript SDK** for Node.js agents. A third package — `@sockt/mcp-server` — is a stdio↔Streamable-HTTP MCP proxy used as a Cursor / Claude / Gemini connector.
 
-The SDK's core value proposition: the agent developer does not need to understand L402, BOLT12, macaroons, top-ups, host topology, or cluster sharding — they import the SDK, provide a Lexe seed (or API key), and call `create_sandbox()`. The SDK handles the rest.
+The SDK's core value proposition: the agent developer does not need to understand sandbox tokens, host topology, or cluster sharding — they import the SDK, provide an API key (or let the LLM go through anonymous Lightning over MCP), and call `create_sandbox()`. The SDK handles the rest.
 
 ---
 
@@ -31,36 +34,24 @@ pip install sockt
 
 #### ComputeClient
 
-The main entry point. Handles L402 onboarding, JWT management, control-plane API calls.
+The main entry point. Manages auth headers, REST calls, and data-plane JWT lifecycle.
 
 **Constructor parameters:**
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `api_url` | str | Yes | Sockt API base URL (e.g. `https://api.sockt.dev`) |
-| `bolt12_offer` | str | No | Pre-registered BOLT12 offer string. Skips registration when present. |
-| `lexe_seed_path` | str | No | Path to Lexe seed file. Required if `bolt12_offer` is not pre-registered. |
-| `lexe_env` | str | No | `mainnet` or `testnet` (default: mainnet) |
-| `lightning_address` | str | No | Alternative for BOLT11 manual top-up mode |
-| `api_key` | str | No | Alternative auth: API key for credit billing |
-| `jwt` | str | No | Pre-existing agent JWT |
-| `jwt_cache_path` | str | No | File path to persist the agent JWT across process restarts |
-| `timeout_secs` | int | No | Default HTTP request timeout (default: 30) |
+| `api_key` | str | No | API key for credit billing (`sockt_live_…`). Falls back to `SOCKT_API_KEY`. |
+| `supabase_jwt` | str | No | Supabase user JWT for `/v1/user/*` only. Falls back to `SOCKT_SUPABASE_JWT` / `SOCKT_USER_JWT`. |
+| `sandbox_token` | str | No | Sandbox-scoped bearer (`sbx_…`) for Lightning sandboxes. Falls back to `SOCKT_SANDBOX_TOKEN`. |
+| `timeout_secs` | float | No | Default HTTP request timeout (default: 120) |
 | `data_jwt_refresh_threshold_secs` | int | No | Refresh `data_jwt` when remaining < this (default: 600) |
-| `log_level` | str | No | `debug`, `info`, `warn`, `error` (default: info) |
 
 **Methods:**
 
-**`register() → AgentInfo`**
-- Validates or registers the agent's BOLT12 offer with the platform
-- Handles the **one-time** L402 challenge: detect 402, pay invoice via Lexe, retry
-- Returns `AgentInfo(agent_id, jwt, jwt_expires_at, balance_msats)`
-- Idempotent
-
-**`create_sandbox(tier, template=None, duration_secs=None, egress=False, label=None, idempotency_key=None) → Sandbox`**
-- Provisions a sandbox; returns a `Sandbox` object that already knows its `data_endpoint` and `data_jwt`
-- Triggers initial top-up automatically
-- Generates `idempotency_key` if not provided
+**`create_sandbox(billing_method, tier, **kwargs) → Sandbox`**
+- REST `POST /v1/sandbox/create` (credits-only). For Lightning sandboxes, use the MCP `sandbox_create` tool — REST does not mint Lightning sandboxes.
+- Returns a `Sandbox` with `data_endpoint` and a freshly minted `data_jwt`.
 
 **`get_sandbox(sandbox_id) → Sandbox`**
 - Fetches the sandbox row (including current `host_id`); mints a fresh `data_jwt` server-side via `/v1/sandbox/{id}/refresh-data-jwt`
@@ -106,7 +97,7 @@ Returned by `create_sandbox()` and `get_sandbox()`. Wraps the control-plane sand
 
 **Methods:**
 
-**`exec(command, timeout_ms=30000, env=None, working_dir='/workspace') → ExecResult`**
+**`exec(command, timeout_ms=30000, env=None, working_dir='.') → ExecResult`**
 - HTTP POST to `data_endpoint + "/exec"` with `Authorization: Bearer {data_jwt}`
 - On 401 `data_jwt_expired`: refresh `data_jwt` once and retry
 - On 503 `host_unreachable`: refresh (host may have moved) and retry once before raising `HostUnreachableError`
@@ -117,7 +108,7 @@ Returned by `create_sandbox()` and `get_sandbox()`. Wraps the control-plane sand
 **`read_file(path, encoding='utf8', max_bytes=10_485_760) → ReadResult`**
 - HTTP GET to `data_endpoint + "/files"` with `?path=...`
 
-**`list_files(path='/workspace', recursive=False, max_depth=3) → List[FileEntry]`**
+**`list_files(path='.', recursive=False, max_depth=3) → List[FileEntry]`**
 - HTTP GET to `data_endpoint + "/files/list"`
 
 **`status() → SandboxStatus`**
@@ -133,12 +124,9 @@ Returned by `create_sandbox()` and `get_sandbox()`. Wraps the control-plane sand
 **`terminate() → TerminateResult`**
 - HTTP DELETE on control plane: `DELETE {api_url}/v1/sandbox/{id}`
 
-**`extend_balance(sats, idempotency_key=None) → ExtendBalanceResult`**
+**`extend_balance(cents=None) → ExtendBalanceResult`**
 - HTTP POST to control plane: `POST {api_url}/v1/sandbox/{id}/extend-balance`
-- Pre-funds the sandbox with `sats` worth of additional balance via a synchronous BOLT12 top-up (Lightning) or credit allocation (credits). Useful before a known-large workload.
-
-**`delegate(readonly=False, expiry_secs=3600, max_exec_calls=None) → str`**
-- Returns an attenuated macaroon for sub-agent delegation (control-plane call)
+- Credits-only. For Lightning sandboxes, the LLM tops up by paying the BOLT11 surfaced in `sandbox_status.pending_invoice` over MCP — there is no REST equivalent.
 
 **`shell() → ShellSession`**
 - Opens an interactive WebSocket shell session (returns a context manager)
@@ -195,7 +183,7 @@ Each tool has a detailed description written for LLM consumption. The toolkit ha
 
 | Class | When raised |
 |---|---|
-| `AuthenticationError` | L402 onboarding failed; Lexe wallet unreachable; JWT invalid |
+| `AuthenticationError` | API key / sandbox token / JWT invalid or missing |
 | `SandboxNotFoundError` | Sandbox ID not found or belongs to another principal |
 | `SandboxNotRunningError` | Sandbox is paused or terminated |
 | `InsufficientBalanceError` | Initial top-up failed (Lightning routing failure) or credits exhausted |
@@ -209,27 +197,21 @@ Each tool has a detailed description written for LLM consumption. The toolkit ha
 
 ---
 
-### One-Shot L402 Onboarding in the SDK
+### Auth handling
 
-The SDK handles L402 once at registration time, then never again:
+The SDK supports three authentication paths:
 
-1. On `register()`, the SDK calls `POST /v1/wallet/offer`
-2. If the response is 402: extract the BOLT11 invoice from `WWW-Authenticate`, pay via the Lexe SDK, retry with `Authorization: L402 <macaroon>:<preimage>`
-3. The 200 response carries the agent JWT, which the SDK caches
-4. For all subsequent API calls, the SDK uses `Authorization: Bearer <jwt>` — no further L402 challenges
-5. When balance falls below threshold the **platform** triggers BOLT12 pull-pay top-ups against the agent's offer; the SDK is informed via WSS `topup` / `topup_failed` frames but does not initiate Lightning calls itself
+1. **API key (credits, recommended for fiat users):** `SOCKT_API_KEY=sockt_live_…` — sent as `Authorization: Bearer …` on every REST and MCP call. New sandboxes default to `billing_method=credits`.
+2. **Sandbox token (Lightning, autonomous LLMs):** `Authorization: Bearer sbx_…` produced by `tools/call sandbox_create`. The MCP proxy (`@sockt/mcp-server`) auto-captures it from the JSON-RPC result and reuses it on subsequent requests; the typed clients (`python-sockt`, `@sockt/client`) accept it via the `sandbox_token` constructor option or `SOCKT_SANDBOX_TOKEN`.
+3. **Supabase JWT:** only required for `/v1/user/*` endpoints (profile, credits ledger, API key management). Not used for sandbox operations.
 
-This eliminates the per-call L402 retry loop from v1.
+The SDKs no longer ship Lexe / BOLT12 / macaroon code paths — paying a Lightning invoice is the responsibility of whatever wallet the LLM already has (e.g. the `lnbot` MCP). The SDK's only job is to surface the BOLT11 it sees on `sandbox_create` / `pending_invoice` and to keep using the `sandbox_token` until the sandbox is paused or terminated.
 
 ---
 
 ### Automatic JWT Refresh
 
-The SDK monitors JWT expiry and refreshes:
-- Agent JWT expires in < 1 hour: call `register()` to obtain a fresh one (Lexe re-pays the 1-sat L402 challenge if needed)
-- `data_jwt` expires in < 10 minutes (configurable): silently call `refresh_data_jwt()` against the control plane
-
-If refresh fails: raise `AuthenticationError` with a clear message.
+`data_jwt` expires in < 10 minutes (configurable): the SDK silently calls `refresh_data_jwt()` against the control plane and updates the `Sandbox` object in place. If refresh fails the SDK raises `AuthenticationError`.
 
 ---
 
@@ -259,29 +241,19 @@ The TypeScript SDK mirrors the Python SDK with idiomatic TypeScript patterns (as
 ```typescript
 interface ComputeClientOptions {
   apiUrl: string;
-  bolt12Offer?: string;
-  lexeSeedPath?: string;
-  lexeEnv?: 'mainnet' | 'testnet';
-  lightningAddress?: string;
   apiKey?: string;
-  jwt?: string;
-  jwtCachePath?: string;
+  supabaseJwt?: string;
+  sandboxToken?: string;
   timeoutMs?: number;
   dataJwtRefreshThresholdSecs?: number;  // default 600
-  logLevel?: 'debug' | 'info' | 'warn' | 'error';
 }
 ```
 
 **Methods:**
 
-- `register(): Promise<AgentInfo>`
-- `createSandbox(options: CreateSandboxOptions): Promise<Sandbox>`
+- `createSandbox(options: { billingMethod: 'credits'; tier: string }): Promise<Sandbox>` — REST, credits-only.
 - `getSandbox(sandboxId: string): Promise<Sandbox>`
-- `listSandboxes(filter?: StatusFilter): Promise<Sandbox[]>`
-- `getPricing(): Promise<PricingInfo>`
-- `getBalance(): Promise<BalanceInfo>`
-- `getBillingHistory(options?: BillingHistoryOptions): Promise<BillingHistory>`
-- `getTopupHistory(options?: TopupHistoryOptions): Promise<TopupHistory>`
+- `getPricing(): Promise<unknown[]>`
 
 #### Sandbox
 
@@ -309,12 +281,11 @@ class Sandbox {
   writeFile(path: string, content: string, options?: WriteOptions): Promise<WriteResult>;
   readFile(path: string, options?: ReadOptions): Promise<ReadResult>;
   listFiles(path?: string, options?: ListOptions): Promise<FileEntry[]>;
-  status(): Promise<SandboxStatus>;
-  pause(): Promise<PauseResult>;
-  resume(): Promise<ResumeResult>;
-  terminate(): Promise<TerminateResult>;
-  extendBalance(sats: number, idempotencyKey?: string): Promise<ExtendBalanceResult>;
-  delegate(options?: DelegateOptions): Promise<string>;
+  runtimeStatus(): Promise<Record<string, unknown>>;
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  terminate(): Promise<void>;
+  extendBalance(opts?: { cents?: number }): Promise<Record<string, unknown>>;
   shell(): ShellSession;
   waitUntilRunning(options?: WaitOptions): Promise<void>;
   refreshDataJwt(): Promise<void>;
@@ -365,17 +336,16 @@ npx @sockt/mcp-server
 | Variable | Description |
 |---|---|
 | `SOCKT_API_URL` | API base URL |
-| `SOCKT_API_KEY` | API key for credit billing (or...) |
-| `AGENT_JWT` | Pre-existing agent JWT for L402 path |
-| `BOLT12_OFFER` | Agent's BOLT12 offer (for auto-registration) |
-| `LEXE_SEED_PATH` | Path to Lexe seed file (one-time L402 onboarding only) |
+| `SOCKT_API_KEY` | Optional API key for credits sandboxes (`sockt_live_…`) |
+| `SOCKT_SANDBOX_TOKEN` | Optional pre-set sandbox bearer (`sbx_…`) — usually captured automatically |
+| `SOCKT_MCP_PATH` | Override `/v1/mcp` if the control plane is mounted elsewhere |
 | `LOG_LEVEL` | debug, info, warn, error |
 
-**Tools exposed:** Identical to the MCP server tools defined in Component 7 (`sandbox_create`, `sandbox_exec`, `sandbox_write_file`, `sandbox_read_file`, `sandbox_list_files`, `sandbox_status`, `sandbox_pause`, `sandbox_resume`, `sandbox_terminate`, `sandbox_extend_balance`, `wallet_balance`, `sandbox_delegate`).
+**Tools exposed:** Identical to the MCP server tools defined in Component 7 (`sandbox_create`, `sandbox_exec`, `sandbox_write_file`, `sandbox_read_file`, `sandbox_list_files`, `sandbox_status`, `sandbox_pause`, `sandbox_resume`, `sandbox_terminate`).
 
 **Transport:** MCP Streamable HTTP to the platform; stdio to the local MCP client.
 
-**Auth handling:** The proxy uses the TypeScript SDK internally. On startup, if `AGENT_JWT` is set, that's used directly. If `BOLT12_OFFER` and `LEXE_SEED_PATH` are set, the SDK performs the one-time L402 onboarding to obtain a JWT and caches it. If `SOCKT_API_KEY` is set, the proxy uses Bearer auth and skips L402 entirely.
+**Auth handling:** If `SOCKT_API_KEY` is set, the proxy sends `Authorization: Bearer sockt_live_…` on every request. Otherwise it goes anonymous: `initialize` and `tools/list` work; `tools/call sandbox_create` returns an `awaiting_payment` result with `sandbox_token=sbx_…`, which the proxy captures from `result.structuredContent.sandbox_token` and reuses on every subsequent request as `Authorization: Bearer sbx_…`. The proxy also surfaces top-up `pending_invoice` blocks to stderr so a human watching the logs can see what to pay.
 
 ---
 
@@ -385,7 +355,7 @@ npx @sockt/mcp-server
 
 Both SDKs support a test mode that points to a Sockt testnet deployment:
 - `api_url = "https://test.sockt.dev"`
-- `lexe_env = "testnet"`
+- `LIGHTNING_NETWORK=testnet` on the control plane
 - Testnet sats; testnet sandboxes have lower resource limits but identical API
 
 ### Integration Test Suite
@@ -405,15 +375,14 @@ The SDK repository includes integration tests against the testnet:
 ## Documentation
 
 The SDK includes:
-- **Quickstart guide** — 5-minute tutorial: register, create sandbox, run code, terminate
-- **Authentication guide** — BOLT12 offer setup with Lexe; Lightning address fallback; API key path
-- **Tier selection guide** — Which tier for which workload, cost estimates
-- **Billing guide** — Prepaid balance + auto top-up explained; how to interpret `low_balance` and `topup_failed` events
-- **Host topology guide** — What `data_endpoint` means; when the SDK refreshes it
-- **LangChain integration guide** — Setting up the toolkit
-- **Claude MCP guide** — `claude_desktop_config.json` setup
-- **Sub-agent delegation guide** — Macaroon attenuation
-- **API reference** — Auto-generated from docstrings and TypeScript types
+- **Quickstart guide** — 5-minute tutorial: pick API key (credits) or anonymous Lightning, create sandbox, run code, terminate.
+- **Authentication guide** — API key vs sandbox token vs Supabase JWT.
+- **Tier selection guide** — Which tier for which workload, cost estimates.
+- **Billing guide** — Sandbox-scoped prepaid balance + threshold top-up; how to interpret `low_balance`, `out_of_balance`, and `pending_invoice`.
+- **Host topology guide** — What `data_endpoint` means; when the SDK refreshes it.
+- **LangChain integration guide** — Setting up the toolkit.
+- **Claude / Cursor MCP guide** — `claude_desktop_config.json` / `mcp.json` setup.
+- **API reference** — Auto-generated from docstrings and TypeScript types.
 
 ---
 
@@ -436,8 +405,7 @@ The SDK includes:
 
 ## Dependencies
 
-- **Control-plane API** (Component 2) — auth, sandbox lifecycle, billing history, `data_jwt` minting
+- **Control-plane API** (Component 2) — auth, sandbox lifecycle, `data_jwt` minting
 - **Host-agent HTTPS data plane** (Components 4, 8) — exec, files, list, status, shell — reached via `data_endpoint`
-- **MCP Server** (Component 7) — `@sockt/mcp-server` proxies stdio MCP to the Streamable HTTP transport
-- **Lexe SDK** — Python `lexe` PyPI package; TypeScript `@lexe/client` npm package (used for one-shot L402 onboarding only)
-- **Supabase Auth** — JWT issuance for website-user API-key flows; SDK accepts an existing JWT and includes it in headers
+- **MCP Server** (Component 7) — `@sockt/mcp-server` proxies stdio MCP to the Streamable HTTP transport and auto-captures the sandbox bearer
+- **Supabase Auth** — JWT issuance for `/v1/user/*` (profile, credits, API keys); the SDK accepts an existing JWT and includes it in headers

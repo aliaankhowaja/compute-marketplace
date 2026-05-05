@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 	"github.com/aliaankhowaja/sockt-backend/internal/config"
-	"github.com/aliaankhowaja/sockt-backend/internal/lightningwallet"
 	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/payment"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
@@ -39,8 +39,16 @@ func NewService(cfg *config.Control, st *store.Store, paySvc *payment.Service, o
 	}
 }
 
-func (s *Service) principalCanAccess(ctx context.Context, p *auth.Principal, sb *store.Sandbox) (bool, error) {
-	if p == nil || sb == nil {
+func (s *Service) principalCanAccess(_ context.Context, p *auth.Principal, sb *store.Sandbox, args map[string]any) (bool, error) {
+	if sb == nil {
+		return false, nil
+	}
+	if tok := strings.TrimSpace(argString(args, "sandbox_token")); auth.IsSandboxToken(tok) {
+		if sb.SandboxToken != nil && *sb.SandboxToken == tok {
+			return true, nil
+		}
+	}
+	if p == nil {
 		return false, nil
 	}
 	switch p.Kind {
@@ -48,23 +56,9 @@ func (s *Service) principalCanAccess(ctx context.Context, p *auth.Principal, sb 
 		if p.UserID != nil && sb.UserID != nil {
 			return *p.UserID == *sb.UserID, nil
 		}
-	case auth.KindL402:
-		if p.AgentID != nil && sb.AgentID != nil {
-			return *p.AgentID == *sb.AgentID, nil
-		}
-	case auth.KindUserJWT:
-		if sb.BillingMethod == "credits" && p.UserID != nil && sb.UserID != nil {
-			return *p.UserID == *sb.UserID, nil
-		}
-		if sb.BillingMethod == "lightning" && p.UserID != nil && sb.AgentID != nil {
-			ag, err := s.Store.GetAgentByJWTSub(ctx, *p.UserID)
-			if err != nil {
-				return false, err
-			}
-			if ag == nil {
-				return false, nil
-			}
-			return ag.ID == *sb.AgentID, nil
+	case auth.KindSandbox:
+		if p.SandboxID != nil {
+			return *p.SandboxID == sb.ID, nil
 		}
 	}
 	return false, nil
@@ -81,11 +75,7 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	case "":
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "tool name required"}
 	case "sandbox_create", "sandbox_exec", "sandbox_write_file", "sandbox_read_file", "sandbox_list_files",
-		"sandbox_status", "sandbox_pause", "sandbox_resume", "sandbox_terminate", "sandbox_extend_balance",
-		"wallet_balance", "wallet_deposit", "wallet_deposit_status":
-		if s.Store == nil {
-			return nil, http.StatusServiceUnavailable, "store_unavailable", map[string]any{"message": "store not configured"}
-		}
+		"sandbox_status", "sandbox_pause", "sandbox_resume", "sandbox_terminate":
 	default:
 		return nil, 0, "", nil
 	}
@@ -98,6 +88,10 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	}
 	if m == nil {
 		m = map[string]any{}
+	}
+
+	if s.Store == nil {
+		return nil, http.StatusServiceUnavailable, "store_unavailable", map[string]any{"message": "store not configured"}
 	}
 
 	switch name {
@@ -119,20 +113,12 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 		return s.toolSandboxResume(ctx, p, m)
 	case "sandbox_terminate":
 		return s.toolSandboxTerminate(ctx, p, m)
-	case "sandbox_extend_balance":
-		return s.toolSandboxExtendBalance(ctx, p, m)
-	case "wallet_balance":
-		return s.toolWalletBalance(ctx, p)
-	case "wallet_deposit":
-		return s.toolWalletDeposit(ctx, p, m)
-	case "wallet_deposit_status":
-		return s.toolWalletDepositStatus(ctx, p, m)
 	default:
 		return nil, 0, "", nil
 	}
 }
 
-func (s *Service) getSandboxForPrincipal(ctx context.Context, p *auth.Principal, id uuid.UUID) (*store.Sandbox, int, string, map[string]any) {
+func (s *Service) getSandboxForPrincipal(ctx context.Context, p *auth.Principal, id uuid.UUID, args map[string]any) (*store.Sandbox, int, string, map[string]any) {
 	sb, err := s.Store.GetSandbox(ctx, id)
 	if err != nil {
 		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
@@ -140,7 +126,7 @@ func (s *Service) getSandboxForPrincipal(ctx context.Context, p *auth.Principal,
 	if sb == nil {
 		return nil, http.StatusNotFound, "not_found", map[string]any{"sandbox_id": id.String()}
 	}
-	ok, err := s.principalCanAccess(ctx, p, sb)
+	ok, err := s.principalCanAccess(ctx, p, sb, args)
 	if err != nil {
 		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
 	}
@@ -151,13 +137,19 @@ func (s *Service) getSandboxForPrincipal(ctx context.Context, p *auth.Principal,
 }
 
 func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
-	if p == nil {
-		return nil, http.StatusUnauthorized, "unauthorized", nil
-	}
 	bm := strings.ToLower(strings.TrimSpace(argString(args, "billing_method")))
+	if bm == "" {
+		// Default to lightning for credential-less callers (autonomous LLM agents); credits otherwise.
+		if p != nil && p.Kind == auth.KindAPIKey {
+			bm = "credits"
+		} else {
+			bm = "lightning"
+		}
+	}
 	if bm != "lightning" && bm != "credits" {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing_method must be lightning or credits"}
 	}
+
 	tier := strings.TrimSpace(argString(args, "tier"))
 	if tier == "" {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "tier required"}
@@ -166,105 +158,48 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	if err != nil || pr == nil {
 		return nil, http.StatusBadRequest, "bad_tier", map[string]any{"message": "unknown tier"}
 	}
-	_, templateLabel, runtime, err := orchestrator.ResolveTier(s.Cfg, tier)
+	_, templateLabel, runtimeLabel, err := orchestrator.ResolveTier(s.Cfg, tier)
 	if err != nil {
 		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": err.Error()}
 	}
 
+	switch bm {
+	case "credits":
+		return s.createCreditsSandbox(ctx, p, tier, templateLabel, runtimeLabel, pr)
+	case "lightning":
+		return s.createLightningSandbox(ctx, tier, templateLabel, runtimeLabel, pr)
+	}
+	return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing_method"}
+}
+
+func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, tier, templateLabel, runtimeLabel string, pr *store.TierPricing) (any, int, string, map[string]any) {
+	if p == nil || p.Kind != auth.KindAPIKey || p.UserID == nil || p.APIKeyID == nil {
+		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "credits billing requires an API key (Bearer sockt_live_...)"}
+	}
 	sb := &store.Sandbox{
-		BillingMethod: bm,
+		BillingMethod: "credits",
 		Tier:          tier,
 		Template:      templateLabel,
 		Status:        "pending",
-		Runtime:       runtime,
-		ConsumedMsats: 0,
+		Runtime:       runtimeLabel,
+		UserID:        p.UserID,
+		APIKeyID:      p.APIKeyID,
 	}
-
-	switch bm {
-	case "credits":
-		if p.Kind != auth.KindAPIKey || p.UserID == nil || p.APIKeyID == nil {
-			return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "api key required for credits sandboxes"}
-		}
-		sb.UserID = p.UserID
-		sb.APIKeyID = p.APIKeyID
-	case "lightning":
-		switch p.Kind {
-		case auth.KindL402:
-			if p.AgentID == nil {
-				return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "L402 required for lightning sandboxes"}
-			}
-			sb.AgentID = p.AgentID
-		case auth.KindUserJWT:
-			if p.UserID == nil {
-				return nil, http.StatusUnauthorized, "unauthorized", nil
-			}
-			ag, err := s.Store.GetAgentByJWTSub(ctx, *p.UserID)
-			if err != nil {
-				return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
-			}
-			if ag == nil {
-				return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "register wallet offer first"}
-			}
-			sb.AgentID = &ag.ID
-		default:
-			return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "L402 or user JWT with agent required for lightning sandboxes"}
-		}
-	}
-
 	if err := s.Store.InsertSandbox(ctx, sb); err != nil {
 		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
 	}
-
-	cp := strings.TrimRight(strings.TrimSpace(s.Cfg.ControlPlanePublicURL), "/")
-	if cp == "" {
-		cp = "http://127.0.0.1:" + s.Cfg.Port
+	alloc, _, err := s.Store.AllocateCreditsForSandbox(ctx, *sb.UserID, sb.ID, s.Cfg.LowCreditThresholdCents*10)
+	if err != nil {
+		return nil, http.StatusPaymentRequired, "insufficient_credits", map[string]any{"message": err.Error()}
 	}
-
-	var initialBal int64
-	var rate int64
-	var topThresh, topAmt int64
-	switch bm {
-	case "lightning":
-		ag, _ := s.Store.GetAgentByID(ctx, *sb.AgentID)
-		if ag != nil {
-			initialBal = ag.BalanceMsats
-		}
-		rate = pr.MsatsPerSecond
-		topThresh = int64(s.Cfg.BalanceLowWaterSecs) * rate
-		topAmt = int64(s.Cfg.BalanceTopupChunkSecs) * rate
-	case "credits":
-		alloc, _, err := s.Store.AllocateCreditsForSandbox(ctx, *sb.UserID, sb.ID, s.Cfg.LowCreditThresholdCents*10)
-		if err != nil {
-			return nil, http.StatusPaymentRequired, "insufficient_credits", map[string]any{"message": err.Error()}
-		}
-		if pr.USDCentsPerSecondX100 <= 0 {
+	rate := int64(1)
+	if pr.USDCentsPerSecondX100 > 0 {
+		rate = pr.USDCentsPerSecondX100 / 100
+		if rate <= 0 {
 			rate = 1
-		} else {
-			rate = pr.USDCentsPerSecondX100 / 100
-			if rate <= 0 {
-				rate = 1
-			}
 		}
-		initialBal = alloc
-		topThresh = int64(s.Cfg.BalanceLowWaterSecs) * rate
-		topAmt = int64(s.Cfg.BalanceTopupChunkSecs) * rate
 	}
-
-	env := map[string]string{
-		"SANDBOX_ID":             sb.ID.String(),
-		"CONTROL_PLANE_URL":      cp,
-		"JWT_SECRET":             string(s.Cfg.WSSJWTSecret),
-		"JWT_AUDIENCE":           s.Cfg.DataJWTAudience,
-		"SANDBOX_ROOT":           s.Cfg.RuntimeSandboxRoot,
-		"CALLBACK_SECRET":        s.Cfg.CallbackSecret,
-		"BILLING_METHOD":         bm,
-		"RATE_PER_SECOND":        fmt.Sprintf("%d", rate),
-		"INITIAL_BALANCE":        fmt.Sprintf("%d", initialBal),
-		"TOPUP_THRESHOLD":        fmt.Sprintf("%d", topThresh),
-		"TOPUP_AMOUNT":           fmt.Sprintf("%d", topAmt),
-		"BALANCE_LOW_WATER_SECS": fmt.Sprintf("%d", s.Cfg.BalanceLowWaterSecs),
-	}
-
+	env := orchestrator.BuildSandboxEnv(s.Cfg, sb, alloc, rate)
 	if s.Orch == nil {
 		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "runpod not configured"}
 	}
@@ -275,12 +210,88 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	return sb2, 0, "", nil
 }
 
+func (s *Service) createLightningSandbox(ctx context.Context, tier, templateLabel, runtimeLabel string, pr *store.TierPricing) (any, int, string, map[string]any) {
+	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
+		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning payment not configured"}
+	}
+	prepaySecs := s.Cfg.SandboxPrepaySecs
+	if prepaySecs <= 0 {
+		prepaySecs = 30
+	}
+	rate := pr.MsatsPerSecond
+	if rate <= 0 {
+		return nil, http.StatusInternalServerError, "tier_error", map[string]any{"message": "tier has no lightning rate"}
+	}
+	prepayMsats := int64(prepaySecs) * rate
+	prepaySats := prepayMsats / 1000
+	if prepayMsats%1000 != 0 {
+		prepaySats++
+	}
+	if prepaySats <= 0 {
+		prepaySats = 1
+	}
+
+	token, err := newSandboxToken()
+	if err != nil {
+		return nil, http.StatusInternalServerError, "internal", map[string]any{"message": err.Error()}
+	}
+
+	sb := &store.Sandbox{
+		BillingMethod: "lightning",
+		Tier:          tier,
+		Template:      templateLabel,
+		Status:        "awaiting_payment",
+		Runtime:       runtimeLabel,
+		SandboxToken:  &token,
+	}
+	if err := s.Store.InsertSandbox(ctx, sb); err != nil {
+		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
+	}
+
+	memo := fmt.Sprintf("sockt-prepay:sandbox:%s", sb.ID.String())
+	idem := fmt.Sprintf("sandbox-prepay:%s", sb.ID.String())
+	dep, err := s.PaySvc.RequestSandboxDepositInvoice(ctx, sb.ID, prepaySats, 3600, memo, idem)
+	if err != nil || dep == nil {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		return nil, http.StatusBadGateway, "invoice_failed", map[string]any{"message": msg}
+	}
+	if len(dep.RHash) != 32 {
+		return nil, http.StatusBadGateway, "invoice_bad_hash", nil
+	}
+	expiresAt := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second)
+	if err := s.Store.SetSandboxPendingInvoice(ctx, sb.ID, dep.PaymentRequest, dep.RHash, dep.AmountMsats, expiresAt); err != nil {
+		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
+	}
+
+	out := map[string]any{
+		"status":            "awaiting_payment",
+		"sandbox_id":        sb.ID.String(),
+		"sandbox_token":     token,
+		"tier":              tier,
+		"runtime":           runtimeLabel,
+		"billing_method":    "lightning",
+		"invoice":           dep.PaymentRequest,
+		"payment_hash":      hex.EncodeToString(dep.RHash),
+		"amount_msats":      dep.AmountMsats,
+		"amount_sats":       prepaySats,
+		"msats_per_second":  rate,
+		"prepaid_seconds":   prepaySecs,
+		"expires_at":        expiresAt.Format(time.RFC3339),
+		"next_step":         fmt.Sprintf("Pay this BOLT11. Then call sandbox_status with sandbox_id=%s and sandbox_token to track readiness.", sb.ID.String()),
+		"auth_hint":         "Send Authorization: Bearer " + token + " on every subsequent MCP POST, or pass sandbox_token as a tool argument.",
+	}
+	return out, 0, "", nil
+}
+
 func (s *Service) toolSandboxExec(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
 	id, ok := parseUUIDArg(args, "sandbox_id")
 	if !ok {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -292,7 +303,7 @@ func (s *Service) toolSandboxWriteFile(ctx context.Context, p *auth.Principal, a
 	if !ok {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -304,7 +315,7 @@ func (s *Service) toolSandboxReadFile(ctx context.Context, p *auth.Principal, ar
 	if !ok {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -316,7 +327,7 @@ func (s *Service) toolSandboxListFiles(ctx context.Context, p *auth.Principal, a
 	if !ok {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -328,7 +339,7 @@ func (s *Service) toolSandboxStatus(ctx context.Context, p *auth.Principal, args
 	if !ok {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -362,6 +373,43 @@ func (s *Service) toolSandboxStatus(ctx context.Context, p *auth.Principal, args
 		}
 	}
 
+	if sb.BillingMethod == "lightning" {
+		out["prepaid_balance_msats"] = sb.PrepaidBalanceMsats
+		secsRemaining := int64(0)
+		if pr != nil && pr.MsatsPerSecond > 0 {
+			secsRemaining = sb.PrepaidBalanceMsats / pr.MsatsPerSecond
+			out["seconds_remaining"] = secsRemaining
+		}
+		switch {
+		case sb.Status == "awaiting_payment":
+			out["warning_level"] = "awaiting_payment"
+		case secsRemaining <= 0 && sb.PrepaidBalanceMsats <= 0:
+			out["warning_level"] = "out_of_balance"
+		case secsRemaining < int64(s.Cfg.SandboxTopupTriggerSecs):
+			out["warning_level"] = "low_balance"
+		default:
+			out["warning_level"] = "ok"
+		}
+		if sb.PendingInvoiceBolt11 != nil {
+			pending := map[string]any{
+				"bolt11": *sb.PendingInvoiceBolt11,
+			}
+			if len(sb.PendingInvoicePaymentHash) == 32 {
+				pending["payment_hash"] = hex.EncodeToString(sb.PendingInvoicePaymentHash)
+			}
+			if sb.PendingInvoiceAmountMsats != nil {
+				pending["amount_msats"] = *sb.PendingInvoiceAmountMsats
+			}
+			if sb.PendingInvoiceExpiresAt != nil {
+				pending["expires_at"] = sb.PendingInvoiceExpiresAt.UTC().Format(time.RFC3339)
+			}
+			out["pending_invoice"] = pending
+		}
+		if sb.SandboxToken != nil {
+			out["sandbox_token"] = *sb.SandboxToken
+		}
+	}
+
 	live, _, _, _ := s.toolRuntimeStatus(ctx, sb)
 	if live != nil && len(live) > 0 {
 		out["metrics_stale"] = false
@@ -381,7 +429,7 @@ func (s *Service) toolSandboxPause(ctx context.Context, p *auth.Principal, args 
 	if !ok {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -403,7 +451,7 @@ func (s *Service) toolSandboxResume(ctx context.Context, p *auth.Principal, args
 	if !ok {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -440,7 +488,7 @@ func (s *Service) toolSandboxTerminate(ctx context.Context, p *auth.Principal, a
 	if !confirm {
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "confirm must be true"}
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
 	if sb == nil {
 		return nil, st, slug, ex
 	}
@@ -463,235 +511,17 @@ func (s *Service) toolSandboxTerminate(ctx context.Context, p *auth.Principal, a
 	}, 0, "", nil
 }
 
-func (s *Service) toolSandboxExtendBalance(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
-	id, ok := parseUUIDArg(args, "sandbox_id")
-	if !ok {
-		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
+// newSandboxToken returns a 256-bit Crockford-base32 opaque bearer token, prefixed `sbx_`.
+func newSandboxToken() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
 	}
-	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id)
-	if sb == nil {
-		return nil, st, slug, ex
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	out := make([]byte, len(raw)*2)
+	for i, b := range raw {
+		out[2*i] = alphabet[b>>4]
+		out[2*i+1] = alphabet[b&0x0F]
 	}
-	switch sb.BillingMethod {
-	case "credits":
-		if p == nil || p.UserID == nil {
-			return nil, http.StatusUnauthorized, "unauthorized", nil
-		}
-		want := int64(argFloat(args, "cents"))
-		if want <= 0 {
-			want = s.Cfg.LowCreditThresholdCents * 10
-		}
-		a, after, err := s.Store.AllocateCreditsForSandbox(ctx, *p.UserID, id, want)
-		if err != nil {
-			return nil, http.StatusPaymentRequired, "insufficient_credits", map[string]any{"message": err.Error()}
-		}
-		return map[string]any{"allocated_cents": a, "balance_after_cents": after}, 0, "", nil
-	case "lightning":
-		agentID := uuid.Nil
-		switch {
-		case p != nil && p.AgentID != nil:
-			agentID = *p.AgentID
-		case p != nil && p.Kind == auth.KindUserJWT && p.UserID != nil:
-			ag, err := s.Store.GetAgentByJWTSub(ctx, *p.UserID)
-			if err != nil || ag == nil {
-				return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "agent not found for user"}
-			}
-			agentID = ag.ID
-		default:
-			return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "agent context required"}
-		}
-		if s.PaySvc == nil || !s.PaySvc.HasLightning() {
-			return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning wallet not configured"}
-		}
-		sats := int64(argFloat(args, "sats"))
-		if sats <= 0 {
-			sats = 50_000
-		}
-		idem := argString(args, "idempotency_key")
-		if idem == "" {
-			idem = fmt.Sprintf("mcp-extend:%s:%d", id.String(), time.Now().UnixNano())
-		}
-		memo := fmt.Sprintf("mcp-extend:sandbox:%s", id.String())
-		dep, err := s.PaySvc.RequestDepositInvoice(ctx, agentID, sats, 3600, memo, idem)
-		if err != nil {
-			return nil, http.StatusBadGateway, slugFromPaymentClass(string(payment.Classify(err))), map[string]any{"message": err.Error()}
-		}
-		if dep == nil || len(dep.RHash) != 32 {
-			return nil, http.StatusBadGateway, "invoice_failed", map[string]any{"message": "bad invoice"}
-		}
-		expRFC := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second).Format(time.RFC3339)
-		ag3, _ := s.Store.GetAgentByID(ctx, agentID)
-		wlvl := ""
-		if ag3 != nil {
-			wlvl = ag3.WarningLevel
-		}
-		return map[string]any{
-			"bolt11":        dep.PaymentRequest,
-			"payment_hash":  hex.EncodeToString(dep.RHash),
-			"amount_msats":  dep.AmountMsats,
-			"expires_at":    expRFC,
-			"warning_level": wlvl,
-		}, 0, "", nil
-	default:
-		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing method"}
-	}
-}
-
-func (s *Service) toolWalletBalance(ctx context.Context, p *auth.Principal) (any, int, string, map[string]any) {
-	if p == nil {
-		return nil, http.StatusUnauthorized, "unauthorized", nil
-	}
-	switch p.Kind {
-	case auth.KindL402:
-		if p.AgentID == nil {
-			return nil, http.StatusUnauthorized, "unauthorized", nil
-		}
-		ag, err := s.Store.GetAgentByID(ctx, *p.AgentID)
-		if err != nil {
-			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
-		}
-		if ag == nil {
-			return nil, http.StatusNotFound, "not_found", map[string]any{"message": "register wallet first"}
-		}
-		return s.walletBalanceLightning(ctx, ag)
-	case auth.KindUserJWT, auth.KindAPIKey:
-		if p.UserID == nil {
-			return nil, http.StatusUnauthorized, "unauthorized", nil
-		}
-		ag, err := s.Store.GetAgentByJWTSub(ctx, *p.UserID)
-		if err != nil {
-			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
-		}
-		if ag != nil {
-			return s.walletBalanceLightning(ctx, ag)
-		}
-		u, err := s.Store.GetUserByID(ctx, *p.UserID)
-		if err != nil {
-			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
-		}
-		if u == nil {
-			return nil, http.StatusNotFound, "not_found", map[string]any{"message": "no billing profile for this credential"}
-		}
-		active, _ := s.Store.CountRunningSandboxesByUser(ctx, *p.UserID)
-		return map[string]any{
-			"billing":                  "credits",
-			"credit_balance_usd_cents": u.CreditBalanceUSDCents,
-			"active_sandboxes":         active,
-			"warning_level":            u.WarningLevel,
-		}, 0, "", nil
-	default:
-		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "unsupported principal kind"}
-	}
-}
-
-func (s *Service) walletBalanceLightning(ctx context.Context, ag *store.Agent) (any, int, string, map[string]any) {
-	rate, _ := s.Store.MaxMsatsPerSecondRunningSandboxesForAgent(ctx, ag.ID)
-	if rate <= 0 {
-		pr, err2 := s.Store.GetTierPricing(ctx, "nano")
-		if err2 != nil || pr == nil {
-			return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": "tier pricing"}
-		}
-		rate = pr.MsatsPerSecond
-	}
-	nextAction, minD, sug := lightningwallet.Hints(ag.BalanceMsats, rate, s.Cfg)
-	active, _ := s.Store.CountRunningSandboxesByAgent(ctx, ag.ID)
-	cp := strings.TrimRight(strings.TrimSpace(s.Cfg.ControlPlanePublicURL), "/")
-	depositURL := ""
-	if cp != "" {
-		depositURL = cp + "/v1/wallet/deposit"
-	}
-	return map[string]any{
-		"billing":                 "lightning",
-		"balance_msats":           ag.BalanceMsats,
-		"active_sandboxes":        active,
-		"billing_hint_msats_sec":  rate,
-		"warning_level":           ag.WarningLevel,
-		"next_action":             nextAction,
-		"min_deposit_msats":       minD,
-		"suggested_deposit_msats": sug,
-		"deposit_url":             depositURL,
-	}, 0, "", nil
-}
-
-func resolveAgentUUID(ctx context.Context, s *Service, p *auth.Principal) (uuid.UUID, error) {
-	if p == nil {
-		return uuid.Nil, fmt.Errorf("no principal")
-	}
-	switch {
-	case p.AgentID != nil:
-		return *p.AgentID, nil
-	case p.Kind == auth.KindUserJWT && p.UserID != nil:
-		ag, err := s.Store.GetAgentByJWTSub(ctx, *p.UserID)
-		if err != nil || ag == nil {
-			return uuid.Nil, fmt.Errorf("agent not registered")
-		}
-		return ag.ID, nil
-	default:
-		return uuid.Nil, fmt.Errorf("agent context required")
-	}
-}
-
-func (s *Service) toolWalletDeposit(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
-	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
-		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning wallet not configured"}
-	}
-	agentID, err := resolveAgentUUID(ctx, s, p)
-	if err != nil {
-		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": err.Error()}
-	}
-	sats := int64(argFloat(args, "amount_sats"))
-	idem := argString(args, "idempotency_key")
-	expiry := int64(3600)
-	memo := fmt.Sprintf("mcp-wallet-deposit:agent:%s", agentID)
-	dep, err := s.PaySvc.RequestDepositInvoice(ctx, agentID, sats, expiry, memo, strings.TrimSpace(idem))
-	if err != nil || dep == nil {
-		msg := ""
-		if err != nil {
-			msg = err.Error()
-		}
-		return nil, http.StatusBadGateway, "invoice_failed", map[string]any{"message": msg}
-	}
-	if len(dep.RHash) != 32 {
-		return nil, http.StatusBadGateway, "invoice_bad_hash", nil
-	}
-	expRFC := time.Now().UTC().Add(time.Duration(dep.ExpirySeconds) * time.Second).Format(time.RFC3339)
-	return map[string]any{
-		"bolt11":           dep.PaymentRequest,
-		"payment_hash":     hex.EncodeToString(dep.RHash),
-		"amount_msats":     dep.AmountMsats,
-		"expires_at":       expRFC,
-		"min_amount_msats": int64(1000),
-	}, 0, "", nil
-}
-
-func (s *Service) toolWalletDepositStatus(ctx context.Context, p *auth.Principal, args map[string]any) (any, int, string, map[string]any) {
-	agentID, err := resolveAgentUUID(ctx, s, p)
-	if err != nil {
-		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": err.Error()}
-	}
-	hhex := strings.TrimSpace(argString(args, "payment_hash"))
-	ph, err := hex.DecodeString(hhex)
-	if err != nil || len(ph) != 32 {
-		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "payment_hash"}
-	}
-	st, err := s.Store.GetDepositStatusForAgent(ctx, agentID, ph)
-	if err != nil {
-		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
-	}
-	if st == nil {
-		return nil, http.StatusNotFound, "not_found", map[string]any{"message": "unknown payment_hash"}
-	}
-	out := map[string]any{
-		"status":       st.Status,
-		"amount_msats": st.AmountMsats,
-		"settled_at":   nil,
-		"bolt11":       nil,
-	}
-	if st.SettledAt != nil {
-		out["settled_at"] = st.SettledAt.UTC().Format(time.RFC3339)
-	}
-	if st.Bolt11Invoice != nil {
-		out["bolt11"] = *st.Bolt11Invoice
-	}
-	return out, 0, "", nil
+	return auth.SandboxTokenPrefix + strings.ToLower(string(out)), nil
 }

@@ -21,10 +21,11 @@ type RuntimeBalance struct {
 
 // MeterEvent is pushed to websocket subscribers for billing fan-out.
 type MeterEvent struct {
-	Type                  string `json:"type"`
-	Balance               int64  `json:"balance"`
-	Message               string `json:"message,omitempty"`
-	SuggestedDepositMsats int64  `json:"suggested_deposit_msats,omitempty"`
+	Type                  string              `json:"type"`
+	Balance               int64               `json:"balance"`
+	Message               string              `json:"message,omitempty"`
+	SuggestedDepositMsats int64               `json:"suggested_deposit_msats,omitempty"`
+	Deposit               *RuntimeDepositMint `json:"deposit,omitempty"`
 }
 
 // Meter drives the 1 Hz tick loop and coordinates callbacks + subscribers.
@@ -44,6 +45,8 @@ type Meter struct {
 	oobNotified bool
 	// pauseTriggerInFlight prevents overlapping pause-trigger HTTP calls.
 	pauseTriggerInFlight bool
+	// nextTopupAttempt suppresses repeat topup-trigger calls while a deposit is pending.
+	nextTopupAttempt time.Time
 
 	subMu sync.RWMutex
 	subs  map[chan MeterEvent]struct{}
@@ -199,42 +202,53 @@ func (m *Meter) tick(parentCtx context.Context) {
 
 	m.broadcast(MeterEvent{Type: "billing", Balance: bal})
 
-	// Credits path: allocate more balance from centralized credit pool via control plane.
-	if strings.EqualFold(m.cfg.BillingMethod, "credits") && bal < thresh && bal > floor && !topupInFlight {
+	// Topup loop (credits + lightning): when balance falls below the topup threshold and
+	// we haven't already kicked the control plane within the last few seconds, ask for more.
+	// Lightning replies with a BOLT11 deposit (apply leaves balance unchanged); credits replies with
+	// a balance_delta or new_balance applied immediately.
+	if bal < thresh && bal > floor && !topupInFlight && now.After(m.nextTopupAttempt) {
 		m.mu.Lock()
 		m.balance.TopupInFlight = true
+		m.nextTopupAttempt = now.Add(5 * time.Second)
 		m.mu.Unlock()
+
+		if strings.EqualFold(m.cfg.BillingMethod, "lightning") && prevBal >= thresh {
+			m.broadcast(MeterEvent{Type: "low_balance", Balance: bal, Message: "deposit_required", SuggestedDepositMsats: m.cfg.TopupAmount})
+		}
 
 		go func(b0, c0 int64) {
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 
-			err := m.cb.PostCreditAllocateApply(ctx, b0, c0, func(delta int64, newBal int64) {
-				if newBal != 0 {
-					m.ApplyNewBalance(newBal)
-				} else if delta != 0 {
-					m.ApplyBalanceDelta(delta)
-				} else {
+			err := m.cb.PostBalanceTopupApply(ctx, b0, c0, func(tr TopupResponse) {
+				if tr.Deposit != nil {
+					m.broadcast(MeterEvent{
+						Type:                  "deposit_required",
+						Balance:               m.Snapshot().Balance,
+						Message:               tr.ErrorClass,
+						SuggestedDepositMsats: tr.Deposit.AmountMsats,
+						Deposit:               tr.Deposit,
+					})
+					m.ClearTopupFlight()
+					return
+				}
+				switch {
+				case tr.NewBalance != 0:
+					m.ApplyNewBalance(tr.NewBalance)
+				case tr.BalanceDelta != 0:
+					m.ApplyBalanceDelta(tr.BalanceDelta)
+				default:
 					m.ClearTopupFlight()
 				}
 			})
 			if err != nil {
-				log.Printf("runtime/meter: credit-allocation-trigger failed: %v", err)
+				log.Printf("runtime/meter: topup-trigger failed: %v", err)
 				m.mu.Lock()
 				m.balance.TopupInFlight = false
 				m.mu.Unlock()
-				m.broadcast(MeterEvent{Type: "error", Balance: m.Snapshot().Balance, Message: "credit_allocation_trigger_failed"})
-			} else {
-				m.broadcast(MeterEvent{Type: "topup", Balance: m.Snapshot().Balance, Message: "credit_allocation_trigger_ok"})
+				m.broadcast(MeterEvent{Type: "error", Balance: m.Snapshot().Balance, Message: "topup_trigger_failed"})
 			}
 		}(bal, consumed)
-	}
-
-	// Lightning prepaid: advise agent to deposit; no automatic LN pull.
-	if strings.EqualFold(m.cfg.BillingMethod, "lightning") && prevBal >= thresh && bal < thresh {
-		sug := m.cfg.TopupAmount
-		m.broadcast(MeterEvent{Type: "low_balance", Balance: bal, Message: "deposit_required", SuggestedDepositMsats: sug})
-		m.broadcast(MeterEvent{Type: "deposit_required", Balance: bal, SuggestedDepositMsats: sug})
 	}
 
 	if bal <= floor {

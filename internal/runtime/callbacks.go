@@ -167,14 +167,33 @@ func (c *Callbacks) PostPauseTrigger(ctx context.Context, balance, consumedTotal
 	return c.postJSON(ctx, "v1/runtime/pause-trigger", body)
 }
 
-type allocateResponse struct {
-	BalanceDelta int64 `json:"balance_delta"`
-	NewBalance   int64 `json:"new_balance"`
-	ErrorClass   string `json:"error_class,omitempty"`
+// TopupResponse is the unified shape returned by /v1/runtime/topup-trigger across
+// credits (server-side allocation) and lightning (client-paid BOLT11 deposit).
+type TopupResponse struct {
+	BalanceDelta int64               `json:"balance_delta"`
+	NewBalance   int64               `json:"new_balance"`
+	ErrorClass   string              `json:"error_class,omitempty"`
+	WarningLevel string              `json:"warning_level,omitempty"`
+	Deposit      *RuntimeDepositMint `json:"deposit,omitempty"`
 }
 
-// PostCreditAllocateApply requests additional prepaid credits from the control plane (credits path only).
-func (c *Callbacks) PostCreditAllocateApply(ctx context.Context, balance, consumedTotal int64, apply func(delta int64, newBal int64)) error {
+type topupResponseEnvelope struct {
+	BalanceDelta int64  `json:"balance_delta"`
+	NewBalance   int64  `json:"new_balance"`
+	ErrorClass   string `json:"error_class,omitempty"`
+	WarningLevel string `json:"warning_level,omitempty"`
+	Deposit      *struct {
+		Bolt11      string `json:"bolt11"`
+		PaymentHash string `json:"payment_hash"`
+		AmountMsats int64  `json:"amount_msats"`
+		ExpiresAt   string `json:"expires_at"`
+	} `json:"deposit,omitempty"`
+}
+
+// PostBalanceTopupApply requests additional prepaid balance from the control plane.
+// Behaves identically for credits (server allocates) and lightning (server returns a BOLT11 deposit).
+// The caller's apply callback is invoked exactly once with the parsed response.
+func (c *Callbacks) PostBalanceTopupApply(ctx context.Context, balance, consumedTotal int64, apply func(TopupResponse)) error {
 	payload, err := json.Marshal(triggerPayload{
 		SandboxID:      c.cfg.SandboxID,
 		PodID:          c.cfg.PodID,
@@ -226,16 +245,23 @@ func (c *Callbacks) PostCreditAllocateApply(ctx context.Context, balance, consum
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			c.resetFailure()
 			if apply != nil {
-				var tr allocateResponse
-				_ = json.Unmarshal(bodyBytes, &tr)
-				switch {
-				case tr.NewBalance != 0:
-					apply(0, tr.NewBalance)
-				case tr.BalanceDelta != 0:
-					apply(tr.BalanceDelta, 0)
-				default:
-					apply(0, 0)
+				var raw topupResponseEnvelope
+				_ = json.Unmarshal(bodyBytes, &raw)
+				out := TopupResponse{
+					BalanceDelta: raw.BalanceDelta,
+					NewBalance:   raw.NewBalance,
+					ErrorClass:   raw.ErrorClass,
+					WarningLevel: raw.WarningLevel,
 				}
+				if raw.Deposit != nil && strings.TrimSpace(raw.Deposit.Bolt11) != "" {
+					out.Deposit = &RuntimeDepositMint{
+						Bolt11:      raw.Deposit.Bolt11,
+						PaymentHash: raw.Deposit.PaymentHash,
+						AmountMsats: raw.Deposit.AmountMsats,
+						ExpiresAt:   raw.Deposit.ExpiresAt,
+					}
+				}
+				apply(out)
 			}
 			return nil
 		}
@@ -249,75 +275,8 @@ func (c *Callbacks) PostCreditAllocateApply(ctx context.Context, balance, consum
 
 // RuntimeDepositMint is a BOLT11 deposit invoice minted when the sandbox requests prepaid funds over Lightning.
 type RuntimeDepositMint struct {
-	Bolt11        string `json:"bolt11"`
-	PaymentHash   string `json:"payment_hash"`
-	AmountMsats   int64  `json:"amount_msats"`
-	ExpiresAt     string `json:"expires_at"`
-	WarningLevel  string `json:"warning_level,omitempty"`
-	ErrorClass    string `json:"error_class,omitempty"`
-}
-
-type runtimeMintEnvelope struct {
-	ErrorClass string `json:"error_class"`
-	Deposit    struct {
-		Bolt11      string `json:"bolt11"`
-		PaymentHash string `json:"payment_hash"`
-		AmountMsats int64  `json:"amount_msats"`
-		ExpiresAt   string `json:"expires_at"`
-	} `json:"deposit"`
-	WarningLevel string `json:"warning_level,omitempty"`
-}
-
-// PostRuntimeDepositMint asks the control plane to mint a deposit invoice (lightning path only).
-func (c *Callbacks) PostRuntimeDepositMint(ctx context.Context, balance, consumedTotal int64) (*RuntimeDepositMint, error) {
-	payload, err := json.Marshal(triggerPayload{
-		SandboxID:      c.cfg.SandboxID,
-		PodID:          c.cfg.PodID,
-		BillingMethod:  c.cfg.BillingMethod,
-		Balance:        balance,
-		ConsumedTotal:  consumedTotal,
-		RequestedTopup: c.cfg.TopupAmount,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	url := joinURL(c.cfg.ControlPlaneURL, "v1/runtime/topup-trigger")
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.cfg.CallbackSecret != "" {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.CallbackSecret)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		c.bumpFailure()
-		return nil, err
-	}
-	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	_ = resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		c.bumpFailure()
-		return nil, fmt.Errorf("runtime deposit mint callback status=%d", resp.StatusCode)
-	}
-	c.resetFailure()
-	var raw runtimeMintEnvelope
-	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(raw.Deposit.Bolt11) == "" {
-		return nil, fmt.Errorf("missing deposit in response (%s)", raw.ErrorClass)
-	}
-	return &RuntimeDepositMint{
-		Bolt11:       raw.Deposit.Bolt11,
-		PaymentHash:  raw.Deposit.PaymentHash,
-		AmountMsats:  raw.Deposit.AmountMsats,
-		ExpiresAt:    raw.Deposit.ExpiresAt,
-		WarningLevel: raw.WarningLevel,
-		ErrorClass:   raw.ErrorClass,
-	}, nil
+	Bolt11      string `json:"bolt11"`
+	PaymentHash string `json:"payment_hash"`
+	AmountMsats int64  `json:"amount_msats"`
+	ExpiresAt   string `json:"expires_at"`
 }

@@ -2,11 +2,12 @@
 
 ## v2 changelog
 
-- Transport switched from HTTP+SSE to **MCP Streamable HTTP** (the 2025-11 transport refresh): one bidirectional HTTP/2 stream per session, not separate GET (SSE) + POST (message) channels. Halves connection count, simplifies session management, and works cleanly through the GCP global LB without SSE-specific quirks.
-- Authentication is **JWT-only** (Supabase user JWT or platform-issued L402-derived JWT). The MCP `tools/list` and `tools/call` endpoints never trigger an L402 402 cycle. L402 happens once during agent registration; thereafter the JWT carries the identity.
-- MCP sessions are pinned to a control-plane instance via **consistent hashing of `session_id`**. Requests for an existing session that hit the wrong instance are forwarded over internal gRPC by `OwnershipForwardMiddleware`.
-- Tools that require data-plane access (`sandbox_exec`, `sandbox_write_file`, `sandbox_read_file`, `sandbox_list_files`) are **proxied by the MCP server to the host-agent's HTTPS endpoint** using the sandbox's `data_jwt` minted at sandbox creation. The MCP server does NOT call exec/files via the control-plane orchestrator (which no longer exposes those operations).
-- Output schemas use msats (Lightning) and cents-x100 (credits), matching the Component 3 / Component 6 unit changes. The `sats_per_second` and `sats_consumed` fields are kept as derived integer values for backward compatibility with existing clients but accompanied by the higher-precision `msats_per_second` and `msats_consumed`.
+- Transport switched from HTTP+SSE to **MCP Streamable HTTP** (the 2025-11 transport refresh): one bidirectional HTTP/2 stream per session, not separate GET (SSE) + POST (message) channels.
+- **Sandbox-scoped Lightning prepay** replaces the macaroon / agent-balance L402 stack. `POST /v1/mcp` accepts an empty `Authorization` header for `initialize`, `tools/list`, and `tools/call sandbox_create`. `sandbox_create` with `billing_method=lightning` (or no auth) atomically creates an `awaiting_payment` sandbox row, mints a `SANDBOX_PREPAY_SECS` BOLT11, and returns `{sandbox_id, sandbox_token, invoice, payment_hash, amount_msats, expires_at}`. The LLM pays the invoice with whatever Lightning tool it has (lnbot, an LNURL-pay, …) and uses `Authorization: Bearer sbx_…` (or the `sandbox_token` argument) on subsequent calls.
+- API-key (credits) flow is unchanged: `Authorization: Bearer sockt_live_…` opts into the per-user credit balance and binds new sandboxes to `UserID` / `APIKeyID`.
+- MCP sessions are pinned to a control-plane instance via consistent hashing of `session_id`. Requests for an existing session that hit the wrong instance are forwarded over internal gRPC by `OwnershipForwardMiddleware`.
+- Tools that require data-plane access (`sandbox_exec`, `sandbox_write_file`, `sandbox_read_file`, `sandbox_list_files`) are proxied by the MCP server to the host-agent's HTTPS endpoint using the sandbox's `data_jwt`.
+- Output schemas use msats (Lightning) and cents-x100 (credits). Lightning sandboxes carry a per-sandbox `prepaid_balance_msats` and `pending_invoice_*` block; `sandbox_status` surfaces both whenever they're populated.
 
 ---
 
@@ -41,13 +42,35 @@ Note: legacy `/mcp/sse` and `/mcp/message` endpoints are no longer supported. Th
 
 ### Authentication
 
-MCP connections require a valid JWT in the `Authorization: Bearer {jwt}` header on both the initial POST and on every subsequent message POST in the same session. Two JWT kinds are accepted:
-- **Supabase user JWT** — for website users who use API-key billing
-- **Agent JWT** — issued at L402 registration; signed by the platform's HS256 secret
+`POST /v1/mcp` resolves the principal in this order (see [`AuthMiddleware`](internal/mcp/auth.go)):
 
-Both are validated by the same `JWTMiddleware` (Component 1). The MCP server does NOT issue L402 challenges.
+1. **API key** — `Authorization: Bearer sockt_live_…` ⇒ `KindAPIKey` principal (credit billing on the owning user).
+2. **Sandbox token** — `Authorization: Bearer sbx_…` ⇒ `KindSandbox` principal scoped to the sandbox the token was minted for (Lightning billing on `sandbox.prepaid_balance_msats`). The token can also travel as `arguments.sandbox_token` for any per-sandbox tool, which is convenient when one MCP session drives multiple Lightning sandboxes.
+3. **Anonymous** — no `Authorization` header. The handler runs `initialize`, `tools/list`, and `tools/call sandbox_create` without a principal. Every other tool returns `forbidden` until a `sandbox_token` is presented.
 
-The underlying tool calls (e.g., `sandbox_create`) trigger BOLT12 top-ups automatically via the billing engine — the LLM does not handle payment logic directly.
+There is no Supabase JWT, no L402 macaroon, and no `X-Agent-Id` on `POST /v1/mcp`. The single rate limiter `MCP_RPM` keys on `Principal.BalanceKey` for authenticated callers and on `ip:<client_ip>` for anonymous ones.
+
+`sandbox_create` is the only tool that mints credentials. For `billing_method=lightning` (or anonymous `sandbox_create` with no `billing_method`):
+
+```json
+{
+  "status": "awaiting_payment",
+  "sandbox_id": "…",
+  "sandbox_token": "sbx_…",
+  "billing_method": "lightning",
+  "tier": "nano",
+  "invoice": "lnbc…",
+  "payment_hash": "…",
+  "amount_msats": 30000,
+  "amount_sats": 30,
+  "msats_per_second": 1000,
+  "prepaid_seconds": 30,
+  "expires_at": "…",
+  "next_step": "Pay this BOLT11. Then call sandbox_status with sandbox_id+sandbox_token to track readiness."
+}
+```
+
+For `billing_method=credits` the response is unchanged from the current credits flow (full sandbox row, principal must be `KindAPIKey`).
 
 ### Session Affinity
 
@@ -59,15 +82,22 @@ The MCP server uses `cluster.OwnerOf(session_id)` to decide where the session li
 
 ## MCP Server Initialization Sequence
 
-1. Client opens `POST /mcp/stream` with `Authorization: Bearer {jwt}`
-2. Server validates the JWT, mints a session_id, and pins ownership via the consistent-hash ring
-3. Server holds the response stream open and writes its `initialize` response
-4. Client writes its `initialize` message body: `{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-11","capabilities":{},"clientInfo":{"name":"claude","version":"3.7"}}}`
-5. Server responds with capabilities + serverInfo and the `Mcp-Session-Id` header
-6. Client sends `tools/list` — server returns all tool definitions
-7. Client calls tools via `tools/call` messages
+1. Client opens `POST /v1/mcp` with `Authorization: Bearer sockt_live_…` (credits) or no `Authorization` (anonymous Lightning).
+2. Server resolves the principal via [`AuthMiddleware`](internal/mcp/auth.go), mints a session id on first successful `initialize`, and sets `Mcp-Session-Id` on the JSON-RPC response.
+3. Client sends JSON-RPC `initialize` with a supported `protocolVersion` (e.g. `2025-11-25`).
+4. Server responds with capabilities + serverInfo and the `Mcp-Session-Id` header.
+5. Client sends `tools/list` — server returns all tool definitions, every per-sandbox tool with an optional `sandbox_token` argument.
+6. Client calls tools via `tools/call`.
 
-The session is destroyed on stream close, on 30 minutes of inactivity, or when the owning instance leaves the cluster (the new owner's session map starts empty; the client must re-initialize).
+**Anonymous Lightning onboarding** (no `Authorization`):
+
+1. `tools/call sandbox_create {"tier":"nano","billing_method":"lightning"}` ⇒ result with `status="awaiting_payment"`, `sandbox_token=sbx_…`, `invoice=lnbc…`, `amount_msats`, `expires_at`.
+2. The LLM pays the BOLT11 (any LN wallet — lnbot tool, LNURL-pay, …).
+3. Once the deposit settles, the control plane credits `sandbox.prepaid_balance_msats` and asynchronously calls the orchestrator to launch the RunPod pod. Status flips `awaiting_payment` → `pending` → `running`.
+4. Client polls `tools/call sandbox_status {"sandbox_id":"…","sandbox_token":"sbx_…"}` until `status="running"`. The same call surfaces `seconds_remaining` and any `pending_invoice` block.
+5. Client uses `sandbox_exec` / `sandbox_write_file` / … with the `sandbox_token` (header or argument). Roughly `SANDBOX_TOPUP_TRIGGER_SECS` before the prepaid balance runs out, the runtime asks the control plane for a top-up; the control plane mints a new BOLT11, persists it on the sandbox row, and the next tool result (or `sandbox_status`) carries it as `pending_invoice`. The LLM pays again. Stop paying ⇒ the runtime hits 0 msats, sends `pause_trigger`, and the orchestrator pauses the pod.
+
+The session is destroyed on stream close, on 30 minutes of inactivity, or when the owning instance leaves the cluster (the new owner's session map starts empty; the client must re-initialize). Sandbox tokens themselves outlive the session — the LLM can resume any sandbox by presenting `sbx_…` from a fresh MCP session.
 
 ---
 
@@ -117,7 +147,7 @@ The session is destroyed on stream close, on 30 minutes of inactivity, or when t
 - `command` (string, required)
 - `timeout_ms` (integer, optional, default 30000, max 300000)
 - `env` (object, optional)
-- `working_dir` (string, optional, default `/workspace`)
+- `working_dir` (string, optional, default `.` — sandbox home / `SANDBOX_ROOT`)
 
 **Output schema:**
 - `stdout` (string)

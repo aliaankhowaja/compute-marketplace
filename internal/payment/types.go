@@ -1,7 +1,5 @@
 package payment
 
-import "time"
-
 // BalanceInfo summarizes liquidity signals for dashboards (custodial wallet or legacy node fields).
 type BalanceInfo struct {
 	WalletConfirmedSats   int64
@@ -28,12 +26,4 @@ type NodeHealth struct {
 type Bolt11Invoice struct {
 	PaymentRequest string // encoded payment string for payment + macaroon binding
 	RHash          []byte // payment hash, 32 bytes
-}
-
-// PoolEntry holds a warm L402 invoice from the invoice pool.
-type PoolEntry struct {
-	BOLT11      string
-	PaymentHash []byte
-	Preimage    []byte
-	ExpiresAt   time.Time
 }

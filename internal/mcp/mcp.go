@@ -128,6 +128,101 @@ func rpcOK(id json.RawMessage, result any) Response {
 	return Response{JSONRPC: "2.0", ID: id, Result: result}
 }
 
+// toolErrorResult returns an MCP tools/call payload with isError: true so clients surface
+// invoice/auth details in visible tool content (not only JSON-RPC error.data).
+func toolErrorResult(slug, msg string, extra map[string]any) map[string]any {
+	text := buildToolErrorText(slug, msg, extra)
+	data := map[string]any{"error_slug": slug}
+	for k, v := range extra {
+		data[k] = v
+	}
+	return map[string]any{
+		"content": []map[string]any{
+			{"type": "text", "text": text},
+		},
+		"isError":           true,
+		"structuredContent": data,
+	}
+}
+
+func buildToolErrorText(slug, msg string, extra map[string]any) string {
+	msg = strings.TrimSpace(msg)
+	if slug == "payment_required" && extra != nil {
+		var b strings.Builder
+		fmt.Fprintf(&b, "payment_required")
+		if msg != "" {
+			fmt.Fprintf(&b, "\n\n%s\n", msg)
+		}
+		appendIf := func(label string, key string) {
+			s := stringifyExtraVal(extra[key])
+			if s == "" {
+				return
+			}
+			fmt.Fprintf(&b, "\n%s:\n%s\n", label, s)
+		}
+		appendIf("BOLT11 invoice (copy this full string)", "invoice")
+		appendIf("Macaroon", "macaroon")
+		appendIf("payment_hash (hex)", "payment_hash")
+		appendIf("agent_id", "agent_id")
+		appendIf("expires_at", "expires_at")
+		if nf := stringifyExtraVal(extra["retry_authorization_format"]); nf != "" {
+			fmt.Fprintf(&b, "\nRetry Authorization format:\n%s\n", nf)
+		}
+		if ns := stringifyExtraVal(extra["next_step"]); ns != "" {
+			fmt.Fprintf(&b, "\nNext step:\n%s\n", ns)
+		}
+		fmt.Fprintf(&b, "\nAfter paying the invoice, retry sandbox_create and include on every MCP POST:\n"+
+			`Authorization: L402 <macaroon>:<preimage_hex>`+"\n"+
+			"Use macaroon from above and preimage from your Lightning payment (32-byte preimage as lowercase hex).\n")
+		return strings.TrimRight(strings.TrimSpace(b.String()), "\n")
+	}
+	switch {
+	case slug != "" && msg != "":
+		return fmt.Sprintf("%s: %s", slug, msg)
+	case msg != "":
+		return msg
+	default:
+		return slug
+	}
+}
+
+func stringifyExtraVal(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case json.Number:
+		return t.String()
+	case float64:
+		return fmt.Sprintf("%v", t)
+	case float32:
+		return fmt.Sprintf("%v", t)
+	case int:
+		return fmt.Sprintf("%d", t)
+	case int64:
+		return fmt.Sprintf("%d", t)
+	case uint64:
+		return fmt.Sprintf("%d", t)
+	case bool:
+		return fmt.Sprintf("%t", t)
+	default:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Sprintf("%v", t)
+		}
+		s := strings.TrimSpace(string(b))
+		if strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) {
+			var decoded string
+			if err := json.Unmarshal(b, &decoded); err == nil {
+				return strings.TrimSpace(decoded)
+			}
+		}
+		return s
+	}
+}
+
 func slugFromPaymentClass(class string) string {
 	if class == "" {
 		return "payment_error"

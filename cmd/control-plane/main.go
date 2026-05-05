@@ -58,20 +58,10 @@ func main() {
 
 	var paySvc *payment.Service
 	var payIface payment.Payment
-	var mint auth.Bolt11Mint
 	if lnBot != nil {
-		issuer := &payment.LNBotInvoiceIssuer{Client: lnBot, Net: net}
-		pool := payment.NewInvoicePool(issuer)
-		pool.SetSizing(cfg.InvoicePoolTarget, cfg.InvoicePoolRefillBelow)
-		go pool.Run(ctx)
-
-		paySvc = payment.NewService(lnBot, pool, nil, st)
+		paySvc = payment.NewService(lnBot, nil, st)
 		paySvc.Chain = net
 		payIface = paySvc
-		mint = paySvc
-
-		deps := &payment.DepositSettlerBackground{Store: st, LNBot: lnBot, Interval: 15 * time.Second}
-		go deps.Run(ctx)
 	}
 
 	keyCache, err := auth.NewAPIKeyCache(st, cfg.APIKeyCacheSize)
@@ -87,6 +77,16 @@ func main() {
 		Cfg:    cfg,
 	}
 
+	if lnBot != nil {
+		deps := &payment.DepositSettlerBackground{
+			Store:            st,
+			LNBot:            lnBot,
+			Interval:         15 * time.Second,
+			OnSandboxSettled: orchestrator.SandboxDepositObserver(orch, st, cfg),
+		}
+		go deps.Run(ctx)
+	}
+
 	handler := api.NewRouter(api.RouterDeps{
 		Cfg:     cfg,
 		Store:   st,
@@ -94,7 +94,7 @@ func main() {
 		PaySvc:  paySvc,
 		Orch:    orch,
 		APIKeys: keyCache,
-	}, mint, cfg.L402RootKey)
+	})
 
 	addr := cfg.ListenHTTP
 	if addr == "" {

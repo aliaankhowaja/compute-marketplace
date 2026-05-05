@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -74,6 +75,13 @@ func (s *Store) InsertPendingDeposit(ctx context.Context, agentID uuid.UUID, pay
 	return err
 }
 
+// InsertPendingSandboxDeposit records a BOLT11 deposit awaiting settlement that funds a single sandbox prepay row.
+func (s *Store) InsertPendingSandboxDeposit(ctx context.Context, sandboxID uuid.UUID, payHash []byte, bolt11 string, amountMsats int64) error {
+	_, err := s.Tx.Exec(ctx, `INSERT INTO public.pending_deposits (agent_id, sandbox_id, payment_hash, bolt11_invoice, amount_msats, status) VALUES (NULL,$1,$2,$3,$4,'pending')`,
+		sandboxID, payHash, bolt11, amountMsats)
+	return err
+}
+
 // DepositWireStatus is returned by GET /wallet/deposit status.
 type DepositWireStatus struct {
 	Status        string  // pending | settled | expired | failed
@@ -125,10 +133,11 @@ func (s *Store) GetDepositStatusForAgent(ctx context.Context, agentID uuid.UUID,
 	return &row, nil
 }
 
-// PendingDepositRow is a pending manual deposit.
+// PendingDepositRow is a pending manual deposit. Either AgentID or SandboxID is set; the other is nil.
 type PendingDepositRow struct {
 	ID        uuid.UUID
-	AgentID   uuid.UUID
+	AgentID   *uuid.UUID
+	SandboxID *uuid.UUID
 	PayHash   []byte
 	Invoice   string
 	Amount    int64
@@ -139,7 +148,7 @@ func (s *Store) ListPendingDepositRows(ctx context.Context, limit int) ([]Pendin
 	if limit <= 0 {
 		limit = 20
 	}
-	rows, err := s.Tx.Query(ctx, `SELECT id, agent_id, payment_hash, bolt11_invoice, amount_msats, created_at FROM public.pending_deposits WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1`, limit)
+	rows, err := s.Tx.Query(ctx, `SELECT id, agent_id, sandbox_id, payment_hash, bolt11_invoice, amount_msats, created_at FROM public.pending_deposits WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +156,7 @@ func (s *Store) ListPendingDepositRows(ctx context.Context, limit int) ([]Pendin
 	var out []PendingDepositRow
 	for rows.Next() {
 		var r PendingDepositRow
-		if err := rows.Scan(&r.ID, &r.AgentID, &r.PayHash, &r.Invoice, &r.Amount, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.AgentID, &r.SandboxID, &r.PayHash, &r.Invoice, &r.Amount, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -163,6 +172,9 @@ func (s *Store) MarkDepositSettled(ctx context.Context, id uuid.UUID) error {
 // SettlePendingDeposit credits the agent, records top_up_intervals, and marks the deposit settled (single transaction).
 // If the top-up row already exists (idempotent replay), only ensures pending row is marked settled.
 func (s *Store) SettlePendingDeposit(ctx context.Context, dep PendingDepositRow, preimage []byte, bolt11 string) error {
+	if dep.AgentID == nil {
+		return fmt.Errorf("agent-scoped settle requires agent_id")
+	}
 	tx, err := s.Tx.Begin(ctx)
 	if err != nil {
 		return err
@@ -173,12 +185,12 @@ func (s *Store) SettlePendingDeposit(ctx context.Context, dep PendingDepositRow,
 	ct, err := tx.Exec(ctx, `INSERT INTO public.top_up_intervals (agent_id, idempotency_key, amount_msats, payment_hash, preimage, bolt12_invoice, status, settled_at)
 		VALUES ($1,$2,$3,$4,$5,$6,'settled', now())
 		ON CONFLICT (idempotency_key) DO NOTHING`,
-		dep.AgentID, idem, dep.Amount, dep.PayHash, preimage, bolt11)
+		*dep.AgentID, idem, dep.Amount, dep.PayHash, preimage, bolt11)
 	if err != nil {
 		return err
 	}
 	if ct.RowsAffected() > 0 {
-		if _, err := tx.Exec(ctx, `UPDATE public.agents SET balance_msats = balance_msats + $2 WHERE id = $1`, dep.AgentID, dep.Amount); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE public.agents SET balance_msats = balance_msats + $2 WHERE id = $1`, *dep.AgentID, dep.Amount); err != nil {
 			return err
 		}
 	}
@@ -186,6 +198,51 @@ func (s *Store) SettlePendingDeposit(ctx context.Context, dep PendingDepositRow,
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// SettleSandboxDeposit credits a per-sandbox prepaid balance, clears the sandbox pending-invoice fields,
+// and marks the deposit row settled. Idempotent on payment_hash via the unique pending-row + status guard.
+// Returns the new prepaid balance after credit.
+func (s *Store) SettleSandboxDeposit(ctx context.Context, dep PendingDepositRow, preimage []byte, bolt11 string) (newBalanceMsats int64, err error) {
+	if dep.SandboxID == nil {
+		return 0, fmt.Errorf("sandbox-scoped settle requires sandbox_id")
+	}
+	tx, err := s.Tx.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ct, err := tx.Exec(ctx, `UPDATE public.pending_deposits SET status = 'settled', settled_at = now() WHERE id = $1 AND status = 'pending'`, dep.ID)
+	if err != nil {
+		return 0, err
+	}
+	if ct.RowsAffected() == 0 {
+		// Already settled — return current balance without crediting again.
+		_ = tx.QueryRow(ctx, `SELECT COALESCE(prepaid_balance_msats, 0) FROM public.sandboxes WHERE id = $1`, *dep.SandboxID).Scan(&newBalanceMsats)
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return newBalanceMsats, nil
+	}
+	if err := tx.QueryRow(ctx,
+		`UPDATE public.sandboxes
+		   SET prepaid_balance_msats = prepaid_balance_msats + $2,
+		       pending_invoice_bolt11 = CASE WHEN pending_invoice_payment_hash = $3 THEN NULL ELSE pending_invoice_bolt11 END,
+		       pending_invoice_payment_hash = CASE WHEN pending_invoice_payment_hash = $3 THEN NULL ELSE pending_invoice_payment_hash END,
+		       pending_invoice_amount_msats = CASE WHEN pending_invoice_payment_hash = $3 THEN NULL ELSE pending_invoice_amount_msats END,
+		       pending_invoice_expires_at = CASE WHEN pending_invoice_payment_hash = $3 THEN NULL ELSE pending_invoice_expires_at END
+		 WHERE id = $1
+		 RETURNING prepaid_balance_msats`,
+		*dep.SandboxID, dep.Amount, dep.PayHash).Scan(&newBalanceMsats); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	_ = preimage
+	_ = bolt11
+	return newBalanceMsats, nil
 }
 
 func (s *Store) ListCreditTransactionsByUser(ctx context.Context, userID uuid.UUID, limit int) ([]CreditTxSummary, error) {

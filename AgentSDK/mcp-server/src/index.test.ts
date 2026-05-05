@@ -1,6 +1,37 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 
-import { forwardRpcLine } from "./proxy.js";
+import { buildAuthHeaders, forwardRpcLine } from "./proxy.js";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe("buildAuthHeaders", () => {
+  it("omits Authorization when no API key and no captured sandbox_token", () => {
+    vi.stubEnv("SOCKT_API_KEY", "");
+    const h = buildAuthHeaders();
+    expect(h.has("Authorization")).toBe(false);
+    expect(h.get("Content-Type")).toBe("application/json");
+  });
+
+  it("uses SOCKT_API_KEY when present", () => {
+    vi.stubEnv("SOCKT_API_KEY", "sockt_live_abc");
+    const h = buildAuthHeaders();
+    expect(h.get("Authorization")).toBe("Bearer sockt_live_abc");
+  });
+
+  it("uses captured sandbox_token when no API key", () => {
+    vi.stubEnv("SOCKT_API_KEY", "");
+    const h = buildAuthHeaders({ sandboxToken: "sbx_test" });
+    expect(h.get("Authorization")).toBe("Bearer sbx_test");
+  });
+
+  it("API key beats sandbox_token", () => {
+    vi.stubEnv("SOCKT_API_KEY", "sockt_live_abc");
+    const h = buildAuthHeaders({ sandboxToken: "sbx_test" });
+    expect(h.get("Authorization")).toBe("Bearer sockt_live_abc");
+  });
+});
 
 describe("forwardRpcLine", () => {
   it("posts JSON-RPC body and captures Mcp-Session-Id", async () => {

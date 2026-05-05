@@ -51,7 +51,7 @@ def _slug_maps_to_exc(slug: str, msg: str, status: int) -> Exception | None:
         return NoCapacityError(msg, slug=s or None, status_code=status)
     if s in {"sandbox_not_running", "paused", "terminated"}:
         return SandboxNotRunningError(msg, slug=s or None, status_code=status)
-    if s in {"unauthorized", "forbidden", "invalid_l402_macaroon"}:
+    if s in {"unauthorized", "forbidden"}:
         return AuthenticationError(msg, slug=s or None, status_code=status)
     if (
         "topup" in s
@@ -67,13 +67,16 @@ def _slug_maps_to_exc(slug: str, msg: str, status: int) -> Exception | None:
 
 @dataclass
 class ComputeClient:
-    """HTTP client for Sockt control plane."""
+    """HTTP client for Sockt control plane.
+
+    REST is credits-only (API key). Lightning sandboxes are managed via MCP, where the
+    sandbox-scoped bearer token (`sbx_…`) is captured automatically by the MCP proxy.
+    """
 
     api_url: str
     api_key: str | None = None
     supabase_jwt: str | None = None
-    l402_authorization: str | None = None
-    agent_id_header: str | None = None
+    sandbox_token: str | None = None
     timeout_secs: float = 120.0
     data_jwt_refresh_threshold_secs: int = 600
     transport: Any | None = None
@@ -102,24 +105,18 @@ class ComputeClient:
         h: dict[str, str] = {"Accept": "application/json", "Content-Type": "application/json"}
         key = self.api_key or os.environ.get("SOCKT_API_KEY")
         jwt = self.supabase_jwt or os.environ.get("SOCKT_SUPABASE_JWT") or os.environ.get("SOCKT_USER_JWT")
-        l402 = self.l402_authorization or os.environ.get("SOCKT_L402_AUTHORIZATION")
-        agent_id = self.agent_id_header or os.environ.get("SOCKT_AGENT_ID")
+        sbx = self.sandbox_token or os.environ.get("SOCKT_SANDBOX_TOKEN")
 
         if key:
             h["Authorization"] = f"Bearer {key.strip()}"
-        elif l402:
-            h["Authorization"] = l402.strip()
-            if agent_id:
-                h["X-Agent-Id"] = agent_id.strip()
+        elif sbx:
+            h["Authorization"] = f"Bearer {sbx.strip()}"
         elif jwt:
             h["Authorization"] = f"Bearer {jwt.strip()}"
         else:
             raise AuthenticationError(
-                "Set api_key, supabase_jwt, or l402_authorization (or SOCKT_API_KEY / SOCKT_USER_JWT / SOCKT_L402_AUTHORIZATION).",
+                "Set api_key, supabase_jwt, or sandbox_token (or SOCKT_API_KEY / SOCKT_USER_JWT / SOCKT_SANDBOX_TOKEN).",
             )
-
-        if agent_id and "X-Agent-Id" not in h:
-            h["X-Agent-Id"] = agent_id.strip()
         return h
 
     def _request_cp(self, method: str, path: str, **kw: Any) -> httpx.Response:
@@ -173,43 +170,6 @@ class ComputeClient:
         self._raise_for_cp(resp)
         data = resp.json()
         return data if isinstance(data, list) else []
-
-    def get_wallet_balance(self) -> dict[str, Any]:
-        """Requires Supabase user JWT (`SOCKT_USER_JWT` / `supabase_jwt`)."""
-
-        resp = self._request_cp("GET", "/v1/wallet/balance")
-        self._raise_for_cp(resp)
-        data = resp.json()
-        return dict(data) if isinstance(data, dict) else {}
-
-    def wallet_deposit(
-        self,
-        *,
-        amount_sats: int | None = None,
-        idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        """Mint a BOLT11 deposit invoice (prepaid balance). Requires user JWT."""
-
-        body: dict[str, Any] = {}
-        if amount_sats is not None:
-            body["amount_sats"] = int(amount_sats)
-        if idempotency_key:
-            body["idempotency_key"] = idempotency_key.strip()
-        resp = self._request_cp("POST", "/v1/wallet/deposit", json=body or {})
-        self._raise_for_cp(resp)
-        data = resp.json()
-        return dict(data) if isinstance(data, dict) else {}
-
-    def wallet_deposit_status(self, payment_hash_hex: str) -> dict[str, Any]:
-        """Poll settlement for a deposit by 32-byte payment hash (hex)."""
-
-        h = (payment_hash_hex or "").strip()
-        if not h:
-            raise ValueError("payment_hash_hex required")
-        resp = self._request_cp("GET", f"/v1/wallet/deposits/{h}")
-        self._raise_for_cp(resp)
-        data = resp.json()
-        return dict(data) if isinstance(data, dict) else {}
 
     # --- internals ---
 
@@ -332,6 +292,7 @@ class Sandbox:
     data_jwt: str
     data_jwt_expires_at: datetime | None
     consumed_msats: int = 0
+    sandbox_token: str | None = None
     raw: Mapping[str, Any] | None = None
     _client: ComputeClient | None = None
 
@@ -355,7 +316,7 @@ class Sandbox:
         command: str,
         *,
         timeout_ms: int = 30_000,
-        working_dir: str = "/workspace",
+        working_dir: str = ".",
     ) -> ExecResult:
         assert self._client is not None
         self._require_running()
@@ -402,7 +363,7 @@ class Sandbox:
             return b64encode_utf8(blob), meta
         return blob, meta
 
-    def list_files(self, path: str = "/workspace", **_ignored: Any) -> list[FileEntry]:
+    def list_files(self, path: str = ".", **_ignored: Any) -> list[FileEntry]:
         """Lists a single directory (`dir` query). Recursive listing is not supported by runtime MVP."""
 
         assert self._client is not None
@@ -451,15 +412,14 @@ class Sandbox:
         resp = self._client._request_cp("DELETE", f"/v1/sandbox/{self.id}")
         self._client._raise_for_cp(resp)
 
-    def extend_balance(self, *, cents: int | None = None, sats: int | None = None) -> dict[str, Any]:
-        """Backend `/extend-balance` JSON field is `cents`; lightning path reuses that field for sat amounts."""
+    def extend_balance(self, *, cents: int | None = None) -> dict[str, Any]:
+        """Allocate more credits for this sandbox (credits-only). Lightning sandboxes top up by paying the
+        BOLT11 surfaced in `sandbox_status.pending_invoice` via MCP — no REST call required."""
 
         assert self._client is not None
         body: dict[str, Any] = {}
         if cents is not None:
             body["cents"] = cents
-        elif sats is not None:
-            body["cents"] = sats
         resp = self._client._request_cp("POST", f"/v1/sandbox/{self.id}/extend-balance", json=body)
         self._client._raise_for_cp(resp)
         data = resp.json()
@@ -498,6 +458,7 @@ def sandbox_from_row(client: ComputeClient, row: Mapping[str, Any]) -> Sandbox:
     proxy = pick(row, "PodProxyURL", "pod_proxy_url")
     endpoint = derive_data_endpoint(str(proxy).strip() if proxy else None, pod_s)
 
+    sbx_tok = pick(row, "SandboxToken", "sandbox_token")
     return Sandbox(
         id=sandbox_uuid,
         status=str(pick(row, "Status", "status") or ""),
@@ -510,6 +471,7 @@ def sandbox_from_row(client: ComputeClient, row: Mapping[str, Any]) -> Sandbox:
         data_jwt="",
         data_jwt_expires_at=None,
         consumed_msats=int(pick(row, "ConsumedMsats", "consumed_msats") or 0),
+        sandbox_token=str(sbx_tok).strip() if sbx_tok else None,
         raw=dict(row),
         _client=client,
     )

@@ -35,8 +35,8 @@ export interface ComputeClientOptions {
   apiUrl: string;
   apiKey?: string;
   supabaseJwt?: string;
-  l402Authorization?: string;
-  agentId?: string;
+  /** Sandbox-scoped bearer (`sbx_…`) returned by `sandbox_create` over MCP. */
+  sandboxToken?: string;
   timeoutMs?: number;
   dataJwtRefreshThresholdSecs?: number;
 }
@@ -64,7 +64,7 @@ function mapSlug(slug: string, msg: string, status: number): Error | undefined {
   if (["sandbox_not_running", "paused", "terminated"].includes(s)) {
     return new SandboxNotRunningError(msg, { slug: s || undefined, statusCode: status });
   }
-  if (["unauthorized", "forbidden", "invalid_l402_macaroon"].includes(s)) {
+  if (["unauthorized", "forbidden"].includes(s)) {
     return new AuthenticationError(msg, { slug: s || undefined, statusCode: status });
   }
   if (
@@ -110,8 +110,7 @@ export class ComputeClient {
       this.opts.supabaseJwt ??
       process.env.SOCKT_SUPABASE_JWT ??
       process.env.SOCKT_USER_JWT;
-    const l402 = this.opts.l402Authorization ?? process.env.SOCKT_L402_AUTHORIZATION;
-    const agentId = this.opts.agentId ?? process.env.SOCKT_AGENT_ID;
+    const sbx = this.opts.sandboxToken ?? process.env.SOCKT_SANDBOX_TOKEN;
 
     const h = new Headers();
     h.set("Accept", "application/json");
@@ -119,18 +118,14 @@ export class ComputeClient {
 
     if (key) {
       h.set("Authorization", `Bearer ${key.trim()}`);
-    } else if (l402) {
-      h.set("Authorization", l402.trim());
-      if (agentId) h.set("X-Agent-Id", agentId.trim());
+    } else if (sbx) {
+      h.set("Authorization", `Bearer ${sbx.trim()}`);
     } else if (jwt) {
       h.set("Authorization", `Bearer ${jwt.trim()}`);
     } else {
       throw new AuthenticationError(
-        "Set apiKey, supabaseJwt, or l402Authorization (or SOCKT_* env vars).",
+        "Set apiKey, supabaseJwt, or sandboxToken (or SOCKT_API_KEY / SOCKT_USER_JWT / SOCKT_SANDBOX_TOKEN).",
       );
-    }
-    if (agentId && !h.has("X-Agent-Id")) {
-      h.set("X-Agent-Id", agentId.trim());
     }
     return h;
   }
@@ -191,33 +186,6 @@ export class ComputeClient {
     if (!resp.ok) await readError(resp);
     const data = await resp.json();
     return Array.isArray(data) ? data : [];
-  }
-
-  async getWalletBalance(): Promise<Record<string, unknown>> {
-    const resp = await this.controlPlaneFetch("GET", "/v1/wallet/balance");
-    if (!resp.ok) await readError(resp);
-    return (await resp.json()) as Record<string, unknown>;
-  }
-
-  async walletDeposit(body?: {
-    amountSats?: number;
-    idempotencyKey?: string;
-  }): Promise<Record<string, unknown>> {
-    const payload: Record<string, unknown> = {};
-    if (body?.amountSats != null) payload.amount_sats = body.amountSats;
-    if (body?.idempotencyKey) payload.idempotency_key = body.idempotencyKey;
-    const resp = await this.controlPlaneFetch("POST", "/v1/wallet/deposit", {
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) await readError(resp);
-    return (await resp.json()) as Record<string, unknown>;
-  }
-
-  async walletDepositStatus(paymentHashHex: string): Promise<Record<string, unknown>> {
-    const hex = encodeURIComponent(paymentHashHex.trim());
-    const resp = await this.controlPlaneFetch("GET", `/v1/wallet/deposits/${hex}`);
-    if (!resp.ok) await readError(resp);
-    return (await resp.json()) as Record<string, unknown>;
   }
 
   /** @internal */
@@ -363,6 +331,7 @@ export interface SandboxInit {
   dataJwt: string;
   dataJwtExpiresAt: Date | null;
   consumedMsats: number;
+  sandboxToken: string | null;
   raw: Record<string, unknown> | null;
 }
 
@@ -380,6 +349,7 @@ export class Sandbox {
   dataJwt: string;
   dataJwtExpiresAt: Date | null;
   consumedMsats: number;
+  sandboxToken: string | null;
   raw: Record<string, unknown> | null;
   private readonly client: ComputeClient;
 
@@ -396,6 +366,7 @@ export class Sandbox {
     this.dataJwt = init.dataJwt;
     this.dataJwtExpiresAt = init.dataJwtExpiresAt;
     this.consumedMsats = init.consumedMsats;
+    this.sandboxToken = init.sandboxToken;
     this.raw = init.raw;
   }
 
@@ -426,7 +397,7 @@ export class Sandbox {
     const sec = Math.max(1, Math.min(300, Math.floor(timeoutMs / 1000)));
     const body = {
       argv: ["/bin/bash", "-lc", command],
-      cwd: opts?.workingDir ?? "/workspace",
+      cwd: opts?.workingDir ?? ".",
       timeout_seconds: sec,
     };
     const r = await this.client.dataRequest(this, "POST", `/sandbox/${this.id}/exec`, {
@@ -488,7 +459,7 @@ export class Sandbox {
     return { content: blob.toString("utf8"), meta };
   }
 
-  async listFiles(dirPath = "/workspace"): Promise<FileEntry[]> {
+  async listFiles(dirPath = "."): Promise<FileEntry[]> {
     this.requireRunning();
     const q = new URLSearchParams({ dir: dirPath });
     const r = await this.client.dataRequest(this, "GET", `/sandbox/${this.id}/files/list?${q}`);
@@ -533,10 +504,9 @@ export class Sandbox {
     if (!resp.ok) await readError(resp);
   }
 
-  async extendBalance(opts?: { cents?: number; sats?: number }): Promise<Record<string, unknown>> {
+  async extendBalance(opts?: { cents?: number }): Promise<Record<string, unknown>> {
     const body: Record<string, number> = {};
     if (opts?.cents != null) body.cents = opts.cents;
-    else if (opts?.sats != null) body.cents = opts.sats;
     const resp = await this.client.controlPlaneFetch("POST", `/v1/sandbox/${this.id}/extend-balance`, {
       body: JSON.stringify(body),
     });
@@ -581,6 +551,9 @@ function sandboxFromRow(client: ComputeClient, row: Record<string, unknown>): Sa
     podId,
   ).replace(/\/+$/, "");
 
+  const sbxRaw = pick(row, "SandboxToken", "sandbox_token");
+  const sandboxToken =
+    sbxRaw != null && String(sbxRaw).trim() ? String(sbxRaw).trim() : null;
   return new Sandbox(client, {
     id: String(sid),
     status: String(pick(row, "Status", "status") ?? ""),
@@ -593,6 +566,7 @@ function sandboxFromRow(client: ComputeClient, row: Record<string, unknown>): Sa
     dataJwt: "",
     dataJwtExpiresAt: null,
     consumedMsats: Number(pick(row, "ConsumedMsats", "consumed_msats") ?? 0),
+    sandboxToken,
     raw: { ...row },
   });
 }
