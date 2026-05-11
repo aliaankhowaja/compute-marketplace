@@ -3,3 +3,4 @@ vendor/
 runpod-reader-key.json
 .env.cp
 .env.rt
+.cursor/
