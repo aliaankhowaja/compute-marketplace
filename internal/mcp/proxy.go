@@ -29,7 +29,7 @@ func dataPlaneBase(sb *store.Sandbox) string {
 		return strings.TrimRight(strings.TrimSpace(*sb.PodProxyURL), "/")
 	}
 	if sb.PodID != nil && strings.TrimSpace(*sb.PodID) != "" {
-		return strings.TrimRight(orchestrator.RunPodProxyURL(*sb.PodID), "/")
+		return strings.TrimRight(orchestrator.RunPodProxyURL(nil, *sb.PodID), "/")
 	}
 	return ""
 }

@@ -32,9 +32,15 @@ type RunPodClient struct {
 }
 
 func NewRunPodClient(cfg *config.Control) *RunPodClient {
+	baseURL := strings.TrimRight(cfg.RunPodAPIURL, "/")
+	apiKey := cfg.RunPodAPIKey
+	if cfg.UsePodMock {
+		baseURL = strings.TrimRight(cfg.PodMockURL, "/") + "/v1"
+		apiKey = "mock"
+	}
 	return &RunPodClient{
-		BaseURL: strings.TrimRight(cfg.RunPodAPIURL, "/"),
-		APIKey:  cfg.RunPodAPIKey,
+		BaseURL: baseURL,
+		APIKey:  apiKey,
 		HTTP:    &http.Client{Timeout: 120 * time.Second},
 	}
 }
@@ -244,7 +250,7 @@ func (s *Service) CreateSandbox(ctx context.Context, sb *store.Sandbox, env map[
 	if err := s.Client.UpdatePodEnv(ctx, pid, env); err != nil {
 		return fmt.Errorf("runpod set env: %w", err)
 	}
-	proxy := fmt.Sprintf("https://%s-8443.proxy.runpod.net", pid)
+	proxy := RunPodProxyURL(s.Cfg, pid)
 	if err := s.Store.UpdateSandboxPod(ctx, sb.ID, strPtr(pid), strPtr(proxy), sb.NetworkVolumeID); err != nil {
 		return err
 	}
@@ -279,7 +285,7 @@ func (s *Service) ResumeSandbox(ctx context.Context, podID string, sandboxID uui
 	if err := s.Client.StartPod(ctx, podID); err != nil {
 		return err
 	}
-	proxy := RunPodProxyURL(podID)
+	proxy := RunPodProxyURL(s.Cfg, podID)
 	if err := s.waitForRuntime(ctx, proxy); err != nil {
 		return fmt.Errorf("runtime not ready after resume: %w", err)
 	}
@@ -294,10 +300,13 @@ func (s *Service) TerminateSandbox(ctx context.Context, podID string, sandboxID 
 	return s.Store.TerminateSandbox(ctx, sandboxID)
 }
 
-func RunPodProxyURL(podID string) string {
+func RunPodProxyURL(cfg *config.Control, podID string) string {
 	podID = strings.TrimSpace(podID)
 	if podID == "" {
 		return ""
+	}
+	if cfg != nil && cfg.UsePodMock {
+		return strings.TrimRight(cfg.PodMockURL, "/")
 	}
 	return fmt.Sprintf("https://%s-8443.proxy.runpod.net", podID)
 }

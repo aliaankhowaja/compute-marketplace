@@ -30,6 +30,9 @@ type Control struct {
 	RunPodTemplateGPUSmallID string
 	RunPodTemplateGPULargeID string
 
+	UsePodMock bool
+	PodMockURL string
+
 	// LightningNetwork is mainnet | testnet — used for BOLT11 decode / validation only (not node RPC).
 	LightningNetwork string
 
@@ -177,6 +180,7 @@ func Load() (*Control, error) {
 		RunPodTemplateCPUID:      strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_CPU_ID")),
 		RunPodTemplateGPUSmallID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_SMALL_ID")),
 		RunPodTemplateGPULargeID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_LARGE_ID")),
+		PodMockURL:               strings.TrimRight(envOrDefault("POD_MOCK_URL", "http://localhost:9090"), "/"),
 		LightningNetwork:         envOrDefault("LIGHTNING_NETWORK", envOrDefault("LND_NETWORK", "mainnet")),
 		LNBOTAPIBaseURL:          strings.TrimSpace(os.Getenv("LNBOT_API_BASE_URL")),
 		LNBOTAPIKey:              strings.TrimSpace(os.Getenv("LNBOT_API_KEY")),
@@ -188,6 +192,11 @@ func Load() (*Control, error) {
 	}
 
 	var err error
+	c.UsePodMock, err = parseBool("USE_POD_MOCK", false)
+	if err != nil {
+		return nil, err
+	}
+
 	if c.LNBOTAPIBaseURL == "" {
 		c.LNBOTAPIBaseURL = "https://api.ln.bot"
 	}

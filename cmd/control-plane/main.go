@@ -33,6 +33,9 @@ func main() {
 	if logLevel == "debug" {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
+	if cfg.UsePodMock {
+		slog.Info("pod_mock_enabled", "url", cfg.PodMockURL)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
