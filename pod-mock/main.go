@@ -27,12 +27,14 @@ func main() {
 		proxyHost = "localhost"
 	}
 
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
 	st := NewStore()
 	mux := NewRouter(st, dm, proxyHost)
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           mux,
+		Handler:           logRequests(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
