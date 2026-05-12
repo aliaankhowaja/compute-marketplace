@@ -82,6 +82,7 @@ type CreatePodRequest struct {
 	CPUFlavorIDs      []string `json:"cpuFlavorIds,omitempty"`
 	CPUFlavorPriority string   `json:"cpuFlavorPriority,omitempty"`
 	VCPUCount         int      `json:"vcpuCount,omitempty"`
+	MemoryInGb        int      `json:"memoryInGb,omitempty"`
 	GPUCount          int      `json:"gpuCount,omitempty"`
 	MinVCPUPerGPU     int      `json:"minVCPUPerGPU,omitempty"`
 	MinRAMPerGPU      int      `json:"minRAMPerGPU,omitempty"`
@@ -93,7 +94,7 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 		return CreatePodRequest{}, "", "", fmt.Errorf("config is nil")
 	}
 	switch strings.TrimSpace(strings.ToLower(tier)) {
-	case "nano", "micro":
+	case "nano":
 		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
 		if id == "" {
 			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
@@ -104,6 +105,21 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         1,
+			MemoryInGb:        2,
+		}, "sockt-cpu", "runpod_cpu", nil
+
+	case "micro":
+		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
+		}
+		return CreatePodRequest{
+			TemplateID:        id,
+			ComputeType:       "CPU",
+			CPUFlavorIDs:      []string{"cpu3c"},
+			CPUFlavorPriority: "availability",
+			VCPUCount:         2,
+			MemoryInGb:        4,
 		}, "sockt-cpu", "runpod_cpu", nil
 
 	case "standard":
@@ -117,6 +133,7 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         4,
+			MemoryInGb:        8,
 		}, "sockt-cpu", "runpod_cpu", nil
 
 	case "gpu_small":
@@ -128,7 +145,7 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			TemplateID:    id,
 			ComputeType:   "GPU",
 			GPUCount:      1,
-			MinVCPUPerGPU: 4,
+			MinVCPUPerGPU: 6,
 			MinRAMPerGPU:  16,
 		}, "sockt-gpu-small", "runpod_gpu", nil
 
@@ -141,8 +158,8 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			TemplateID:    id,
 			ComputeType:   "GPU",
 			GPUCount:      1,
-			MinVCPUPerGPU: 8,
-			MinRAMPerGPU:  80,
+			MinVCPUPerGPU: 6,
+			MinRAMPerGPU:  32,
 		}, "sockt-gpu-large", "runpod_gpu", nil
 
 	default:
@@ -306,7 +323,7 @@ func RunPodProxyURL(cfg *config.Control, podID string) string {
 		return ""
 	}
 	if cfg != nil && cfg.UsePodMock {
-		return strings.TrimRight(cfg.PodMockURL, "/")
+		return strings.TrimRight(cfg.PodMockURL, "/") + "/proxy/" + podID
 	}
 	return fmt.Sprintf("https://%s-8443.proxy.runpod.net", podID)
 }

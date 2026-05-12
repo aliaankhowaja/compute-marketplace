@@ -17,11 +17,13 @@ const (
 )
 
 type Pod struct {
-	ID        string
-	Name      string
-	Env       map[string]string
-	State     PodState
-	CreatedAt time.Time
+	ID          string
+	Name        string
+	Env         map[string]string
+	State       PodState
+	CreatedAt   time.Time
+	ContainerID string
+	HostPort    int
 }
 
 type Store struct {
@@ -33,14 +35,16 @@ func NewStore() *Store {
 	return &Store{pods: make(map[string]*Pod)}
 }
 
-func (s *Store) Create(name string, env map[string]string) *Pod {
+func (s *Store) Create(name string, env map[string]string, containerID string, hostPort int) *Pod {
 	id := randomID()
 	p := &Pod{
-		ID:        id,
-		Name:      name,
-		Env:       env,
-		State:     StateRunning,
-		CreatedAt: time.Now(),
+		ID:          id,
+		Name:        name,
+		Env:         env,
+		State:       StateRunning,
+		CreatedAt:   time.Now(),
+		ContainerID: containerID,
+		HostPort:    hostPort,
 	}
 	s.mu.Lock()
 	s.pods[id] = p
@@ -111,6 +115,16 @@ func (s *Store) Terminate(id string) error {
 	}
 	p.State = StateTerminated
 	return nil
+}
+
+func (s *Store) All() []*Pod {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*Pod, 0, len(s.pods))
+	for _, p := range s.pods {
+		out = append(out, p)
+	}
+	return out
 }
 
 func randomID() string {

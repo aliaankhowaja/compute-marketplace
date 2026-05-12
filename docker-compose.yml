@@ -1,0 +1,42 @@
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    ports:
+      - "8080:8080"
+    env_file: .env.cp
+    environment:
+      LISTEN_HTTP: "0.0.0.0:8080"
+      USE_POD_MOCK: "true"
+      POD_MOCK_URL: "http://pod-mock:9090"
+      CONTROL_PLANE_URL: "http://host.docker.internal:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      pod-mock:
+        condition: service_started
+
+  pod-mock:
+    build:
+      context: .
+      dockerfile: pod-mock/Dockerfile
+    ports:
+      - "9090:9090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      POD_MOCK_PORT: "9090"
+      POD_MOCK_RUNTIME_IMAGE: "sockt-runtime"
+      POD_MOCK_PORT_BASE: "18000"
+      POD_MOCK_PROXY_HOST: "host.docker.internal"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  runtime-image:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sockt-runtime
+    profiles:
+      - build-only
