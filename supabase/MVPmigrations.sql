@@ -1,9 +1,10 @@
--- sockt MVP schema + RLS (from MVPplans/DB.md)
--- Run in Supabase SQL Editor as one script; optionally wrap in BEGIN; ... COMMIT;
+-- sockt MVP schema (consolidated from all migrations)
+-- Run in Supabase SQL Editor as one script.
 -- Requires Supabase Auth (auth.users) for FK and signup trigger.
 
--- === supabase/migrations/20260503120001_users.sql ===
--- public.users: one row per dashboard user; id matches auth.users.id
+------------------------------------------------------------------------
+-- 1. users
+------------------------------------------------------------------------
 
 create table public.users (
   id uuid not null primary key references auth.users (id) on delete cascade,
@@ -16,21 +17,18 @@ create table public.users (
 
 create unique index users_email_idx on public.users using btree (email);
 
--- === supabase/migrations/20260503120002_agents_api_keys.sql ===
--- Lightning / L402 principals and hashed API keys for credit path
+------------------------------------------------------------------------
+-- 2. agents + api_keys
+------------------------------------------------------------------------
 
 create table public.agents (
   id uuid not null primary key default gen_random_uuid(),
-  jwt_sub uuid not null,
-  offer_type text not null
-    constraint agents_offer_type_check check (offer_type in ('bolt12', 'manual_bolt11')),
-  bolt12_offer text,
+  jwt_sub uuid,
   balance_msats bigint not null default 0
     constraint agents_balance_msats_check check (balance_msats >= -1000000),
   warning_level text not null default 'ok',
   created_at timestamp with time zone not null default now(),
-  constraint agents_jwt_sub_unique unique (jwt_sub),
-  constraint agents_bolt12_offer_unique unique (bolt12_offer)
+  constraint agents_jwt_sub_unique unique (jwt_sub)
 );
 
 create index agents_jwt_sub_idx on public.agents using btree (jwt_sub);
@@ -50,9 +48,9 @@ create table public.api_keys (
 create index api_keys_key_hash_idx on public.api_keys using btree (key_hash);
 create index api_keys_user_id_idx on public.api_keys using btree (user_id);
 
--- === supabase/migrations/20260503120003_tier_pricing_templates.sql ===
--- Reference pricing (seed placeholders — replace with real catalog before production)
--- and RunPod template catalog
+------------------------------------------------------------------------
+-- 3. tier_pricing
+------------------------------------------------------------------------
 
 create table public.tier_pricing (
   tier text not null primary key,
@@ -61,8 +59,6 @@ create table public.tier_pricing (
   updated_at timestamp with time zone not null default now()
 );
 
-comment on table public.tier_pricing is 'Placeholder rates from MVP migration; tune msats_per_second and usd_cents_per_second_x100 for production.';
-
 insert into public.tier_pricing (tier, msats_per_second, usd_cents_per_second_x100) values
   ('nano', 1, 1),
   ('micro', 5, 5),
@@ -70,19 +66,9 @@ insert into public.tier_pricing (tier, msats_per_second, usd_cents_per_second_x1
   ('gpu_small', 100, 100),
   ('gpu_large', 400, 400);
 
-create table public.templates (
-  id uuid not null primary key default gen_random_uuid(),
-  name text not null,
-  runpod_template_id text not null,
-  runtime text not null
-    constraint templates_runtime_check check (runtime in ('runpod_cpu', 'runpod_gpu')),
-  default_tier text not null references public.tier_pricing (tier) on update cascade on delete restrict,
-  created_at timestamp with time zone not null default now(),
-  constraint templates_name_unique unique (name)
-);
-
--- === supabase/migrations/20260503120004_sandboxes.sql ===
--- RunPod-backed sandboxes; Lightning (agent_id) or credits (user_id + api_key_id)
+------------------------------------------------------------------------
+-- 4. sandboxes
+------------------------------------------------------------------------
 
 create table public.sandboxes (
   id uuid not null primary key default gen_random_uuid(),
@@ -99,20 +85,32 @@ create table public.sandboxes (
   pod_id text,
   pod_proxy_url text,
   network_volume_id text,
+  consumed_msats bigint not null default 0,
+  sandbox_token text,
+  prepaid_balance_msats bigint not null default 0
+    constraint sandboxes_prepaid_balance_msats_check check (prepaid_balance_msats >= -1000000),
+  pending_invoice_bolt11 text,
+  pending_invoice_payment_hash bytea,
+  pending_invoice_amount_msats bigint,
+  pending_invoice_expires_at timestamptz,
   created_at timestamp with time zone not null default now(),
   terminated_at timestamp with time zone,
   constraint sandboxes_billing_consistency check (
     (
       billing_method = 'lightning'
-      and agent_id is not null
       and user_id is null
       and api_key_id is null
+      and (
+        (agent_id is not null and sandbox_token is null)
+        or (agent_id is null and sandbox_token is not null)
+      )
     )
     or (
       billing_method = 'credits'
       and agent_id is null
       and user_id is not null
       and api_key_id is not null
+      and sandbox_token is null
     )
   )
 );
@@ -120,9 +118,15 @@ create table public.sandboxes (
 create index sandboxes_user_id_idx on public.sandboxes using btree (user_id);
 create index sandboxes_agent_id_idx on public.sandboxes using btree (agent_id);
 create index sandboxes_api_key_id_idx on public.sandboxes using btree (api_key_id);
+create unique index sandboxes_sandbox_token_uniq
+  on public.sandboxes (sandbox_token) where sandbox_token is not null;
+create index sandboxes_pending_invoice_payment_hash_idx
+  on public.sandboxes (pending_invoice_payment_hash)
+  where pending_invoice_payment_hash is not null;
 
--- === supabase/migrations/20260503120005_billing_credit_topups.sql ===
--- Lightning metering, credit ledger, BOLT12 top-ups, manual BOLT11 deposits
+------------------------------------------------------------------------
+-- 5. billing_intervals, credit_transactions, top_up_intervals, pending_deposits
+------------------------------------------------------------------------
 
 create table public.billing_intervals (
   id uuid not null primary key default gen_random_uuid(),
@@ -136,7 +140,6 @@ create table public.billing_intervals (
 
 create index billing_intervals_sandbox_created_idx
   on public.billing_intervals using btree (sandbox_id, created_at desc);
-
 create index billing_intervals_agent_idx on public.billing_intervals using btree (agent_id);
 
 create table public.credit_transactions (
@@ -154,7 +157,6 @@ create table public.credit_transactions (
 
 create index credit_tx_user_created_idx
   on public.credit_transactions using btree (user_id, created_at desc);
-
 create index credit_tx_type_idx on public.credit_transactions using btree (type);
 
 create table public.top_up_intervals (
@@ -173,25 +175,32 @@ create table public.top_up_intervals (
 
 create index top_up_agent_requested_idx
   on public.top_up_intervals using btree (agent_id, requested_at desc);
-
 create index top_up_payment_hash_idx on public.top_up_intervals using btree (payment_hash);
 
 create table public.pending_deposits (
   id uuid not null primary key default gen_random_uuid(),
-  agent_id uuid not null references public.agents (id) on delete restrict,
+  agent_id uuid references public.agents (id) on delete restrict,
+  sandbox_id uuid references public.sandboxes(id) on delete cascade,
   payment_hash bytea not null,
   bolt11_invoice text not null,
   amount_msats bigint not null,
   status text not null default 'pending',
   created_at timestamp with time zone not null default now(),
   settled_at timestamp with time zone,
-  constraint pending_deposits_payment_hash_unique unique (payment_hash)
+  constraint pending_deposits_payment_hash_unique unique (payment_hash),
+  constraint pending_deposits_owner_check check (
+    (agent_id is not null and sandbox_id is null)
+    or (agent_id is null and sandbox_id is not null)
+  )
 );
 
 create index pending_deposits_agent_idx on public.pending_deposits using btree (agent_id);
+create index pending_deposits_sandbox_id_idx
+  on public.pending_deposits (sandbox_id) where sandbox_id is not null;
 
--- === supabase/migrations/20260503120006_audit_log.sql ===
--- Append-only audit trail (dashboard reads primarily via control plane)
+------------------------------------------------------------------------
+-- 6. audit_log
+------------------------------------------------------------------------
 
 create table public.audit_log (
   id uuid not null primary key default gen_random_uuid(),
@@ -207,69 +216,37 @@ create table public.audit_log (
 
 create index audit_log_created_idx on public.audit_log using btree (created_at desc);
 
--- === supabase/migrations/20260503120007_rls.sql ===
--- RLS on all public MVP tables; dashboard SELECT-only where specified in DB.md
+------------------------------------------------------------------------
+-- 7. RLS
+------------------------------------------------------------------------
 
 alter table public.users enable row level security;
-
-create policy users_select_own
-  on public.users
-  for select
-  to authenticated
-  using (id = auth.uid());
+create policy users_select_own on public.users for select to authenticated using (id = auth.uid());
 
 alter table public.agents enable row level security;
 
 alter table public.api_keys enable row level security;
-
-create policy api_keys_select_own
-  on public.api_keys
-  for select
-  to authenticated
-  using (user_id = auth.uid());
+create policy api_keys_select_own on public.api_keys for select to authenticated using (user_id = auth.uid());
+create policy api_keys_insert_own on public.api_keys for insert to authenticated with check (user_id = auth.uid());
+create policy api_keys_update_own on public.api_keys for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
 alter table public.sandboxes enable row level security;
-
-create policy sandboxes_select_own
-  on public.sandboxes
-  for select
-  to authenticated
-  using (user_id = auth.uid());
+create policy sandboxes_select_own on public.sandboxes for select to authenticated using (user_id = auth.uid());
 
 alter table public.tier_pricing enable row level security;
-
-create policy tier_pricing_select_all
-  on public.tier_pricing
-  for select
-  to anon, authenticated
-  using (true);
-
-alter table public.templates enable row level security;
-
-create policy templates_select_all
-  on public.templates
-  for select
-  to anon, authenticated
-  using (true);
+create policy tier_pricing_select_all on public.tier_pricing for select to anon, authenticated using (true);
 
 alter table public.billing_intervals enable row level security;
-
 alter table public.credit_transactions enable row level security;
-
-create policy credit_transactions_select_own
-  on public.credit_transactions
-  for select
-  to authenticated
-  using (user_id = auth.uid());
+create policy credit_transactions_select_own on public.credit_transactions for select to authenticated using (user_id = auth.uid());
 
 alter table public.top_up_intervals enable row level security;
-
 alter table public.pending_deposits enable row level security;
-
 alter table public.audit_log enable row level security;
 
--- === supabase/migrations/20260503120008_auth_user_sync.sql ===
--- Sync public.users on Auth signup (failure blocks signup — test in staging)
+------------------------------------------------------------------------
+-- 8. Auth user sync trigger
+------------------------------------------------------------------------
 
 create or replace function public.handle_new_user()
 returns trigger
@@ -288,9 +265,3 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row
   execute procedure public.handle_new_user();
-
--- === supabase/migrations/20260505120000_agents_anonymous.sql ===
--- Allow Lightning agents created via MCP anonymous L402 (no Supabase user linkage yet).
-
-alter table public.agents alter column jwt_sub drop not null;
-
