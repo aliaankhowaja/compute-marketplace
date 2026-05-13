@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,10 +30,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	logLevel := strings.ToLower(cfg.LogLevel)
-	if logLevel == "debug" {
-		slog.SetLogLoggerLevel(slog.LevelDebug)
+	var slogLevel slog.Level
+	if strings.ToLower(cfg.LogLevel) == "debug" {
+		slogLevel = slog.LevelDebug
 	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slogLevel})))
 	if cfg.UsePodMock {
 		slog.Info("pod_mock_enabled", "url", cfg.PodMockURL)
 	}
@@ -90,13 +92,26 @@ func main() {
 		go deps.Run(ctx)
 	}
 
+	var fileLogger func(http.Handler) http.Handler
+	if logPath := os.Getenv("HTTP_LOG_FILE"); logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			slog.Error("open http log file", "path", logPath, "err", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		var mu sync.Mutex
+		fileLogger = api.FileLogMiddleware(f, &mu, []string{"/healthz", "/health"})
+	}
+
 	handler := api.NewRouter(api.RouterDeps{
-		Cfg:     cfg,
-		Store:   st,
-		Pay:     payIface,
-		PaySvc:  paySvc,
-		Orch:    orch,
-		APIKeys: keyCache,
+		Cfg:        cfg,
+		Store:      st,
+		Pay:        payIface,
+		PaySvc:     paySvc,
+		Orch:       orch,
+		APIKeys:    keyCache,
+		FileLogger: fileLogger,
 	})
 
 	addr := cfg.ListenHTTP

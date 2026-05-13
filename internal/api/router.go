@@ -15,12 +15,13 @@ import (
 
 // RouterDeps wires handlers.
 type RouterDeps struct {
-	Cfg     *config.Control
-	Store   *store.Store
-	Pay     payment.Payment
-	PaySvc  *payment.Service
-	Orch    *orchestrator.Service
-	APIKeys *auth.APIKeyCache
+	Cfg        *config.Control
+	Store      *store.Store
+	Pay        payment.Payment
+	PaySvc     *payment.Service
+	Orch       *orchestrator.Service
+	APIKeys    *auth.APIKeyCache
+	FileLogger func(http.Handler) http.Handler
 }
 
 // NewRouter builds the HTTP mux.
@@ -98,7 +99,11 @@ func NewRouter(d RouterDeps) http.Handler {
 	// Stripe
 	mux.Handle("POST /internal/webhooks/stripe", http.HandlerFunc(handleStripeWebhook(d)))
 
-	return recoverReqIDLog(mux)
+	handler := requestLogger(recoverReqIDLog(mux))
+	if d.FileLogger != nil {
+		return d.FileLogger(handler)
+	}
+	return handler
 }
 
 func controlPlaneOrigin(d RouterDeps) string {

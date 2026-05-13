@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -30,11 +31,24 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 
 	st := NewStore()
-	mux := NewRouter(st, dm, proxyHost)
+	useDirectRoute := dm.Network() != ""
+	mux := NewRouter(st, dm, proxyHost, useDirectRoute)
+
+	var handler http.Handler = logRequests(mux)
+	if logPath := os.Getenv("HTTP_LOG_FILE"); logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			slog.Error("open http log file", "path", logPath, "err", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		var mu sync.Mutex
+		handler = FileLogMiddleware(f, &mu, []string{"/healthz"})(handler)
+	}
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           logRequests(mux),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

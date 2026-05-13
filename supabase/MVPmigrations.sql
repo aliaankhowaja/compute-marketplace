@@ -25,7 +25,7 @@ create table public.agents (
   id uuid not null primary key default gen_random_uuid(),
   jwt_sub uuid,
   balance_msats bigint not null default 0
-    constraint agents_balance_msats_check check (balance_msats >= -1000000),
+    constraint agents_balance_msats_check check (balance_msats >= -50000),
   warning_level text not null default 'ok',
   created_at timestamp with time zone not null default now(),
   constraint agents_jwt_sub_unique unique (jwt_sub)
@@ -88,7 +88,7 @@ create table public.sandboxes (
   consumed_msats bigint not null default 0,
   sandbox_token text,
   prepaid_balance_msats bigint not null default 0
-    constraint sandboxes_prepaid_balance_msats_check check (prepaid_balance_msats >= -1000000),
+    constraint sandboxes_prepaid_balance_msats_check check (prepaid_balance_msats >= -50000),
   pending_invoice_bolt11 text,
   pending_invoice_payment_hash bytea,
   pending_invoice_amount_msats bigint,

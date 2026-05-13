@@ -23,7 +23,7 @@ func (s *Store) InsertBillingIntervals(ctx context.Context, agentID uuid.UUID, r
 		if err != nil {
 			return err
 		}
-		if _, err := s.Tx.Exec(ctx, `UPDATE public.agents SET balance_msats = balance_msats - $2 WHERE id = $1 AND balance_msats - $2 >= -1000000`,
+		if _, err := s.Tx.Exec(ctx, `UPDATE public.agents SET balance_msats = balance_msats - $2 WHERE id = $1 AND balance_msats - $2 >= -50000`,
 			agentID, r.Msats); err != nil {
 			return err
 		}

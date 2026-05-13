@@ -7,7 +7,7 @@ create table public.agents (
     constraint agents_offer_type_check check (offer_type in ('bolt12', 'manual_bolt11')),
   bolt12_offer text,
   balance_msats bigint not null default 0
-    constraint agents_balance_msats_check check (balance_msats >= -1000000),
+    constraint agents_balance_msats_check check (balance_msats >= -50000),
   warning_level text not null default 'ok',
   created_at timestamp with time zone not null default now(),
   constraint agents_jwt_sub_unique unique (jwt_sub),
