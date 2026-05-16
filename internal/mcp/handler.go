@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -29,43 +28,7 @@ func rpcErrMessageFromExtra(slug string, extra map[string]any) string {
 	return slug
 }
 
-// SSEHandler serves legacy MCP SSE: GET opens a stream advertising the JSON-RPC POST endpoint URL.
-func SSEHandler(postEndpointURL string) http.Handler {
-	postEndpointURL = strings.TrimSpace(postEndpointURL)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if postEndpointURL == "" {
-			http.Error(w, "server misconfigured", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		fl, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-			return
-		}
-		fmt.Fprintf(w, "event: endpoint\ndata: %s\n\n", postEndpointURL)
-		fl.Flush()
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-r.Context().Done():
-				return
-			case <-ticker.C:
-				fmt.Fprintf(w, ": ping\n\n")
-				fl.Flush()
-			}
-		}
-	})
-}
-
-// Handler serves one JSON-RPC 2.0 message per POST (Streamable HTTP MVP).
+// Handler serves one JSON-RPC 2.0 message per POST.
 func Handler(svc *Service) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limit := int64(4 << 20)
@@ -125,17 +88,6 @@ func Handler(svc *Service) http.Handler {
 			caps := map[string]any{
 				"tools": map[string]any{},
 			}
-			cpURL := ""
-			if svc != nil && svc.Cfg != nil {
-				cpURL = strings.TrimRight(strings.TrimSpace(svc.Cfg.ControlPlanePublicURL), "/")
-			}
-			if cpURL != "" {
-				caps["notifications"] = map[string]any{
-					"endpoint":  cpURL + "/v1/mcp",
-					"transport": "sse",
-					"header":    "Mcp-Session-Id: " + sid,
-				}
-			}
 			writeJSON(w, http.StatusOK, rpcOK(req.ID, map[string]any{
 				"protocolVersion": pv,
 				"capabilities":    caps,
@@ -189,7 +141,7 @@ func Handler(svc *Service) http.Handler {
 				return
 			}
 
-			svc.ServeToolCallSSE(w, r, session, p, tcp.Name, args, req.ID)
+			svc.ServeToolCall(w, r, session, p, tcp.Name, args, req.ID)
 
 		case "ping":
 			writeJSON(w, http.StatusOK, rpcOK(req.ID, map[string]any{}))

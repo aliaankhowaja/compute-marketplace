@@ -19,13 +19,13 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
 
+
 // Service is the MCP tool implementation.
 type Service struct {
 	Cfg        *config.Control
 	Store      *store.Store
 	PaySvc     *payment.Service
 	Orch       *orchestrator.Service
-	EventBus   *SandboxEventBus
 	HTTPClient *http.Client
 	Sessions   *SessionRegistry
 	Executions *ExecutionRegistry
@@ -42,16 +42,6 @@ func NewService(cfg *config.Control, st *store.Store, paySvc *payment.Service, o
 	}
 }
 
-func (s *Service) notificationsURL(sandboxID uuid.UUID) string {
-	if s.EventBus == nil || s.Cfg == nil {
-		return ""
-	}
-	base := strings.TrimRight(strings.TrimSpace(s.Cfg.ControlPlanePublicURL), "/")
-	if base == "" {
-		return ""
-	}
-	return base + "/v1/mcp/notifications?sandbox_id=" + sandboxID.String()
-}
 
 func (s *Service) principalCanAccess(_ context.Context, p *auth.Principal, sb *store.Sandbox, args map[string]any) (bool, error) {
 	if sb == nil {
@@ -78,23 +68,8 @@ func (s *Service) principalCanAccess(_ context.Context, p *auth.Principal, sb *s
 	return false, nil
 }
 
-// ServeToolCallSSE handles a tools/call by streaming the response as SSE events
-// in the POST response body (MCP Streamable HTTP). The tool result is delivered as
-// a "message" event containing the JSON-RPC response. For sandbox_exec, subsequent
-// exec.output/exec.done/exec.error events are also streamed until completion.
-func (s *Service) ServeToolCallSSE(w http.ResponseWriter, r *http.Request, session *Session, p *auth.Principal, name string, args json.RawMessage, rpcID json.RawMessage) {
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeJSON(w, http.StatusInternalServerError, rpcErr(rpcID, http.StatusInternalServerError, "streaming_unsupported", "server does not support streaming", nil))
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	fl.Flush()
-
+// ServeToolCall handles a tools/call request and writes a standard JSON-RPC response.
+func (s *Service) ServeToolCall(w http.ResponseWriter, r *http.Request, session *Session, p *auth.Principal, name string, args json.RawMessage, rpcID json.RawMessage) {
 	var res any
 	var st int
 	var slug string
@@ -118,97 +93,7 @@ func (s *Service) ServeToolCallSSE(w http.ResponseWriter, r *http.Request, sessi
 		resp = rpcOK(rpcID, rewrapToolResult(res))
 	}
 
-	b, _ := json.Marshal(resp)
-	writeSSEEvent(w, fl, "message", b)
-
-	// Also emit on session so GET stream listeners receive it too
-	session.Emit(SessionEvent{Type: "tool.result", RawJSON: b})
-
-	// For sandbox_exec, keep the stream open and forward session events
-	// (exec.output, exec.done, exec.error, billing) until the execution completes.
-	if name == "sandbox_exec" && st == 0 {
-		var execID string
-		if m, ok := res.(map[string]any); ok {
-			execID, _ = m["execution_id"].(string)
-		}
-		if execID != "" {
-			s.streamExecEvents(w, fl, r.Context(), session, execID)
-		}
-	}
-}
-
-// streamExecEvents forwards session events for a specific execution on the POST
-// response body until the execution completes or the client disconnects.
-func (s *Service) streamExecEvents(w http.ResponseWriter, fl http.Flusher, ctx context.Context, session *Session, execID string) {
-	ch := session.EventCh()
-	ping := time.NewTicker(15 * time.Second)
-	defer ping.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ping.C:
-			fmt.Fprintf(w, ": ping\n\n")
-			fl.Flush()
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
-			if ev.ExecID != execID && ev.Type != "deposit_required" && ev.Type != "balance_restored" {
-				continue
-			}
-			writeStreamEvent(w, fl, ev)
-			if ev.ExecID == execID && (ev.Type == "exec.done" || ev.Type == "exec.error") {
-				return
-			}
-		}
-	}
-}
-
-func writeSSEEvent(w http.ResponseWriter, fl http.Flusher, event string, data []byte) {
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
-	fl.Flush()
-}
-
-// ExecToolBackground runs a tool in a detached goroutine and emits the JSON-RPC
-// response as a "tool.result" event on the session's SSE stream (for GET listeners).
-func (s *Service) ExecToolBackground(session *Session, p *auth.Principal, name string, args json.RawMessage, rpcID json.RawMessage) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				resp := Response{JSONRPC: "2.0", ID: rpcID, Error: &ErrorObj{Code: ErrCodeInternal, Message: "internal error"}}
-				b, _ := json.Marshal(resp)
-				session.Emit(SessionEvent{Type: "tool.result", RawJSON: b})
-			}
-		}()
-
-		var res any
-		var st int
-		var slug string
-		var extra map[string]any
-
-		asyncTools := map[string]bool{"sandbox_exec": true, "sandbox_exec_cancel": true, "sandbox_exec_result": true}
-		if asyncTools[name] {
-			res, st, slug, extra = s.CallToolAsync(context.Background(), session, p, name, args)
-		} else {
-			res, st, slug, extra = s.CallTool(context.Background(), p, name, args)
-		}
-
-		var resp Response
-		switch {
-		case st == 0 && slug == "" && res == nil:
-			resp = rpcErr(rpcID, http.StatusBadRequest, "unknown_tool", "unknown tool", map[string]any{"tool": name})
-		case st != 0:
-			msg := rpcErrMessageFromExtra(slug, extra)
-			resp = rpcOK(rpcID, toolErrorResult(slug, msg, extra))
-		default:
-			resp = rpcOK(rpcID, rewrapToolResult(res))
-		}
-
-		b, _ := json.Marshal(resp)
-		session.Emit(SessionEvent{Type: "tool.result", RawJSON: b})
-	}()
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // CallTool runs a named tool. httpStatus 0 with empty slug means unknown tool. On success httpStatus is 0 and slug is "".
@@ -537,9 +422,6 @@ func (s *Service) createLightningSandbox(ctx context.Context, tier, templateLabe
 		"next_step":         fmt.Sprintf("Pay this BOLT11. Then call sandbox_status with sandbox_id=%s and sandbox_token to track readiness.", sb.ID.String()),
 		"auth_hint":         "Send Authorization: Bearer " + token + " on every subsequent MCP POST, or pass sandbox_token as a tool argument.",
 	}
-	if nurl := s.notificationsURL(sb.ID); nurl != "" {
-		out["notifications_url"] = nurl
-	}
 	return out, 0, "", nil
 }
 
@@ -676,10 +558,6 @@ func (s *Service) toolSandboxStatus(ctx context.Context, p *auth.Principal, args
 		if bal, ok := live["balance"]; ok {
 			out["balance_local"] = bal
 		}
-	}
-
-	if nurl := s.notificationsURL(sb.ID); nurl != "" {
-		out["notifications_url"] = nurl
 	}
 
 	return out, 0, "", nil

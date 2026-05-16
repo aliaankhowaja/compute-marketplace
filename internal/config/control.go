@@ -78,8 +78,6 @@ type Control struct {
 	MCPExecMaxTimeout time.Duration
 	// MCPSessionTTL is how long an idle MCP session lives before cleanup (MCP_SESSION_TTL_SECS, default 2h).
 	MCPSessionTTL time.Duration
-	// MCPSessionEventBuf is the ring buffer capacity for SSE event replay (MCP_SESSION_EVENT_BUFFER, default 256).
-	MCPSessionEventBuf int
 	// MCPMaxConcurrentExec is max concurrent async execs per session (MCP_MAX_CONCURRENT_EXEC, default 10).
 	MCPMaxConcurrentExec int
 
@@ -272,10 +270,6 @@ func Load() (*Control, error) {
 		return nil, err
 	}
 	c.MCPSessionTTL, err = parseDurationSecs("MCP_SESSION_TTL_SECS", 2*time.Hour)
-	if err != nil {
-		return nil, err
-	}
-	c.MCPSessionEventBuf, err = parseInt("MCP_SESSION_EVENT_BUFFER", 256)
 	if err != nil {
 		return nil, err
 	}

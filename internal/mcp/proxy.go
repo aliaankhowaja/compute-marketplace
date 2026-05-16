@@ -256,7 +256,7 @@ func (s *Service) toolExecAsync(session *Session, sb *store.Sandbox, args map[st
 	exec := s.Executions.Create(session.ID, sb.ID, cmd, execCancel)
 	s.Sessions.TrackSandbox(session.ID, sb.ID)
 
-	go s.runExecAsync(execCtx, execCancel, exec, session, sb, cmd, cwd)
+	go s.runExecAsync(execCtx, execCancel, exec, sb, cmd, cwd)
 
 	return map[string]any{
 		"execution_id": exec.ID,
@@ -266,7 +266,7 @@ func (s *Service) toolExecAsync(session *Session, sb *store.Sandbox, args map[st
 	}, 0, "", nil
 }
 
-func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, exec *Execution, session *Session, sb *store.Sandbox, cmd, cwd string) {
+func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, exec *Execution, sb *store.Sandbox, cmd, cwd string) {
 	defer cancel()
 
 	base := dataPlaneBase(sb)
@@ -274,12 +274,6 @@ func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, e
 	if err != nil {
 		s.Executions.Complete(exec.ID, "failed")
 		exec.SetError(err.Error())
-		session.Emit(SessionEvent{
-			Type:      "exec.error",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"error": err.Error(), "slug": "token_error"},
-		})
 		return
 	}
 
@@ -290,17 +284,16 @@ func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, e
 		TimeoutSeconds: 0,
 	}
 
-	streamed := s.tryStreamingExec(ctx, exec, session, sb, base, streamPath, tok, body)
+	streamed := s.tryStreamingExec(ctx, exec, sb, base, streamPath, tok, body)
 	if streamed {
 		return
 	}
 
-	// Fallback: use standard /exec with long timeout
 	fallbackPath := fmt.Sprintf("/sandbox/%s/exec", sb.ID.String())
 	fallbackBody := execRuntimeRequest{
 		Argv:           []string{"/bin/bash", "-lc", cmd},
 		CWD:            cwd,
-		TimeoutSeconds: 0, // unlimited on runtime side; ctx controls cancellation
+		TimeoutSeconds: 0,
 	}
 	raw, code, err := s.proxyPOSTWithTimeout(ctx, base, fallbackPath, tok, fallbackBody, 0)
 	if err != nil {
@@ -310,24 +303,12 @@ func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, e
 		}
 		s.Executions.Complete(exec.ID, status)
 		exec.SetError(err.Error())
-		session.Emit(SessionEvent{
-			Type:      "exec.error",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"error": err.Error(), "slug": "host_unreachable"},
-		})
 		return
 	}
 	if code < 200 || code >= 300 {
 		s.Executions.Complete(exec.ID, "failed")
 		_, textErr := decodeJSONOrText(raw, code)
 		exec.SetError(textErr)
-		session.Emit(SessionEvent{
-			Type:      "exec.error",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"error": textErr, "slug": "host_error", "http_status": code},
-		})
 		return
 	}
 
@@ -335,12 +316,6 @@ func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, e
 	if err := json.Unmarshal(raw, &out); err != nil {
 		s.Executions.Complete(exec.ID, "failed")
 		exec.SetError("invalid response from runtime")
-		session.Emit(SessionEvent{
-			Type:      "exec.error",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"error": "invalid response from runtime"},
-		})
 		return
 	}
 
@@ -348,31 +323,10 @@ func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, e
 	exec.SetDone(out.ExitCode)
 	if out.Stdout != "" {
 		exec.AppendOutput("stdout", out.Stdout)
-		session.Emit(SessionEvent{
-			Type:      "exec.output",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"stream": "stdout", "chunk": out.Stdout},
-		})
 	}
 	if out.Stderr != "" {
 		exec.AppendOutput("stderr", out.Stderr)
-		session.Emit(SessionEvent{
-			Type:      "exec.output",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"stream": "stderr", "chunk": out.Stderr},
-		})
 	}
-	session.Emit(SessionEvent{
-		Type:      "exec.done",
-		ExecID:    exec.ID,
-		SandboxID: sb.ID,
-		Data: map[string]any{
-			"exit_code":   out.ExitCode,
-			"duration_ms": time.Since(exec.StartedAt).Milliseconds(),
-		},
-	})
 }
 
 type streamChunk struct {
@@ -381,7 +335,7 @@ type streamChunk struct {
 	ExitCode *int   `json:"exit_code,omitempty"`
 }
 
-func (s *Service) tryStreamingExec(ctx context.Context, exec *Execution, session *Session, sb *store.Sandbox, base, path, tok string, body execRuntimeRequest) bool {
+func (s *Service) tryStreamingExec(ctx context.Context, exec *Execution, sb *store.Sandbox, base, path, tok string, body execRuntimeRequest) bool {
 	b, err := json.Marshal(body)
 	if err != nil {
 		return false
@@ -406,12 +360,7 @@ func (s *Service) tryStreamingExec(ctx context.Context, exec *Execution, session
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		s.Executions.Complete(exec.ID, "failed")
 		_, textErr := decodeJSONOrText(raw, resp.StatusCode)
-		session.Emit(SessionEvent{
-			Type:      "exec.error",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"error": textErr, "slug": "host_error", "http_status": resp.StatusCode},
-		})
+		exec.SetError(textErr)
 		return true
 	}
 
@@ -424,12 +373,6 @@ func (s *Service) tryStreamingExec(ctx context.Context, exec *Execution, session
 		switch chunk.Type {
 		case "stdout", "stderr":
 			exec.AppendOutput(chunk.Type, chunk.Data)
-			session.Emit(SessionEvent{
-				Type:      "exec.output",
-				ExecID:    exec.ID,
-				SandboxID: sb.ID,
-				Data:      map[string]any{"stream": chunk.Type, "chunk": chunk.Data},
-			})
 		case "exit":
 			exitCode := 0
 			if chunk.ExitCode != nil {
@@ -437,15 +380,6 @@ func (s *Service) tryStreamingExec(ctx context.Context, exec *Execution, session
 			}
 			s.Executions.Complete(exec.ID, "completed")
 			exec.SetDone(exitCode)
-			session.Emit(SessionEvent{
-				Type:      "exec.done",
-				ExecID:    exec.ID,
-				SandboxID: sb.ID,
-				Data: map[string]any{
-					"exit_code":   exitCode,
-					"duration_ms": time.Since(exec.StartedAt).Milliseconds(),
-				},
-			})
 			return true
 		}
 	}
@@ -453,12 +387,6 @@ func (s *Service) tryStreamingExec(ctx context.Context, exec *Execution, session
 	if exec.Status == "running" {
 		s.Executions.Complete(exec.ID, "failed")
 		exec.SetError("stream ended without exit")
-		session.Emit(SessionEvent{
-			Type:      "exec.error",
-			ExecID:    exec.ID,
-			SandboxID: sb.ID,
-			Data:      map[string]any{"error": "stream ended without exit", "slug": "stream_incomplete"},
-		})
 	}
 	return true
 }

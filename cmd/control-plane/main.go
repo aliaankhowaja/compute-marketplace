@@ -18,7 +18,6 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/api"
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 	"github.com/aliaankhowaja/sockt-backend/internal/config"
-	"github.com/aliaankhowaja/sockt-backend/internal/mcp"
 	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/payment"
 	"github.com/aliaankhowaja/sockt-backend/internal/payment/lnbot"
@@ -84,8 +83,6 @@ func main() {
 		Cfg:    cfg,
 	}
 
-	eventBus := mcp.NewSandboxEventBus()
-
 	if lnBot != nil {
 		orchObserver := orchestrator.SandboxDepositObserver(orch, st, cfg)
 		deps := &payment.DepositSettlerBackground{
@@ -94,14 +91,6 @@ func main() {
 			Interval: 15 * time.Second,
 			OnSandboxSettled: func(ctx context.Context, sandboxID uuid.UUID, amountMsats, newBalanceMsats int64) {
 				orchObserver(ctx, sandboxID, amountMsats, newBalanceMsats)
-				eventBus.Publish(mcp.SandboxEvent{
-					Type:      "balance_restored",
-					SandboxID: sandboxID,
-					Data: map[string]any{
-						"amount_msats":      amountMsats,
-						"new_balance_msats": newBalanceMsats,
-					},
-				})
 			},
 		}
 		go deps.Run(ctx)
@@ -126,7 +115,6 @@ func main() {
 		PaySvc:     paySvc,
 		Orch:       orch,
 		APIKeys:    keyCache,
-		EventBus:   eventBus,
 		FileLogger: fileLogger,
 	})
 

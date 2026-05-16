@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/aliaankhowaja/sockt-backend/internal/mcp"
 	"github.com/aliaankhowaja/sockt-backend/internal/runtime"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
@@ -334,18 +333,6 @@ func handleSandboxLightningTopup(w http.ResponseWriter, r *http.Request, d Route
 			"message":       err.Error(),
 		})
 		return
-	}
-	if d.EventBus != nil {
-		d.EventBus.Publish(mcp.SandboxEvent{
-			Type:      "deposit_required",
-			SandboxID: sb.ID,
-			Data: map[string]any{
-				"bolt11":       dep.PaymentRequest,
-				"payment_hash": fmt.Sprintf("%x", dep.RHash),
-				"amount_msats": dep.AmountMsats,
-				"expires_at":   expRFC.Format(time.RFC3339),
-			},
-		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"balance_delta": int64(0),

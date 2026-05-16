@@ -27,15 +27,12 @@ func sandboxInstructions(svc *Service) string {
 - sandbox_write_file, sandbox_read_file, and sandbox_list_files use the same logical path rules for their path argument.
 - New sandboxes start with an empty filesystem; use sandbox_list_files to inspect before assuming files exist.
 
-Streamable HTTP model:
-- All tools/call requests return HTTP 202 immediately. Results are delivered on the SSE stream.
-- Open GET /v1/mcp with Mcp-Session-Id header to receive events. Do this right after initialize.
-- Tool results arrive as "tool.result" SSE events containing a full JSON-RPC response (correlated by the request id).
-- sandbox_exec delivers its initial acknowledgment ({execution_id, status: "running"}) as a tool.result event, then streams incremental output as exec.output events, and signals completion with exec.done or exec.error. Simply wait for these events — no polling or additional tool calls are needed to receive output.
+Execution model:
+- sandbox_exec returns immediately with execution_id and status "running".
+- Poll sandbox_exec_result with the execution_id to retrieve incremental output chunks, status, and exit code.
 - Use sandbox_exec_cancel with the execution_id to abort a long-running command.
 - Multiple commands can run concurrently (up to 10 per session).
-- BILLING: The sandbox consumes prepaid balance every second. When balance runs low, a deposit_required event arrives on the stream with a BOLT11 invoice. Invoices are generated CONTINUOUSLY until one is paid. Pay each invoice immediately to prevent sandbox pause. If not paid within the grace period, the sandbox auto-pauses. A balance_restored event confirms payment.
-- Recovery: if the SSE stream disconnects mid-execution, sandbox_exec_result retrieves any missed output. Do not use otherwise.
+- BILLING: The sandbox consumes prepaid balance every second. Poll sandbox_status to check balance and pending invoices. When a pending_invoice appears, pay it immediately to prevent sandbox pause.
 
 See result.sockt for Sockt authentication and billing hints.`,
 		root, exSub, root)
@@ -48,20 +45,6 @@ func sessionHints(svc *Service, p *auth.Principal) map[string]any {
 		cp := strings.TrimRight(strings.TrimSpace(svc.Cfg.ControlPlanePublicURL), "/")
 		if cp != "" {
 			out["control_plane_public_url"] = cp
-			out["event_stream"] = map[string]any{
-				"endpoint":    cp + "/v1/mcp",
-				"transport":   "sse",
-				"auth_header": "Mcp-Session-Id: <session.id from this initialize response>",
-				"purpose":     "Receives all tool results and billing events. Open immediately after initialize.",
-				"events": []string{
-					"tool.result — JSON-RPC response for a tools/call request (correlated by id field in data)",
-					"exec.output — incremental stdout/stderr (fields: execution_id, stream, chunk)",
-					"exec.done — command finished (fields: execution_id, exit_code, duration_ms)",
-					"exec.error — command failed (fields: execution_id, error, slug)",
-					"deposit_required — BOLT11 invoice sent CONTINUOUSLY when balance is low; pay each immediately to prevent pause (fields: sandbox_id, bolt11, amount_msats, expires_at)",
-					"balance_restored — payment confirmed (fields: sandbox_id)",
-				},
-			}
 		}
 	}
 
@@ -126,7 +109,7 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_exec",
-			Description: "Run a shell command. Output streams automatically via exec.output SSE events on this response; exec.done or exec.error signals completion. Do NOT poll — just wait for events. If a deposit_required event arrives, pay the BOLT11 immediately. Use sandbox_exec_cancel to abort. working_dir defaults to SANDBOX_ROOT. Pass sandbox_token if not using bearer auth.",
+			Description: "Run a shell command asynchronously. Returns immediately with execution_id and status \"running\". Poll sandbox_exec_result with the execution_id to retrieve output and completion status. Use sandbox_exec_cancel to abort. working_dir defaults to SANDBOX_ROOT. Pass sandbox_token if not using bearer auth.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id", "command"],
@@ -140,7 +123,7 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_exec_result",
-			Description: "Recovery tool: retrieve buffered output for an execution when the SSE stream was interrupted. Do NOT call this during normal operation — output arrives automatically via SSE events. Only use if you lost connection and need to catch up on missed stdout/stderr. Returns output chunks, status (running/completed/failed), and exit_code when done.",
+			Description: "Poll execution output. Returns buffered stdout/stderr chunks since the last poll, status (running/completed/failed/cancelled), and exit_code when done. Call repeatedly until status is no longer \"running\".",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["execution_id"],
