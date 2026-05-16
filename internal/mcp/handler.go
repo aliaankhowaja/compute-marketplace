@@ -117,11 +117,28 @@ func Handler(svc *Service) http.Handler {
 			}
 			sid := uuid.NewString()
 			w.Header().Set("Mcp-Session-Id", sid)
+
+			if svc != nil && svc.Sessions != nil {
+				svc.Sessions.Create(sid, p)
+			}
+
+			caps := map[string]any{
+				"tools": map[string]any{},
+			}
+			cpURL := ""
+			if svc != nil && svc.Cfg != nil {
+				cpURL = strings.TrimRight(strings.TrimSpace(svc.Cfg.ControlPlanePublicURL), "/")
+			}
+			if cpURL != "" {
+				caps["notifications"] = map[string]any{
+					"endpoint":  cpURL + "/v1/mcp",
+					"transport": "sse",
+					"header":    "Mcp-Session-Id: " + sid,
+				}
+			}
 			writeJSON(w, http.StatusOK, rpcOK(req.ID, map[string]any{
 				"protocolVersion": pv,
-				"capabilities": map[string]any{
-					"tools": map[string]any{},
-				},
+				"capabilities":    caps,
 				"serverInfo": map[string]any{
 					"name":    "sockt-cp",
 					"version": "mvp",
@@ -155,17 +172,24 @@ func Handler(svc *Service) http.Handler {
 			if len(args) == 0 || string(args) == "null" {
 				args = json.RawMessage(`{}`)
 			}
-			res, st, slug, extra := svc.CallTool(r.Context(), p, tcp.Name, args)
-			if st == 0 && slug == "" && res == nil {
-				writeJSON(w, http.StatusOK, rpcErr(req.ID, http.StatusBadRequest, "unknown_tool", "unknown tool", map[string]any{"tool": tcp.Name}))
+
+			sessionID := strings.TrimSpace(r.Header.Get("Mcp-Session-Id"))
+			if sessionID == "" {
+				writeJSON(w, http.StatusOK, rpcErr(req.ID, http.StatusBadRequest, "session_required",
+					"Mcp-Session-Id header required for tools/call", nil))
 				return
 			}
-			if st != 0 {
-				msg := rpcErrMessageFromExtra(slug, extra)
-				writeJSON(w, http.StatusOK, rpcOK(req.ID, toolErrorResult(slug, msg, extra)))
+			var session *Session
+			if svc != nil && svc.Sessions != nil {
+				session = svc.Sessions.Get(sessionID)
+			}
+			if session == nil {
+				writeJSON(w, http.StatusOK, rpcErr(req.ID, http.StatusUnauthorized, "invalid_session",
+					"session not found or expired", nil))
 				return
 			}
-			writeJSON(w, http.StatusOK, rpcOK(req.ID, rewrapToolResult(res)))
+
+			svc.ServeToolCallSSE(w, r, session, p, tcp.Name, args, req.ID)
 
 		case "ping":
 			writeJSON(w, http.StatusOK, rpcOK(req.ID, map[string]any{}))

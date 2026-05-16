@@ -74,11 +74,21 @@ type Control struct {
 	MCPDataJWTTTL       time.Duration // 0 = use DataJWTTTL for data_jwt minting on MCP→pod proxy
 	// MCPRPM is per-principal-or-IP requests per minute for POST /v1/mcp.
 	MCPRPM int
+	// MCPExecMaxTimeout is the maximum duration for async exec (MCP_EXEC_MAX_TIMEOUT_SECS, default 4h).
+	MCPExecMaxTimeout time.Duration
+	// MCPSessionTTL is how long an idle MCP session lives before cleanup (MCP_SESSION_TTL_SECS, default 2h).
+	MCPSessionTTL time.Duration
+	// MCPSessionEventBuf is the ring buffer capacity for SSE event replay (MCP_SESSION_EVENT_BUFFER, default 256).
+	MCPSessionEventBuf int
+	// MCPMaxConcurrentExec is max concurrent async execs per session (MCP_MAX_CONCURRENT_EXEC, default 10).
+	MCPMaxConcurrentExec int
 
 	// SandboxPrepaySecs is how many seconds of compute one sandbox-scoped BOLT11 prepays.
 	SandboxPrepaySecs int
 	// SandboxTopupTriggerSecs is how few seconds of remaining balance triggers a top-up mint.
 	SandboxTopupTriggerSecs int
+	// NegativeGraceSecs is how long a sandbox runs at negative balance before hard-pause (0 = immediate).
+	NegativeGraceSecs int
 
 	// SandboxReadyTimeout is the max time to wait for sockt-runtime /healthz after pod create or resume (SANDBOX_READY_TIMEOUT_SECS).
 	SandboxReadyTimeout time.Duration
@@ -257,6 +267,22 @@ func Load() (*Control, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.MCPExecMaxTimeout, err = parseDurationSecs("MCP_EXEC_MAX_TIMEOUT_SECS", 4*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	c.MCPSessionTTL, err = parseDurationSecs("MCP_SESSION_TTL_SECS", 2*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	c.MCPSessionEventBuf, err = parseInt("MCP_SESSION_EVENT_BUFFER", 256)
+	if err != nil {
+		return nil, err
+	}
+	c.MCPMaxConcurrentExec, err = parseInt("MCP_MAX_CONCURRENT_EXEC", 10)
+	if err != nil {
+		return nil, err
+	}
 	c.SandboxPrepaySecs, err = parseInt("SANDBOX_PREPAY_SECS", 30)
 	if err != nil {
 		return nil, err
@@ -270,6 +296,13 @@ func Load() (*Control, error) {
 	}
 	if c.SandboxTopupTriggerSecs < 1 {
 		c.SandboxTopupTriggerSecs = 1
+	}
+	c.NegativeGraceSecs, err = parseInt("NEGATIVE_GRACE_SECS", 120)
+	if err != nil {
+		return nil, err
+	}
+	if c.NegativeGraceSecs < 0 {
+		c.NegativeGraceSecs = 0
 	}
 
 	c.SandboxReadyTimeout, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_SECS", 120*time.Second)

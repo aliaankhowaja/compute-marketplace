@@ -28,9 +28,10 @@ type Config struct {
 	RatePerSecond  int64
 	InitialBalance int64
 
-	TopupThreshold int64
-	TopupAmount    int64
-	SafetyFloor    int64
+	TopupThreshold    int64
+	TopupAmount       int64
+	SafetyFloor       int64
+	NegativeGraceSecs int64
 
 	CallbackSecret string
 
@@ -119,6 +120,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.SafetyFloor, err = parseInt64Env("SAFETY_FLOOR", 0)
+	if err != nil {
+		return nil, err
+	}
+	c.NegativeGraceSecs, err = parseInt64Env("NEGATIVE_GRACE_SECS", 120)
 	if err != nil {
 		return nil, err
 	}

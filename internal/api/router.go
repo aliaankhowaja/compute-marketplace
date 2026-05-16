@@ -21,6 +21,7 @@ type RouterDeps struct {
 	PaySvc     *payment.Service
 	Orch       *orchestrator.Service
 	APIKeys    *auth.APIKeyCache
+	EventBus   *mcp.SandboxEventBus
 	FileLogger func(http.Handler) http.Handler
 }
 
@@ -61,13 +62,36 @@ func NewRouter(d RouterDeps) http.Handler {
 	rl := auth.NewRateLimiter(d.Cfg.MCPRPM)
 
 	mcpSvc := mcp.NewService(d.Cfg, d.Store, d.PaySvc, d.Orch, nil)
+	mcpSvc.EventBus = d.EventBus
+	mcpSvc.Sessions = mcp.NewSessionRegistry(d.Cfg.MCPSessionTTL, d.Cfg.MCPSessionEventBuf)
+	mcpSvc.Sessions.StartCleanupLoop(0)
+	mcpSvc.Executions = mcp.NewExecutionRegistry()
+	if d.EventBus != nil {
+		d.EventBus.SetSessionRegistry(mcpSvc.Sessions)
+	}
+
 	postMCPURL := controlPlaneOrigin(d) + "/v1/mcp"
 	mux.Handle("GET /v1/mcp/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mcp.HealthPayload())
 	}))
-	// Legacy SSE: public handshake; POST /v1/mcp still requires its own auth.
-	mux.Handle("GET /v1/mcp", rl.Middleware(mcp.SSEHandler(postMCPURL)))
+	// GET /v1/mcp: if Mcp-Session-Id is present, serve session SSE stream (Streamable HTTP spec);
+	// otherwise fall back to legacy SSE handshake that advertises the POST endpoint.
+	streamH := mcp.AuthMiddleware(d.APIKeys, d.Store, rl.Middleware(mcp.StreamHandler(mcpSvc.Sessions)))
+	legacySSE := rl.Middleware(mcp.SSEHandler(postMCPURL))
+	mux.Handle("GET /v1/mcp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Mcp-Session-Id") != "" || r.URL.Query().Get("session_id") != "" {
+			streamH.ServeHTTP(w, r)
+			return
+		}
+		legacySSE.ServeHTTP(w, r)
+	}))
 	mux.Handle("POST /v1/mcp", mcp.AuthMiddleware(d.APIKeys, d.Store, rl.Middleware(mcp.Handler(mcpSvc))))
+	// Explicit /v1/mcp/stream path kept for backward compatibility with clients using the notifications hint.
+	mux.Handle("GET /v1/mcp/stream", streamH)
+	// Legacy per-sandbox SSE billing notifications (kept for backward compatibility).
+	if d.EventBus != nil {
+		mux.Handle("GET /v1/mcp/notifications", mcp.AuthMiddleware(d.APIKeys, d.Store, rl.Middleware(mcp.NotificationsHandler(mcpSvc, d.EventBus))))
+	}
 
 	// User JWT routes
 	jt := func(h http.Handler) http.Handler {

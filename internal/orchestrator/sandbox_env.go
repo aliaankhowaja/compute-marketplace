@@ -33,6 +33,11 @@ func BuildSandboxEnv(cfg *config.Control, sb *store.Sandbox, initialBalance, rat
 	topThresh := int64(triggerSecs) * ratePerSecond
 	topAmt := int64(prepaySecs) * ratePerSecond
 
+	graceSecs := cfg.NegativeGraceSecs
+	if graceSecs <= 0 {
+		graceSecs = 120
+	}
+
 	return map[string]string{
 		"SANDBOX_ID":             sb.ID.String(),
 		"CONTROL_PLANE_URL":      cp,
@@ -46,6 +51,7 @@ func BuildSandboxEnv(cfg *config.Control, sb *store.Sandbox, initialBalance, rat
 		"TOPUP_THRESHOLD":        fmt.Sprintf("%d", topThresh),
 		"TOPUP_AMOUNT":           fmt.Sprintf("%d", topAmt),
 		"BALANCE_LOW_WATER_SECS": fmt.Sprintf("%d", triggerSecs),
+		"NEGATIVE_GRACE_SECS":    fmt.Sprintf("%d", graceSecs),
 	}
 }
 
