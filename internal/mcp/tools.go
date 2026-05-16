@@ -37,13 +37,15 @@ Execution model:
 
 Billing (lightning sandboxes):
 - Balance decreases every second while the sandbox runs.
-- Check sandbox_status for warning_level:
-  "ok" = healthy, no action needed.
-  "low_balance" = running low; a pending_invoice will appear soon.
-  "awaiting_payment" = pay the pending_invoice to proceed.
-  "out_of_balance" = balance is zero, sandbox is paused; pay and call sandbox_resume.
+- sandbox_status returns next_poll_secs: wait exactly that many seconds before your next sandbox_status call. It adapts automatically (5–60 s range: short when balance is nearly depleted, longer when healthy).
+- Check warning_level:
+  "ok" = healthy; poll again in next_poll_secs.
+  "low_balance" = running low; a pending_invoice will appear soon. Poll in next_poll_secs.
+  "awaiting_payment" = pay the pending_invoice immediately. Poll every next_poll_secs (5 s) until payment confirms.
+  "out_of_balance" = sandbox is paused; pay the invoice and call sandbox_resume. Poll every next_poll_secs (5 s).
 - pending_invoice appears in both sandbox_status AND sandbox_exec_result responses.
 - Pay the BOLT11 invoice immediately when you see it. If unpaid, sandbox auto-pauses.
+- POLLING RULE: After every sandbox_status response, wait next_poll_secs before calling sandbox_status again.
 
 Billing (credits sandboxes):
 - Usage charges your USD credit balance automatically. No invoices to pay.
@@ -70,7 +72,7 @@ func sessionHints(svc *Service, p *auth.Principal) map[string]any {
 		case auth.KindAPIKey:
 			out["billing"] = "API key (credits): sandbox_create with billing_method=credits charges your USD credit balance."
 		case auth.KindSandbox:
-			out["billing"] = "Sandbox token: this credential is bound to a single Lightning sandbox; pay any pending_invoice in sandbox_status to keep it running."
+			out["billing"] = "Sandbox token: bound to a single Lightning sandbox. Poll sandbox_status every next_poll_secs (returned in each response, 5–60 s) and pay any pending_invoice immediately."
 			if p.SandboxID != nil {
 				out["sandbox_id"] = p.SandboxID.String()
 			}
@@ -91,7 +93,8 @@ func sessionHints(svc *Service, p *auth.Principal) map[string]any {
 		`tools/call sandbox_create with billing_method "lightning" and tier (nano|micro|standard|gpu_small|gpu_large).`,
 		fmt.Sprintf("Server returns sandbox_id, sandbox_token (sbx_…), and a BOLT11 prepaying %d seconds of compute. Pay it from any LN wallet.", prepay),
 		`Once paid, the sandbox boots automatically. Poll sandbox_status with sandbox_id+sandbox_token until status="running".`,
-		`When sandbox_status shows warning_level "low_balance" or "awaiting_payment" with a pending_invoice, pay the BOLT11 immediately. If balance reaches zero (warning_level "out_of_balance"), the sandbox auto-pauses; pay the invoice and call sandbox_resume to continue.`,
+		`Poll sandbox_status at the interval given by next_poll_secs in each response (5–60 s, adapts to remaining balance). When warning_level is "low_balance" or "awaiting_payment" with a pending_invoice, pay the BOLT11 immediately.`,
+		`If warning_level reaches "out_of_balance", the sandbox auto-pauses; pay the invoice and call sandbox_resume. Keep polling at next_poll_secs until warning_level returns to "ok".`,
 	}
 	return out
 }
@@ -209,7 +212,7 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_status",
-			Description: "Get sandbox status, billing state, and runtime metrics. For lightning sandboxes: shows prepaid_balance_msats, seconds_remaining, warning_level (ok/low_balance/awaiting_payment/out_of_balance), and pending_invoice when payment is needed. Poll this to monitor billing health between executions.",
+			Description: "Get sandbox status, billing state, and runtime metrics. For lightning sandboxes: returns prepaid_balance_msats, seconds_remaining, msats_per_second, warning_level, next_poll_secs, and pending_invoice when payment is needed. IMPORTANT: call sandbox_status again after next_poll_secs seconds — it adapts automatically (short when balance is low, longer when healthy, range 5–60 s). Pay the pending_invoice BOLT11 immediately when present.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id"],

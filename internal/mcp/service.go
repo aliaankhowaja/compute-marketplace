@@ -541,6 +541,26 @@ func (s *Service) toolSandboxStatus(ctx context.Context, p *auth.Principal, args
 		default:
 			out["warning_level"] = "ok"
 		}
+
+		var nextPoll int64
+		switch out["warning_level"] {
+		case "awaiting_payment", "out_of_balance":
+			nextPoll = 5
+		default:
+			timeUntilTrigger := secsRemaining - int64(s.Cfg.SandboxTopupTriggerSecs)
+			if timeUntilTrigger < 0 {
+				timeUntilTrigger = 0
+			}
+			nextPoll = timeUntilTrigger / 2
+			if nextPoll < 5 {
+				nextPoll = 5
+			}
+			if nextPoll > 60 {
+				nextPoll = 60
+			}
+		}
+		out["next_poll_secs"] = nextPoll
+
 		if sb.PendingInvoiceBolt11 != nil {
 			pending := map[string]any{
 				"bolt11": *sb.PendingInvoiceBolt11,
