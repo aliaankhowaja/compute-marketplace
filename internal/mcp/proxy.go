@@ -174,15 +174,22 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "command required"}
 	}
 	timeoutMS := 30000.0
-	if v, ok := args["timeout_ms"].(float64); ok && v > 0 {
-		timeoutMS = v
+	unlimited := false
+	if v, ok := args["timeout_ms"].(float64); ok {
+		if v == 0 {
+			unlimited = true
+		} else if v > 0 {
+			timeoutMS = v
+		}
 	}
 	sec := int(timeoutMS / 1000)
-	if sec <= 0 {
-		sec = 1
-	}
-	if sec > 300 {
-		sec = 300
+	if !unlimited {
+		if sec <= 0 {
+			sec = 1
+		}
+		if sec > 300 {
+			sec = 300
+		}
 	}
 	cwd := "."
 	if v, ok := args["working_dir"].(string); ok && strings.TrimSpace(v) != "" {
@@ -193,13 +200,24 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 		return nil, http.StatusInternalServerError, "token_error", map[string]any{"message": err.Error()}
 	}
 	path := fmt.Sprintf("/sandbox/%s/exec", sb.ID.String())
+	runtimeTimeout := sec
+	if unlimited {
+		runtimeTimeout = 0
+	}
 	body := execRuntimeRequest{
 		Argv:           []string{"/bin/bash", "-lc", cmd},
 		CWD:            cwd,
-		TimeoutSeconds: sec,
+		TimeoutSeconds: runtimeTimeout,
 	}
-	// Use exec-specific timeout: command timeout + 10s buffer for network overhead.
-	execTimeout := time.Duration(sec+10) * time.Second
+	var execTimeout time.Duration
+	if unlimited {
+		execTimeout = 4 * time.Hour
+		if s.Cfg != nil && s.Cfg.MCPExecMaxTimeout > 0 {
+			execTimeout = s.Cfg.MCPExecMaxTimeout
+		}
+	} else {
+		execTimeout = time.Duration(sec+10) * time.Second
+	}
 	execCtx, execCancel := context.WithTimeout(ctx, execTimeout)
 	defer execCancel()
 	raw, code, err := s.proxyPOSTWithTimeout(execCtx, base, path, tok, body, execTimeout)
@@ -263,6 +281,7 @@ func (s *Service) toolExecAsync(session *Session, sb *store.Sandbox, args map[st
 		"status":       "running",
 		"sandbox_id":   sb.ID.String(),
 		"command":      cmd,
+		"next_step":    "Poll sandbox_exec_result with this execution_id to retrieve output. Repeat until status is 'completed', 'failed', or 'cancelled'.",
 	}, 0, "", nil
 }
 
@@ -429,8 +448,12 @@ func hostHTTPFailure(code int, raw []byte) (httpStatus int, extra map[string]any
 	}
 	ex := map[string]any{"message": msg, "status": code}
 	st := statusFromDataPlane(code)
-	if code == http.StatusNotFound {
-		ex["hint"] = "Path sandbox id must match the runtime SANDBOX_ID. Check PodProxyURL/pod_id for this sandbox row, or reprovision if the pod was swapped."
+	switch {
+	case code == http.StatusNotFound:
+		ex["hint"] = "Sandbox or path not found. Verify sandbox_id is correct and sandbox status is 'running'."
+	case code == http.StatusServiceUnavailable || code == http.StatusBadGateway || code == http.StatusGatewayTimeout:
+		ex["hint"] = "Data plane temporarily unreachable. Retry after a few seconds."
+		ex["retryable"] = true
 	}
 	return st, ex
 }

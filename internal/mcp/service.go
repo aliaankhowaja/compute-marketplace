@@ -123,7 +123,7 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	}
 
 	if s.Store == nil {
-		return nil, http.StatusServiceUnavailable, "store_unavailable", map[string]any{"message": "store not configured"}
+		return nil, http.StatusServiceUnavailable, "store_unavailable", map[string]any{"message": "store not configured", "retryable": true, "hint": "Database temporarily unavailable. Retry in a few seconds."}
 	}
 
 	switch name {
@@ -146,7 +146,10 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	case "sandbox_terminate":
 		return s.toolSandboxTerminate(ctx, p, m)
 	case "sandbox_exec_cancel", "sandbox_exec_result":
-		return nil, http.StatusBadRequest, "session_required", map[string]any{"message": fmt.Sprintf("%s requires an active session (Mcp-Session-Id header)", name)}
+		return nil, http.StatusBadRequest, "session_required", map[string]any{
+			"message": fmt.Sprintf("%s requires an active session (Mcp-Session-Id header)", name),
+			"hint":    "Call initialize first to obtain a session, then include Mcp-Session-Id header on subsequent requests.",
+		}
 	default:
 		return nil, 0, "", nil
 	}
@@ -188,7 +191,10 @@ func (s *Service) CallToolAsync(ctx context.Context, session *Session, p *auth.P
 			return nil, http.StatusServiceUnavailable, "service_unavailable", nil
 		}
 		if ok := s.Executions.Cancel(execID); !ok {
-			return nil, http.StatusNotFound, "not_found", map[string]any{"message": "execution not found or already completed"}
+			return nil, http.StatusNotFound, "not_found", map[string]any{
+				"message": "execution not found or already completed",
+				"hint":    "The execution may have already finished or been cleaned up.",
+			}
 		}
 		return map[string]any{"execution_id": execID, "status": "cancelled"}, 0, "", nil
 
@@ -202,10 +208,16 @@ func (s *Service) CallToolAsync(ctx context.Context, session *Session, p *auth.P
 		}
 		exec := s.Executions.Get(execID)
 		if exec == nil {
-			return nil, http.StatusNotFound, "not_found", map[string]any{"message": "execution not found"}
+			return nil, http.StatusNotFound, "not_found", map[string]any{
+				"message": "execution not found",
+				"hint":    "The execution may have expired or been cleaned up. Completed executions are only retained temporarily.",
+			}
 		}
 		if exec.SessionID != session.ID {
-			return nil, http.StatusForbidden, "forbidden", map[string]any{"message": "execution belongs to another session"}
+			return nil, http.StatusForbidden, "forbidden", map[string]any{
+				"message": "execution belongs to another session",
+				"hint":    "You can only poll executions started in your current session (same Mcp-Session-Id).",
+			}
 		}
 		return s.toolExecResult(ctx, exec)
 
@@ -299,7 +311,7 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	}
 	_, templateLabel, runtimeLabel, err := orchestrator.ResolveTier(s.Cfg, tier)
 	if err != nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": err.Error()}
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": err.Error(), "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 
 	switch bm {
@@ -340,7 +352,7 @@ func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, t
 	}
 	env := orchestrator.BuildSandboxEnv(s.Cfg, sb, alloc, rate)
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "runpod not configured"}
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "runpod not configured", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.CreateSandbox(ctx, sb, env); err != nil {
 		return nil, http.StatusBadGateway, "runpod_error", map[string]any{"message": err.Error()}
@@ -351,7 +363,7 @@ func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, t
 
 func (s *Service) createLightningSandbox(ctx context.Context, tier, templateLabel, runtimeLabel string, pr *store.TierPricing) (any, int, string, map[string]any) {
 	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
-		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning payment not configured"}
+		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning payment not configured", "retryable": false, "hint": "Lightning payments not configured on this server."}
 	}
 	prepaySecs := s.Cfg.SandboxPrepaySecs
 	if prepaySecs <= 0 {
@@ -577,7 +589,7 @@ func (s *Service) toolSandboxPause(ctx context.Context, p *auth.Principal, args 
 		podID = *sb.PodID
 	}
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", nil
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "pod orchestration not available", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.PauseSandbox(ctx, podID, id); err != nil {
 		return nil, http.StatusBadGateway, "pause_failed", map[string]any{"message": err.Error()}
@@ -599,7 +611,7 @@ func (s *Service) toolSandboxResume(ctx context.Context, p *auth.Principal, args
 		podID = *sb.PodID
 	}
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", nil
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "pod orchestration not available", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.ResumeSandbox(ctx, podID, id); err != nil {
 		return nil, http.StatusBadGateway, "resume_failed", map[string]any{"message": err.Error()}
@@ -636,7 +648,7 @@ func (s *Service) toolSandboxTerminate(ctx context.Context, p *auth.Principal, a
 		podID = *sb.PodID
 	}
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", nil
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "pod orchestration not available", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.TerminateSandbox(ctx, podID, id); err != nil {
 		return nil, http.StatusBadGateway, "terminate_failed", map[string]any{"message": err.Error()}
@@ -644,7 +656,6 @@ func (s *Service) toolSandboxTerminate(ctx context.Context, p *auth.Principal, a
 	return map[string]any{
 		"sandbox_id":           id.String(),
 		"status":               "terminated",
-		"total_uptime_secs":    0,
 		"consumed_msats_total": sb.ConsumedMsats,
 		"terminated_at":        time.Now().UTC().Format(time.RFC3339),
 	}, 0, "", nil

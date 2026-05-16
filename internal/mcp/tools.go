@@ -28,13 +28,28 @@ func sandboxInstructions(svc *Service) string {
 - New sandboxes start with an empty filesystem; use sandbox_list_files to inspect before assuming files exist.
 
 Execution model:
-- sandbox_exec returns immediately with execution_id and status "running".
-- Poll sandbox_exec_result with the execution_id to retrieve incremental output chunks, status, and exit code.
-- Use sandbox_exec_cancel with the execution_id to abort a long-running command.
+- sandbox_exec returns immediately with execution_id and status "running". Output is NOT in this response.
+- Call sandbox_exec_result with the execution_id to retrieve buffered output chunks incrementally.
+- Keep polling sandbox_exec_result until status changes from "running" to "completed", "failed", or "cancelled".
+- Use sandbox_exec_cancel to abort a long-running command.
 - Multiple commands can run concurrently (up to 10 per session).
-- BILLING: The sandbox consumes prepaid balance every second. Poll sandbox_status to check balance and pending invoices. When a pending_invoice appears, pay it immediately to prevent sandbox pause.
+- Completed executions are available for polling for a limited time; poll promptly.
 
-See result.sockt for Sockt authentication and billing hints.`,
+Billing (lightning sandboxes):
+- Balance decreases every second while the sandbox runs.
+- Check sandbox_status for warning_level:
+  "ok" = healthy, no action needed.
+  "low_balance" = running low; a pending_invoice will appear soon.
+  "awaiting_payment" = pay the pending_invoice to proceed.
+  "out_of_balance" = balance is zero, sandbox is paused; pay and call sandbox_resume.
+- pending_invoice appears in both sandbox_status AND sandbox_exec_result responses.
+- Pay the BOLT11 invoice immediately when you see it. If unpaid, sandbox auto-pauses.
+
+Billing (credits sandboxes):
+- Usage charges your USD credit balance automatically. No invoices to pay.
+- If credits run out, sandbox pauses. Top up credits externally and call sandbox_resume.
+
+See result.sockt for Sockt authentication hints.`,
 		root, exSub, root)
 }
 
@@ -76,7 +91,7 @@ func sessionHints(svc *Service, p *auth.Principal) map[string]any {
 		`tools/call sandbox_create with billing_method "lightning" and tier (nano|micro|standard|gpu_small|gpu_large).`,
 		fmt.Sprintf("Server returns sandbox_id, sandbox_token (sbx_…), and a BOLT11 prepaying %d seconds of compute. Pay it from any LN wallet.", prepay),
 		`Once paid, the sandbox boots automatically. Poll sandbox_status with sandbox_id+sandbox_token until status="running".`,
-		`When sandbox_status shows a pending_invoice, pay it to keep running; otherwise the sandbox auto-pauses when prepaid balance hits zero.`,
+		`When sandbox_status shows warning_level "low_balance" or "awaiting_payment" with a pending_invoice, pay the BOLT11 immediately. If balance reaches zero (warning_level "out_of_balance"), the sandbox auto-pauses; pay the invoice and call sandbox_resume to continue.`,
 	}
 	return out
 }
@@ -109,7 +124,7 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_exec",
-			Description: "Run a shell command asynchronously. Returns immediately with execution_id and status \"running\". Poll sandbox_exec_result with the execution_id to retrieve output and completion status. Use sandbox_exec_cancel to abort. working_dir defaults to SANDBOX_ROOT. Pass sandbox_token if not using bearer auth.",
+			Description: "Run a shell command asynchronously. Returns immediately with execution_id and status \"running\". Output is NOT included in this response. You MUST call sandbox_exec_result repeatedly with the execution_id to retrieve buffered stdout/stderr chunks. Keep polling until status is \"completed\", \"failed\", or \"cancelled\". Pass timeout_ms=0 for unlimited duration (model training, etc). Use sandbox_exec_cancel to abort. working_dir defaults to SANDBOX_ROOT.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id", "command"],
@@ -117,13 +132,14 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 					"sandbox_id": {"type": "string"},
 					"sandbox_token": {"type": "string"},
 					"command": {"type": "string"},
-					"working_dir": {"type": "string"}
+					"working_dir": {"type": "string"},
+					"timeout_ms": {"type": "integer", "description": "Timeout in milliseconds. Default 30000 (30s), max 300000 (5min). Set 0 for unlimited (long-running tasks)."}
 				}
 			}`),
 		},
 		{
 			Name:        "sandbox_exec_result",
-			Description: "Poll execution output. Returns buffered stdout/stderr chunks since the last poll, status (running/completed/failed/cancelled), and exit_code when done. Call repeatedly until status is no longer \"running\".",
+			Description: "Poll execution output. Returns new stdout/stderr chunks since last poll, current status (running/completed/failed/cancelled), and exit_code when done. Also includes pending_invoice if the sandbox needs payment. Call repeatedly until status is no longer \"running\".",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["execution_id"],
@@ -135,7 +151,7 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_exec_cancel",
-			Description: "Cancel a running async execution by its execution_id. Returns immediately with status \"cancelled\".",
+			Description: "Cancel a running execution by execution_id. Must be called from the same session that started the execution. Returns immediately with status \"cancelled\".",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["execution_id"],
@@ -193,7 +209,7 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_status",
-			Description: "Sandbox row plus optional live runtime status. For lightning sandboxes, includes prepaid_balance_msats, seconds_remaining, and pending_invoice when one is outstanding.",
+			Description: "Get sandbox status, billing state, and runtime metrics. For lightning sandboxes: shows prepaid_balance_msats, seconds_remaining, warning_level (ok/low_balance/awaiting_payment/out_of_balance), and pending_invoice when payment is needed. Poll this to monitor billing health between executions.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id"],
