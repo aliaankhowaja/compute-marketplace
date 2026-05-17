@@ -27,7 +27,32 @@ func sandboxInstructions(svc *Service) string {
 - sandbox_write_file, sandbox_read_file, and sandbox_list_files use the same logical path rules for their path argument.
 - New sandboxes start with an empty filesystem; use sandbox_list_files to inspect before assuming files exist.
 
-See result.sockt for Sockt authentication and billing hints.`,
+Execution model:
+- sandbox_exec returns immediately with execution_id and status "running". Output is NOT in this response.
+- Call sandbox_exec_result with the execution_id to retrieve buffered output chunks incrementally.
+- Keep polling sandbox_exec_result until status changes from "running" to "completed", "failed", or "cancelled".
+- Use sandbox_exec_cancel to abort a long-running command.
+- Multiple commands can run concurrently (up to 10 per session).
+- Completed executions are available for polling for a limited time; poll promptly.
+
+Billing (lightning sandboxes):
+- Balance decreases every second while the sandbox runs.
+- sandbox_status returns next_poll_secs: wait exactly that many seconds before your next sandbox_status call. It adapts automatically (5–60 s range: short when balance is nearly depleted, longer when healthy).
+- Check warning_level:
+  "ok" = healthy; poll again in next_poll_secs.
+  "low_balance" = running low; a pending_invoice will appear soon. Poll in next_poll_secs.
+  "awaiting_payment" = pay the pending_invoice immediately. Poll every next_poll_secs (5 s) until payment confirms.
+  "out_of_balance" = sandbox is paused; pay the invoice and call sandbox_resume. Poll every next_poll_secs (5 s).
+- pending_invoice appears in both sandbox_status AND sandbox_exec_result responses.
+- Pay the BOLT11 invoice immediately when you see it. If unpaid, sandbox auto-pauses.
+- POLLING RULE: After every sandbox_status response, wait next_poll_secs before calling sandbox_status again.
+- REFUND ON TERMINATE: When you are done with the sandbox, call sandbox_terminate with your lightning_address to receive a refund of any unused prepaid balance. Obtain your lightning address from your wallet (e.g. via a list_addresses tool if available). The refund is sent asynchronously — even if the response shows "pending", the payment will settle shortly. Do not tell the user the refund failed based on a pending status; it will arrive.
+
+Billing (credits sandboxes):
+- Usage charges your USD credit balance automatically. No invoices to pay.
+- If credits run out, sandbox pauses. Top up credits externally and call sandbox_resume.
+
+See result.sockt for Sockt authentication hints.`,
 		root, exSub, root)
 }
 
@@ -48,7 +73,7 @@ func sessionHints(svc *Service, p *auth.Principal) map[string]any {
 		case auth.KindAPIKey:
 			out["billing"] = "API key (credits): sandbox_create with billing_method=credits charges your USD credit balance."
 		case auth.KindSandbox:
-			out["billing"] = "Sandbox token: this credential is bound to a single Lightning sandbox; pay any pending_invoice in sandbox_status to keep it running."
+			out["billing"] = "Sandbox token: bound to a single Lightning sandbox. Poll sandbox_status every next_poll_secs (returned in each response, 5–60 s) and pay any pending_invoice immediately."
 			if p.SandboxID != nil {
 				out["sandbox_id"] = p.SandboxID.String()
 			}
@@ -63,13 +88,14 @@ func sessionHints(svc *Service, p *auth.Principal) map[string]any {
 		prepay = svc.Cfg.SandboxPrepaySecs
 	}
 	out["auth_state"] = "unauthenticated"
-	out["billing"] = "Without credentials, sandbox_create with billing_method=lightning returns a BOLT11 + sandbox_token. Pay the invoice and call subsequent tools with Authorization: Bearer <sandbox_token> (or pass sandbox_token as a tool argument)."
+	out["billing"] = "Without credentials, sandbox_create with billing_method=lightning and prepaid_sats returns a BOLT11 + sandbox_token. Set prepaid_sats to the number of satoshis you want to prepay (e.g. 50). Pay the invoice and call subsequent tools with Authorization: Bearer <sandbox_token> (or pass sandbox_token as a tool argument)."
 	out["lightning_prepay_secs"] = prepay
 	out["onboarding_steps"] = []string{
-		`tools/call sandbox_create with billing_method "lightning" and tier (nano|micro|standard|gpu_small|gpu_large).`,
-		fmt.Sprintf("Server returns sandbox_id, sandbox_token (sbx_…), and a BOLT11 prepaying %d seconds of compute. Pay it from any LN wallet.", prepay),
+		`tools/call sandbox_create with billing_method "lightning", tier (nano|micro|standard|gpu_small|gpu_large), and prepaid_sats (amount in satoshis to prepay, e.g. 50).`,
+		"Server returns sandbox_id, sandbox_token (sbx_…), and a BOLT11 invoice for the prepaid_sats amount you specified. Pay it from any LN wallet.",
 		`Once paid, the sandbox boots automatically. Poll sandbox_status with sandbox_id+sandbox_token until status="running".`,
-		`When sandbox_status shows a pending_invoice, pay it to keep running; otherwise the sandbox auto-pauses when prepaid balance hits zero.`,
+		`Poll sandbox_status at the interval given by next_poll_secs in each response (5–60 s, adapts to remaining balance). When warning_level is "low_balance" or "awaiting_payment" with a pending_invoice, pay the BOLT11 immediately.`,
+		`If warning_level reaches "out_of_balance", the sandbox auto-pauses; pay the invoice and call sandbox_resume. Keep polling at next_poll_secs until warning_level returns to "ok".`,
 	}
 	return out
 }
@@ -82,7 +108,7 @@ type toolDef struct {
 
 func toolList(svc *Service, p *auth.Principal) []toolDef {
 	_ = svc
-	createDesc := "Provision a new sandbox (RunPod). May take up to ~2 minutes for credits sandboxes; lightning sandboxes return an invoice + sandbox_token immediately and boot once you pay. billing_method: lightning (no credentials needed) or credits (API key required). Tier: nano|micro|standard|gpu_small|gpu_large."
+	createDesc := "Provision a new sandbox (RunPod). May take up to ~2 minutes for credits sandboxes; lightning sandboxes return an invoice + sandbox_token immediately and boot once you pay. billing_method: lightning (no credentials needed) or credits (API key required). Tier: nano|micro|standard|gpu_small|gpu_large. For lightning: pass prepaid_sats to control how much balance to load (e.g. 50 sats ≈ 50 seconds on nano tier). The returned BOLT11 invoice will be for that amount."
 	if p == nil {
 		createDesc = "[Without credentials, billing_method defaults to \"lightning\". The response includes a BOLT11 invoice and a sandbox_token; pay the invoice, then send Authorization: Bearer <sandbox_token> on subsequent calls or pass sandbox_token as a tool argument.] " + createDesc
 	}
@@ -96,13 +122,14 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 				"properties": {
 					"billing_method": {"type": "string", "enum": ["lightning", "credits"]},
 					"tier": {"type": "string", "enum": ["nano", "micro", "standard", "gpu_small", "gpu_large"]},
-					"label": {"type": "string"}
+					"label": {"type": "string"},
+					"prepaid_sats": {"type": "integer", "minimum": 1, "description": "Lightning only: override default prepay amount (sats). If omitted, server calculates based on tier rate."}
 				}
 			}`),
 		},
 		{
 			Name:        "sandbox_exec",
-			Description: "Run a shell command in the sandbox. working_dir defaults to SANDBOX_ROOT. Pass sandbox_token if not using bearer auth.",
+			Description: "Run a shell command asynchronously. Returns immediately with execution_id and status \"running\". Output is NOT included in this response. You MUST call sandbox_exec_result repeatedly with the execution_id to retrieve buffered stdout/stderr chunks. Keep polling until status is \"completed\", \"failed\", or \"cancelled\". Pass timeout_ms=0 for unlimited duration (model training, etc). Use sandbox_exec_cancel to abort. working_dir defaults to SANDBOX_ROOT.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id", "command"],
@@ -110,9 +137,32 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 					"sandbox_id": {"type": "string"},
 					"sandbox_token": {"type": "string"},
 					"command": {"type": "string"},
-					"timeout_ms": {"type": "integer"},
-					"env": {"type": "object"},
-					"working_dir": {"type": "string"}
+					"working_dir": {"type": "string"},
+					"timeout_ms": {"type": "integer", "description": "Timeout in milliseconds. Default 30000 (30s), max 300000 (5min). Set 0 for unlimited (long-running tasks)."}
+				}
+			}`),
+		},
+		{
+			Name:        "sandbox_exec_result",
+			Description: "Poll execution output. Returns new stdout/stderr chunks since last poll, current status (running/completed/failed/cancelled), and exit_code when done. Also includes pending_invoice if the sandbox needs payment. Call repeatedly until status is no longer \"running\".",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"required": ["execution_id"],
+				"properties": {
+					"execution_id": {"type": "string"},
+					"sandbox_token": {"type": "string"}
+				}
+			}`),
+		},
+		{
+			Name:        "sandbox_exec_cancel",
+			Description: "Cancel a running execution by execution_id. Must be called from the same session that started the execution. Returns immediately with status \"cancelled\".",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"required": ["execution_id"],
+				"properties": {
+					"execution_id": {"type": "string"},
+					"sandbox_token": {"type": "string"}
 				}
 			}`),
 		},
@@ -164,7 +214,7 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_status",
-			Description: "Sandbox row plus optional live runtime status. For lightning sandboxes, includes prepaid_balance_msats, seconds_remaining, and pending_invoice when one is outstanding.",
+			Description: "Get sandbox status, billing state, and runtime metrics. For lightning sandboxes: returns prepaid_balance_msats, seconds_remaining, msats_per_second, warning_level, next_poll_secs, and pending_invoice when payment is needed. IMPORTANT: call sandbox_status again after next_poll_secs seconds — it adapts automatically (short when balance is low, longer when healthy, range 5–60 s). Pay the pending_invoice BOLT11 immediately when present.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id"],
@@ -200,14 +250,15 @@ func toolList(svc *Service, p *auth.Principal) []toolDef {
 		},
 		{
 			Name:        "sandbox_terminate",
-			Description: "Permanently delete the sandbox and pod.",
+			Description: "Permanently delete the sandbox and pod. For lightning sandboxes, pass lightning_address to receive a refund of any remaining prepaid balance.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"required": ["sandbox_id", "confirm"],
 				"properties": {
 					"sandbox_id": {"type": "string"},
 					"sandbox_token": {"type": "string"},
-					"confirm": {"type": "boolean"}
+					"confirm": {"type": "boolean"},
+					"lightning_address": {"type": "string", "description": "Lightning address to refund remaining prepaid balance (lightning billing only)."}
 				}
 			}`),
 		},

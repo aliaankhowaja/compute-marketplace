@@ -153,11 +153,14 @@ export class ComputeClient {
     }
   }
 
-  async createSandbox(body: { billingMethod: string; tier: string }): Promise<Sandbox> {
+  async createSandbox(body: { billingMethod: string; tier: string; prepaidSats?: number }): Promise<Sandbox> {
     const payload: Record<string, unknown> = {
       billing_method: body.billingMethod,
       tier: body.tier,
     };
+    if (body.prepaidSats != null) {
+      payload.prepaid_sats = body.prepaidSats;
+    }
     const resp = await this.controlPlaneFetch("POST", "/v1/sandbox/create", {
       body: JSON.stringify(payload),
     });
@@ -499,8 +502,12 @@ export class Sandbox {
     await this.refreshDataJwt(true);
   }
 
-  async terminate(): Promise<void> {
-    const resp = await this.client.controlPlaneFetch("DELETE", `/v1/sandbox/${this.id}`);
+  async terminate(opts?: { lightningAddress?: string }): Promise<void> {
+    const init: RequestInit = {};
+    if (opts?.lightningAddress) {
+      init.body = JSON.stringify({ lightning_address: opts.lightningAddress });
+    }
+    const resp = await this.client.controlPlaneFetch("DELETE", `/v1/sandbox/${this.id}`, init);
     if (!resp.ok) await readError(resp);
   }
 

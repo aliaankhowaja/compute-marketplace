@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"os/user"
 	"strconv"
@@ -53,15 +54,14 @@ func ExecHandler(cfg *Config) http.Handler {
 			return
 		}
 
-		timeout := 120 * time.Second
+		var ctx context.Context
+		var cancel context.CancelFunc
 		if req.TimeoutSeconds > 0 {
-			timeout = time.Duration(req.TimeoutSeconds) * time.Second
-			if timeout > 30*time.Minute {
-				timeout = 30 * time.Minute
-			}
+			timeout := time.Duration(req.TimeoutSeconds) * time.Second
+			ctx, cancel = context.WithTimeout(r.Context(), timeout)
+		} else {
+			ctx, cancel = context.WithCancel(r.Context())
 		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 
 		cred, err := credForUser(cfg.SandboxUser)
@@ -83,6 +83,7 @@ func ExecHandler(cfg *Config) http.Handler {
 		cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
 		cmd.Dir = workDir
 		cmd.SysProcAttr = cred
+		cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
 
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout

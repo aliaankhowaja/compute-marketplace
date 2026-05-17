@@ -30,6 +30,9 @@ type Control struct {
 	RunPodTemplateGPUSmallID string
 	RunPodTemplateGPULargeID string
 
+	UsePodMock bool
+	PodMockURL string
+
 	// LightningNetwork is mainnet | testnet — used for BOLT11 decode / validation only (not node RPC).
 	LightningNetwork string
 
@@ -71,11 +74,19 @@ type Control struct {
 	MCPDataJWTTTL       time.Duration // 0 = use DataJWTTTL for data_jwt minting on MCP→pod proxy
 	// MCPRPM is per-principal-or-IP requests per minute for POST /v1/mcp.
 	MCPRPM int
+	// MCPExecMaxTimeout is the maximum duration for async exec (MCP_EXEC_MAX_TIMEOUT_SECS, default 4h).
+	MCPExecMaxTimeout time.Duration
+	// MCPSessionTTL is how long an idle MCP session lives before cleanup (MCP_SESSION_TTL_SECS, default 2h).
+	MCPSessionTTL time.Duration
+	// MCPMaxConcurrentExec is max concurrent async execs per session (MCP_MAX_CONCURRENT_EXEC, default 10).
+	MCPMaxConcurrentExec int
 
 	// SandboxPrepaySecs is how many seconds of compute one sandbox-scoped BOLT11 prepays.
 	SandboxPrepaySecs int
 	// SandboxTopupTriggerSecs is how few seconds of remaining balance triggers a top-up mint.
 	SandboxTopupTriggerSecs int
+	// NegativeGraceSecs is how long a sandbox runs at negative balance before hard-pause (0 = immediate).
+	NegativeGraceSecs int
 
 	// SandboxReadyTimeout is the max time to wait for sockt-runtime /healthz after pod create or resume (SANDBOX_READY_TIMEOUT_SECS).
 	SandboxReadyTimeout time.Duration
@@ -177,6 +188,7 @@ func Load() (*Control, error) {
 		RunPodTemplateCPUID:      strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_CPU_ID")),
 		RunPodTemplateGPUSmallID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_SMALL_ID")),
 		RunPodTemplateGPULargeID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_LARGE_ID")),
+		PodMockURL:               strings.TrimRight(envOrDefault("POD_MOCK_URL", "http://localhost:9090"), "/"),
 		LightningNetwork:         envOrDefault("LIGHTNING_NETWORK", envOrDefault("LND_NETWORK", "mainnet")),
 		LNBOTAPIBaseURL:          strings.TrimSpace(os.Getenv("LNBOT_API_BASE_URL")),
 		LNBOTAPIKey:              strings.TrimSpace(os.Getenv("LNBOT_API_KEY")),
@@ -188,6 +200,11 @@ func Load() (*Control, error) {
 	}
 
 	var err error
+	c.UsePodMock, err = parseBool("USE_POD_MOCK", false)
+	if err != nil {
+		return nil, err
+	}
+
 	if c.LNBOTAPIBaseURL == "" {
 		c.LNBOTAPIBaseURL = "https://api.ln.bot"
 	}
@@ -248,6 +265,18 @@ func Load() (*Control, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.MCPExecMaxTimeout, err = parseDurationSecs("MCP_EXEC_MAX_TIMEOUT_SECS", 4*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	c.MCPSessionTTL, err = parseDurationSecs("MCP_SESSION_TTL_SECS", 2*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	c.MCPMaxConcurrentExec, err = parseInt("MCP_MAX_CONCURRENT_EXEC", 10)
+	if err != nil {
+		return nil, err
+	}
 	c.SandboxPrepaySecs, err = parseInt("SANDBOX_PREPAY_SECS", 30)
 	if err != nil {
 		return nil, err
@@ -261,6 +290,13 @@ func Load() (*Control, error) {
 	}
 	if c.SandboxTopupTriggerSecs < 1 {
 		c.SandboxTopupTriggerSecs = 1
+	}
+	c.NegativeGraceSecs, err = parseInt("NEGATIVE_GRACE_SECS", 120)
+	if err != nil {
+		return nil, err
+	}
+	if c.NegativeGraceSecs < 0 {
+		c.NegativeGraceSecs = 0
 	}
 
 	c.SandboxReadyTimeout, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_SECS", 120*time.Second)

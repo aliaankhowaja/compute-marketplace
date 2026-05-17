@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -19,13 +20,16 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
 
-// Service is the MCP tool implementation (stateless).
+
+// Service is the MCP tool implementation.
 type Service struct {
 	Cfg        *config.Control
 	Store      *store.Store
 	PaySvc     *payment.Service
 	Orch       *orchestrator.Service
 	HTTPClient *http.Client
+	Sessions   *SessionRegistry
+	Executions *ExecutionRegistry
 }
 
 // NewService constructs an MCP service. HTTPClient may be nil (default from config timeout).
@@ -38,6 +42,7 @@ func NewService(cfg *config.Control, st *store.Store, paySvc *payment.Service, o
 		HTTPClient: hc,
 	}
 }
+
 
 func (s *Service) principalCanAccess(_ context.Context, p *auth.Principal, sb *store.Sandbox, args map[string]any) (bool, error) {
 	if sb == nil {
@@ -64,6 +69,34 @@ func (s *Service) principalCanAccess(_ context.Context, p *auth.Principal, sb *s
 	return false, nil
 }
 
+// ServeToolCall handles a tools/call request and writes a standard JSON-RPC response.
+func (s *Service) ServeToolCall(w http.ResponseWriter, r *http.Request, session *Session, p *auth.Principal, name string, args json.RawMessage, rpcID json.RawMessage) {
+	var res any
+	var st int
+	var slug string
+	var extra map[string]any
+
+	asyncTools := map[string]bool{"sandbox_exec": true, "sandbox_exec_cancel": true, "sandbox_exec_result": true}
+	if asyncTools[name] {
+		res, st, slug, extra = s.CallToolAsync(r.Context(), session, p, name, args)
+	} else {
+		res, st, slug, extra = s.CallTool(r.Context(), p, name, args)
+	}
+
+	var resp Response
+	switch {
+	case st == 0 && slug == "" && res == nil:
+		resp = rpcErr(rpcID, http.StatusBadRequest, "unknown_tool", "unknown tool", map[string]any{"tool": name})
+	case st != 0:
+		msg := rpcErrMessageFromExtra(slug, extra)
+		resp = rpcOK(rpcID, toolErrorResult(slug, msg, extra))
+	default:
+		resp = rpcOK(rpcID, rewrapToolResult(res))
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // CallTool runs a named tool. httpStatus 0 with empty slug means unknown tool. On success httpStatus is 0 and slug is "".
 func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, args json.RawMessage) (result any, httpStatus int, slug string, extra map[string]any) {
 	if s == nil {
@@ -75,7 +108,7 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	case "":
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "tool name required"}
 	case "sandbox_create", "sandbox_exec", "sandbox_write_file", "sandbox_read_file", "sandbox_list_files",
-		"sandbox_status", "sandbox_pause", "sandbox_resume", "sandbox_terminate":
+		"sandbox_status", "sandbox_pause", "sandbox_resume", "sandbox_terminate", "sandbox_exec_cancel", "sandbox_exec_result":
 	default:
 		return nil, 0, "", nil
 	}
@@ -91,7 +124,7 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	}
 
 	if s.Store == nil {
-		return nil, http.StatusServiceUnavailable, "store_unavailable", map[string]any{"message": "store not configured"}
+		return nil, http.StatusServiceUnavailable, "store_unavailable", map[string]any{"message": "store not configured", "retryable": true, "hint": "Database temporarily unavailable. Retry in a few seconds."}
 	}
 
 	switch name {
@@ -113,9 +146,128 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 		return s.toolSandboxResume(ctx, p, m)
 	case "sandbox_terminate":
 		return s.toolSandboxTerminate(ctx, p, m)
+	case "sandbox_exec_cancel", "sandbox_exec_result":
+		return nil, http.StatusBadRequest, "session_required", map[string]any{
+			"message": fmt.Sprintf("%s requires an active session (Mcp-Session-Id header)", name),
+			"hint":    "Call initialize first to obtain a session, then include Mcp-Session-Id header on subsequent requests.",
+		}
 	default:
 		return nil, 0, "", nil
 	}
+}
+
+// CallToolAsync handles tools that return immediately and deliver results via SSE.
+func (s *Service) CallToolAsync(ctx context.Context, session *Session, p *auth.Principal, name string, args json.RawMessage) (result any, httpStatus int, slug string, extra map[string]any) {
+	if s == nil {
+		return nil, http.StatusServiceUnavailable, "service_unavailable", map[string]any{"message": "service not configured"}
+	}
+	var m map[string]any
+	if len(args) > 0 && string(args) != "null" {
+		if err := json.Unmarshal(args, &m); err != nil {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "arguments must be a JSON object"}
+		}
+	}
+	if m == nil {
+		m = map[string]any{}
+	}
+
+	switch name {
+	case "sandbox_exec":
+		id, ok := parseUUIDArg(m, "sandbox_id")
+		if !ok {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
+		}
+		sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, m)
+		if sb == nil {
+			return nil, st, slug, ex
+		}
+		return s.toolExecAsync(session, sb, m)
+
+	case "sandbox_exec_cancel":
+		execID := strings.TrimSpace(argString(m, "execution_id"))
+		if execID == "" {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "execution_id required"}
+		}
+		if s.Executions == nil {
+			return nil, http.StatusServiceUnavailable, "service_unavailable", nil
+		}
+		if ok := s.Executions.Cancel(execID); !ok {
+			return nil, http.StatusNotFound, "not_found", map[string]any{
+				"message": "execution not found or already completed",
+				"hint":    "The execution may have already finished or been cleaned up.",
+			}
+		}
+		return map[string]any{"execution_id": execID, "status": "cancelled"}, 0, "", nil
+
+	case "sandbox_exec_result":
+		execID := strings.TrimSpace(argString(m, "execution_id"))
+		if execID == "" {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "execution_id required"}
+		}
+		if s.Executions == nil {
+			return nil, http.StatusServiceUnavailable, "service_unavailable", nil
+		}
+		exec := s.Executions.Get(execID)
+		if exec == nil {
+			return nil, http.StatusNotFound, "not_found", map[string]any{
+				"message": "execution not found",
+				"hint":    "The execution may have expired or been cleaned up. Completed executions are only retained temporarily.",
+			}
+		}
+		if exec.SessionID != session.ID {
+			return nil, http.StatusForbidden, "forbidden", map[string]any{
+				"message": "execution belongs to another session",
+				"hint":    "You can only poll executions started in your current session (same Mcp-Session-Id).",
+			}
+		}
+		return s.toolExecResult(ctx, exec)
+
+	default:
+		return nil, 0, "", nil
+	}
+}
+
+func (s *Service) toolExecResult(ctx context.Context, exec *Execution) (any, int, string, map[string]any) {
+	chunks, status, exitCode, errMsg := exec.PollOutput()
+
+	output := make([]map[string]any, 0, len(chunks))
+	for _, c := range chunks {
+		output = append(output, map[string]any{"stream": c.Stream, "chunk": c.Data})
+	}
+
+	out := map[string]any{
+		"execution_id": exec.ID,
+		"status":       status,
+		"output":       output,
+	}
+	if exitCode != nil {
+		out["exit_code"] = *exitCode
+	}
+	if errMsg != "" {
+		out["error"] = errMsg
+	}
+
+	// Include pending invoice if sandbox has one
+	if s.Store != nil {
+		sb, err := s.Store.GetSandbox(ctx, exec.SandboxID)
+		if err == nil && sb != nil && sb.BillingMethod == "lightning" && sb.PendingInvoiceBolt11 != nil {
+			pending := map[string]any{
+				"bolt11": *sb.PendingInvoiceBolt11,
+			}
+			if len(sb.PendingInvoicePaymentHash) == 32 {
+				pending["payment_hash"] = hex.EncodeToString(sb.PendingInvoicePaymentHash)
+			}
+			if sb.PendingInvoiceAmountMsats != nil {
+				pending["amount_msats"] = *sb.PendingInvoiceAmountMsats
+			}
+			if sb.PendingInvoiceExpiresAt != nil {
+				pending["expires_at"] = sb.PendingInvoiceExpiresAt.UTC().Format(time.RFC3339)
+			}
+			out["pending_invoice"] = pending
+		}
+	}
+
+	return out, 0, "", nil
 }
 
 func (s *Service) getSandboxForPrincipal(ctx context.Context, p *auth.Principal, id uuid.UUID, args map[string]any) (*store.Sandbox, int, string, map[string]any) {
@@ -160,14 +312,15 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	}
 	_, templateLabel, runtimeLabel, err := orchestrator.ResolveTier(s.Cfg, tier)
 	if err != nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": err.Error()}
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": err.Error(), "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 
 	switch bm {
 	case "credits":
 		return s.createCreditsSandbox(ctx, p, tier, templateLabel, runtimeLabel, pr)
 	case "lightning":
-		return s.createLightningSandbox(ctx, tier, templateLabel, runtimeLabel, pr)
+		clientPrepaidSats := int64(argFloat(args, "prepaid_sats"))
+		return s.createLightningSandbox(ctx, tier, templateLabel, runtimeLabel, pr, clientPrepaidSats)
 	}
 	return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing_method"}
 }
@@ -201,7 +354,7 @@ func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, t
 	}
 	env := orchestrator.BuildSandboxEnv(s.Cfg, sb, alloc, rate)
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "runpod not configured"}
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "runpod not configured", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.CreateSandbox(ctx, sb, env); err != nil {
 		return nil, http.StatusBadGateway, "runpod_error", map[string]any{"message": err.Error()}
@@ -210,25 +363,33 @@ func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, t
 	return sb2, 0, "", nil
 }
 
-func (s *Service) createLightningSandbox(ctx context.Context, tier, templateLabel, runtimeLabel string, pr *store.TierPricing) (any, int, string, map[string]any) {
+func (s *Service) createLightningSandbox(ctx context.Context, tier, templateLabel, runtimeLabel string, pr *store.TierPricing, clientPrepaidSats int64) (any, int, string, map[string]any) {
 	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
-		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning payment not configured"}
-	}
-	prepaySecs := s.Cfg.SandboxPrepaySecs
-	if prepaySecs <= 0 {
-		prepaySecs = 30
+		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning payment not configured", "retryable": false, "hint": "Lightning payments not configured on this server."}
 	}
 	rate := pr.MsatsPerSecond
 	if rate <= 0 {
 		return nil, http.StatusInternalServerError, "tier_error", map[string]any{"message": "tier has no lightning rate"}
 	}
-	prepayMsats := int64(prepaySecs) * rate
-	prepaySats := prepayMsats / 1000
-	if prepayMsats%1000 != 0 {
-		prepaySats++
-	}
-	if prepaySats <= 0 {
-		prepaySats = 1
+
+	var prepaySats int64
+	var prepaySecs int
+	if clientPrepaidSats > 0 {
+		prepaySats = clientPrepaidSats
+		prepaySecs = int((prepaySats * 1000) / rate)
+	} else {
+		prepaySecs = s.Cfg.SandboxPrepaySecs
+		if prepaySecs <= 0 {
+			prepaySecs = 30
+		}
+		prepayMsats := int64(prepaySecs) * rate
+		prepaySats = prepayMsats / 1000
+		if prepayMsats%1000 != 0 {
+			prepaySats++
+		}
+		if prepaySats <= 0 {
+			prepaySats = 1
+		}
 	}
 
 	token, err := newSandboxToken()
@@ -390,6 +551,26 @@ func (s *Service) toolSandboxStatus(ctx context.Context, p *auth.Principal, args
 		default:
 			out["warning_level"] = "ok"
 		}
+
+		var nextPoll int64
+		switch out["warning_level"] {
+		case "awaiting_payment", "out_of_balance":
+			nextPoll = 5
+		default:
+			timeUntilTrigger := secsRemaining - int64(s.Cfg.SandboxTopupTriggerSecs)
+			if timeUntilTrigger < 0 {
+				timeUntilTrigger = 0
+			}
+			nextPoll = timeUntilTrigger / 2
+			if nextPoll < 5 {
+				nextPoll = 5
+			}
+			if nextPoll > 60 {
+				nextPoll = 60
+			}
+		}
+		out["next_poll_secs"] = nextPoll
+
 		if sb.PendingInvoiceBolt11 != nil {
 			pending := map[string]any{
 				"bolt11": *sb.PendingInvoiceBolt11,
@@ -438,7 +619,7 @@ func (s *Service) toolSandboxPause(ctx context.Context, p *auth.Principal, args 
 		podID = *sb.PodID
 	}
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", nil
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "pod orchestration not available", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.PauseSandbox(ctx, podID, id); err != nil {
 		return nil, http.StatusBadGateway, "pause_failed", map[string]any{"message": err.Error()}
@@ -460,7 +641,7 @@ func (s *Service) toolSandboxResume(ctx context.Context, p *auth.Principal, args
 		podID = *sb.PodID
 	}
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", nil
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "pod orchestration not available", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.ResumeSandbox(ctx, podID, id); err != nil {
 		return nil, http.StatusBadGateway, "resume_failed", map[string]any{"message": err.Error()}
@@ -497,18 +678,52 @@ func (s *Service) toolSandboxTerminate(ctx context.Context, p *auth.Principal, a
 		podID = *sb.PodID
 	}
 	if s.Orch == nil {
-		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", nil
+		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "pod orchestration not available", "retryable": false, "hint": "Pod orchestration not configured on this server."}
 	}
 	if err := s.Orch.TerminateSandbox(ctx, podID, id); err != nil {
 		return nil, http.StatusBadGateway, "terminate_failed", map[string]any{"message": err.Error()}
 	}
-	return map[string]any{
+
+	var refundResult map[string]any
+	lightningAddr := strings.TrimSpace(argString(args, "lightning_address"))
+	if sb.BillingMethod == "lightning" && lightningAddr != "" && sb.PrepaidBalanceMsats > 0 {
+		refundResult = s.attemptLightningRefund(ctx, id, sb.PrepaidBalanceMsats, lightningAddr)
+	}
+
+	out := map[string]any{
 		"sandbox_id":           id.String(),
 		"status":               "terminated",
-		"total_uptime_secs":    0,
 		"consumed_msats_total": sb.ConsumedMsats,
 		"terminated_at":        time.Now().UTC().Format(time.RFC3339),
-	}, 0, "", nil
+	}
+	if refundResult != nil {
+		out["refund"] = refundResult
+	}
+	return out, 0, "", nil
+}
+
+func (s *Service) attemptLightningRefund(ctx context.Context, sandboxID uuid.UUID, remainingMsats int64, address string) map[string]any {
+	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
+		slog.Warn("refund skipped: lightning not configured", "sandbox_id", sandboxID.String())
+		return map[string]any{"status": "skipped", "reason": "lightning not configured"}
+	}
+
+	refundSats := remainingMsats / 1000
+	if remainingMsats%1000 != 0 {
+		refundSats++
+	}
+	if refundSats <= 0 {
+		return map[string]any{"status": "skipped", "reason": "balance too small"}
+	}
+
+	idem := fmt.Sprintf("sandbox-refund:%s", sandboxID.String())
+	if err := s.PaySvc.SendToAddress(ctx, address, refundSats, idem); err != nil {
+		slog.Error("lightning refund failed", "sandbox_id", sandboxID.String(), "address", address, "amount_sats", refundSats, "err", err)
+		return map[string]any{"status": "failed", "reason": err.Error(), "amount_sats": refundSats}
+	}
+
+	slog.Info("lightning refund sent", "sandbox_id", sandboxID.String(), "address", address, "amount_sats", refundSats)
+	return map[string]any{"status": "sent", "amount_sats": refundSats, "address": address}
 }
 
 // newSandboxToken returns a 256-bit Crockford-base32 opaque bearer token, prefixed `sbx_`.

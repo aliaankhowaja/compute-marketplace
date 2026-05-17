@@ -2,5 +2,9 @@
 vendor/
 runpod-reader-key.json
 .env.cp
+.env.cp.dev
 .env.rt
 .cursor/
+control-plane
+pod-mock
+logs/

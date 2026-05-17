@@ -1,0 +1,53 @@
+networks:
+  default:
+    name: sockt-dev
+
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    user: "0:0"
+    ports:
+      - "8080:8080"
+    env_file: .env.cp.dev
+    environment:
+      LISTEN_HTTP: "0.0.0.0:8080"
+      USE_POD_MOCK: "true"
+      POD_MOCK_URL: "http://pod-mock:9090"
+      CONTROL_PLANE_URL: "http://host.docker.internal:8080"
+      HTTP_LOG_FILE: "/var/log/sockt/cp.log"
+    volumes:
+      - ./logs:/var/log/sockt
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      pod-mock:
+        condition: service_started
+
+  pod-mock:
+    build:
+      context: .
+      dockerfile: pod-mock/Dockerfile
+    ports:
+      - "9090:9090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/var/log/sockt
+    environment:
+      POD_MOCK_PORT: "9090"
+      POD_MOCK_RUNTIME_IMAGE: "sockt-runtime"
+      POD_MOCK_PORT_BASE: "18000"
+      POD_MOCK_PROXY_HOST: "host.docker.internal"
+      POD_MOCK_NETWORK: "sockt-dev"
+      HTTP_LOG_FILE: "/var/log/sockt/pm.log"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  runtime-image:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sockt-runtime
+    profiles:
+      - build-only

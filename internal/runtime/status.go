@@ -6,10 +6,12 @@ import (
 )
 
 type statusResponse struct {
-	Service string           `json:"service"`
-	Version string           `json:"version,omitempty"`
-	Balance RuntimeBalance   `json:"balance"`
-	Commit  string           `json:"commit,omitempty"`
+	Service            string         `json:"service"`
+	Version            string         `json:"version,omitempty"`
+	Balance            RuntimeBalance `json:"balance"`
+	Commit             string         `json:"commit,omitempty"`
+	NegativeGraceSecs  int64          `json:"negative_grace_secs,omitempty"`
+	GraceRemainingSecs int64          `json:"grace_remaining_secs,omitempty"`
 }
 
 // StatusHandler returns meter snapshot + runtime metadata.
@@ -33,10 +35,15 @@ func StatusHandler(cfg *Config, meter *Meter) http.Handler {
 			modVersion = info.Main.Version
 		}
 
-		writeJSON(w, http.StatusOK, statusResponse{
+		resp := statusResponse{
 			Service: "sockt-runtime",
 			Version: modVersion,
 			Balance: meter.Snapshot(),
-		})
+		}
+		if gr := meter.GraceRemaining(); gr > 0 {
+			resp.NegativeGraceSecs = cfg.NegativeGraceSecs
+			resp.GraceRemainingSecs = gr
+		}
+		writeJSON(w, http.StatusOK, resp)
 	})
 }

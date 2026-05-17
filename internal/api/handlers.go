@@ -300,6 +300,14 @@ func handleDeleteSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			writeErr(w, http.StatusBadRequest, "bad_request", "id")
 			return
 		}
+
+		var body struct {
+			LightningAddress string `json:"lightning_address"`
+		}
+		if r.Body != nil {
+			_ = json.NewDecoder(r.Body).Decode(&body)
+		}
+
 		sb, err := d.Store.GetSandbox(r.Context(), id)
 		if err != nil || sb == nil || !canAccessSandbox(p, sb) {
 			writeErr(w, http.StatusForbidden, "forbidden", "")
@@ -313,6 +321,19 @@ func handleDeleteSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			writeErr(w, http.StatusBadGateway, "terminate_failed", err.Error())
 			return
 		}
+
+		addr := strings.TrimSpace(body.LightningAddress)
+		if sb.BillingMethod == "lightning" && addr != "" && sb.PrepaidBalanceMsats > 0 && d.PaySvc != nil {
+			refundSats := sb.PrepaidBalanceMsats / 1000
+			if sb.PrepaidBalanceMsats%1000 != 0 {
+				refundSats++
+			}
+			if refundSats > 0 {
+				idem := "sandbox-refund:" + id.String()
+				_ = d.PaySvc.SendToAddress(r.Context(), addr, refundSats, idem)
+			}
+		}
+
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

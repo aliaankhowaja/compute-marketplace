@@ -32,9 +32,15 @@ type RunPodClient struct {
 }
 
 func NewRunPodClient(cfg *config.Control) *RunPodClient {
+	baseURL := strings.TrimRight(cfg.RunPodAPIURL, "/")
+	apiKey := cfg.RunPodAPIKey
+	if cfg.UsePodMock {
+		baseURL = strings.TrimRight(cfg.PodMockURL, "/") + "/v1"
+		apiKey = "mock"
+	}
 	return &RunPodClient{
-		BaseURL: strings.TrimRight(cfg.RunPodAPIURL, "/"),
-		APIKey:  cfg.RunPodAPIKey,
+		BaseURL: baseURL,
+		APIKey:  apiKey,
 		HTTP:    &http.Client{Timeout: 120 * time.Second},
 	}
 }
@@ -76,6 +82,7 @@ type CreatePodRequest struct {
 	CPUFlavorIDs      []string `json:"cpuFlavorIds,omitempty"`
 	CPUFlavorPriority string   `json:"cpuFlavorPriority,omitempty"`
 	VCPUCount         int      `json:"vcpuCount,omitempty"`
+	MemoryInGb        int      `json:"memoryInGb,omitempty"`
 	GPUCount          int      `json:"gpuCount,omitempty"`
 	MinVCPUPerGPU     int      `json:"minVCPUPerGPU,omitempty"`
 	MinRAMPerGPU      int      `json:"minRAMPerGPU,omitempty"`
@@ -87,7 +94,7 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 		return CreatePodRequest{}, "", "", fmt.Errorf("config is nil")
 	}
 	switch strings.TrimSpace(strings.ToLower(tier)) {
-	case "nano", "micro":
+	case "nano":
 		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
 		if id == "" {
 			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
@@ -98,6 +105,21 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         1,
+			MemoryInGb:        2,
+		}, "sockt-cpu", "runpod_cpu", nil
+
+	case "micro":
+		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
+		}
+		return CreatePodRequest{
+			TemplateID:        id,
+			ComputeType:       "CPU",
+			CPUFlavorIDs:      []string{"cpu3c"},
+			CPUFlavorPriority: "availability",
+			VCPUCount:         2,
+			MemoryInGb:        4,
 		}, "sockt-cpu", "runpod_cpu", nil
 
 	case "standard":
@@ -111,6 +133,7 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         4,
+			MemoryInGb:        8,
 		}, "sockt-cpu", "runpod_cpu", nil
 
 	case "gpu_small":
@@ -122,7 +145,7 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			TemplateID:    id,
 			ComputeType:   "GPU",
 			GPUCount:      1,
-			MinVCPUPerGPU: 4,
+			MinVCPUPerGPU: 6,
 			MinRAMPerGPU:  16,
 		}, "sockt-gpu-small", "runpod_gpu", nil
 
@@ -135,8 +158,8 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			TemplateID:    id,
 			ComputeType:   "GPU",
 			GPUCount:      1,
-			MinVCPUPerGPU: 8,
-			MinRAMPerGPU:  80,
+			MinVCPUPerGPU: 6,
+			MinRAMPerGPU:  32,
 		}, "sockt-gpu-large", "runpod_gpu", nil
 
 	default:
@@ -244,7 +267,7 @@ func (s *Service) CreateSandbox(ctx context.Context, sb *store.Sandbox, env map[
 	if err := s.Client.UpdatePodEnv(ctx, pid, env); err != nil {
 		return fmt.Errorf("runpod set env: %w", err)
 	}
-	proxy := fmt.Sprintf("https://%s-8443.proxy.runpod.net", pid)
+	proxy := RunPodProxyURL(s.Cfg, pid)
 	if err := s.Store.UpdateSandboxPod(ctx, sb.ID, strPtr(pid), strPtr(proxy), sb.NetworkVolumeID); err != nil {
 		return err
 	}
@@ -279,7 +302,7 @@ func (s *Service) ResumeSandbox(ctx context.Context, podID string, sandboxID uui
 	if err := s.Client.StartPod(ctx, podID); err != nil {
 		return err
 	}
-	proxy := RunPodProxyURL(podID)
+	proxy := RunPodProxyURL(s.Cfg, podID)
 	if err := s.waitForRuntime(ctx, proxy); err != nil {
 		return fmt.Errorf("runtime not ready after resume: %w", err)
 	}
@@ -294,10 +317,13 @@ func (s *Service) TerminateSandbox(ctx context.Context, podID string, sandboxID 
 	return s.Store.TerminateSandbox(ctx, sandboxID)
 }
 
-func RunPodProxyURL(podID string) string {
+func RunPodProxyURL(cfg *config.Control, podID string) string {
 	podID = strings.TrimSpace(podID)
 	if podID == "" {
 		return ""
+	}
+	if cfg != nil && cfg.UsePodMock {
+		return strings.TrimRight(cfg.PodMockURL, "/") + "/proxy/" + podID
 	}
 	return fmt.Sprintf("https://%s-8443.proxy.runpod.net", podID)
 }

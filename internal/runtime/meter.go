@@ -47,6 +47,10 @@ type Meter struct {
 	pauseTriggerInFlight bool
 	// nextTopupAttempt suppresses repeat topup-trigger calls while a deposit is pending.
 	nextTopupAttempt time.Time
+	// negativeGraceStart is set when balance first crosses below floor. Zero means not in grace period.
+	negativeGraceStart time.Time
+	// negativeGraceTopupNext throttles topup requests during the grace window.
+	negativeGraceTopupNext time.Time
 
 	subMu sync.RWMutex
 	subs  map[chan MeterEvent]struct{}
@@ -76,6 +80,21 @@ func (m *Meter) Snapshot() RuntimeBalance {
 	return m.balance
 }
 
+// GraceRemaining returns seconds left in the negative-balance grace period, or 0 if not in grace.
+func (m *Meter) GraceRemaining() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.negativeGraceStart.IsZero() || m.cfg.NegativeGraceSecs == 0 {
+		return 0
+	}
+	deadline := m.negativeGraceStart.Add(time.Duration(m.cfg.NegativeGraceSecs) * time.Second)
+	remaining := time.Until(deadline).Seconds()
+	if remaining < 0 {
+		return 0
+	}
+	return int64(remaining)
+}
+
 // ClearTopupFlight clears the credit allocation latch without changing balance.
 func (m *Meter) ClearTopupFlight() {
 	m.mu.Lock()
@@ -91,6 +110,8 @@ func (m *Meter) ApplyBalanceDelta(delta int64) {
 	if m.balance.Balance > m.cfg.SafetyFloor {
 		m.meterHalted = false
 		m.oobNotified = false
+		m.negativeGraceStart = time.Time{}
+		m.negativeGraceTopupNext = time.Time{}
 	}
 	b := m.balance.Balance
 	m.mu.Unlock()
@@ -105,6 +126,8 @@ func (m *Meter) ApplyNewBalance(newBal int64) {
 	if m.balance.Balance > m.cfg.SafetyFloor {
 		m.meterHalted = false
 		m.oobNotified = false
+		m.negativeGraceStart = time.Time{}
+		m.negativeGraceTopupNext = time.Time{}
 	}
 	m.mu.Unlock()
 	m.broadcast(MeterEvent{Type: "topup", Balance: newBal, Message: "balance_set"})
@@ -252,39 +275,144 @@ func (m *Meter) tick(parentCtx context.Context) {
 	}
 
 	if bal <= floor {
-		var notifyOOB, firePause bool
-		m.mu.Lock()
-		if !m.oobNotified {
-			m.oobNotified = true
-			notifyOOB = true
-		}
-		if !m.pauseTriggerInFlight {
-			m.pauseTriggerInFlight = true
-			firePause = true
-		}
-		m.mu.Unlock()
+		graceSecs := m.cfg.NegativeGraceSecs
+		if graceSecs == 0 {
+			// Grace disabled — immediate pause (legacy behavior).
+			var notifyOOB, firePause bool
+			m.mu.Lock()
+			if !m.oobNotified {
+				m.oobNotified = true
+				notifyOOB = true
+			}
+			if !m.pauseTriggerInFlight {
+				m.pauseTriggerInFlight = true
+				firePause = true
+			}
+			m.mu.Unlock()
 
-		if notifyOOB {
-			m.broadcast(MeterEvent{Type: "out_of_balance", Balance: bal})
-		}
-		if firePause {
-			go func(b0, c0 int64) {
-				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer cancel()
-				defer func() {
+			if notifyOOB {
+				m.broadcast(MeterEvent{Type: "out_of_balance", Balance: bal})
+			}
+			if firePause {
+				go func(b0, c0 int64) {
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer cancel()
+					defer func() {
+						m.mu.Lock()
+						m.pauseTriggerInFlight = false
+						m.mu.Unlock()
+					}()
+					if err := m.cb.PostPauseTrigger(ctx, b0, c0, "out_of_balance"); err != nil {
+						log.Printf("runtime/meter: pause-trigger failed: %v", err)
+						return
+					}
 					m.mu.Lock()
-					m.pauseTriggerInFlight = false
+					m.meterHalted = true
 					m.mu.Unlock()
-				}()
-				if err := m.cb.PostPauseTrigger(ctx, b0, c0, "out_of_balance"); err != nil {
-					log.Printf("runtime/meter: pause-trigger failed: %v", err)
-					return
-				}
-				m.mu.Lock()
-				m.meterHalted = true
+					m.flushAudit(context.Background())
+				}(bal, consumed)
+			}
+		} else {
+			// Grace period: keep running, request topups, hard-pause only after deadline.
+			m.mu.Lock()
+			if m.negativeGraceStart.IsZero() {
+				m.negativeGraceStart = now
+			}
+			if !m.oobNotified {
+				m.oobNotified = true
 				m.mu.Unlock()
-				m.flushAudit(context.Background())
-			}(bal, consumed)
+				m.broadcast(MeterEvent{
+					Type:                  "out_of_balance",
+					Balance:               bal,
+					Message:               "balance_negative_grace_started",
+					SuggestedDepositMsats: m.cfg.TopupAmount,
+				})
+			} else {
+				m.mu.Unlock()
+			}
+
+			// Continue requesting topups during grace (every 5s).
+			m.mu.RLock()
+			graceTopupNext := m.negativeGraceTopupNext
+			m.mu.RUnlock()
+			if !topupInFlight && now.After(graceTopupNext) {
+				m.mu.Lock()
+				m.balance.TopupInFlight = true
+				m.negativeGraceTopupNext = now.Add(5 * time.Second)
+				m.mu.Unlock()
+
+				go func(b0, c0 int64) {
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					defer cancel()
+					err := m.cb.PostBalanceTopupApply(ctx, b0, c0, func(tr TopupResponse) {
+						if tr.Deposit != nil {
+							m.broadcast(MeterEvent{
+								Type:                  "deposit_required",
+								Balance:               m.Snapshot().Balance,
+								Message:               tr.ErrorClass,
+								SuggestedDepositMsats: tr.Deposit.AmountMsats,
+								Deposit:               tr.Deposit,
+							})
+							m.ClearTopupFlight()
+							return
+						}
+						switch {
+						case tr.NewBalance != 0:
+							m.ApplyNewBalance(tr.NewBalance)
+						case tr.BalanceDelta != 0:
+							m.ApplyBalanceDelta(tr.BalanceDelta)
+						default:
+							m.ClearTopupFlight()
+						}
+					})
+					if err != nil {
+						log.Printf("runtime/meter: grace-topup-trigger failed: %v", err)
+						m.mu.Lock()
+						m.balance.TopupInFlight = false
+						m.mu.Unlock()
+					}
+				}(bal, consumed)
+			}
+
+			// Check if grace period has expired.
+			m.mu.RLock()
+			graceStart := m.negativeGraceStart
+			m.mu.RUnlock()
+
+			graceDeadline := graceStart.Add(time.Duration(graceSecs) * time.Second)
+			if !graceStart.IsZero() && now.After(graceDeadline) {
+				var firePause bool
+				m.mu.Lock()
+				if !m.pauseTriggerInFlight {
+					m.pauseTriggerInFlight = true
+					firePause = true
+				}
+				m.mu.Unlock()
+
+				if firePause {
+					go func(b0, c0 int64) {
+						ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+						defer cancel()
+						defer func() {
+							m.mu.Lock()
+							m.pauseTriggerInFlight = false
+							m.mu.Unlock()
+						}()
+						if err := m.cb.PostPauseTrigger(ctx, b0, c0, "grace_period_expired"); err != nil {
+							log.Printf("runtime/meter: pause-trigger failed: %v", err)
+							return
+						}
+						m.mu.Lock()
+						if m.balance.Balance > m.cfg.SafetyFloor {
+							m.mu.Unlock()
+							return
+						}
+						m.meterHalted = true
+						m.mu.Unlock()
+						m.flushAudit(context.Background())
+					}(bal, consumed)
+				}
+			}
 		}
 	}
 

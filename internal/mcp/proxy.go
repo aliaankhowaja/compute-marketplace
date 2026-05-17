@@ -29,7 +29,7 @@ func dataPlaneBase(sb *store.Sandbox) string {
 		return strings.TrimRight(strings.TrimSpace(*sb.PodProxyURL), "/")
 	}
 	if sb.PodID != nil && strings.TrimSpace(*sb.PodID) != "" {
-		return strings.TrimRight(orchestrator.RunPodProxyURL(*sb.PodID), "/")
+		return strings.TrimRight(orchestrator.RunPodProxyURL(nil, *sb.PodID), "/")
 	}
 	return ""
 }
@@ -82,9 +82,11 @@ type fileEntry struct {
 }
 
 type podStatusJSON struct {
-	Service string          `json:"service"`
-	Version string          `json:"version,omitempty"`
-	Balance json.RawMessage `json:"balance"`
+	Service            string          `json:"service"`
+	Version            string          `json:"version,omitempty"`
+	Balance            json.RawMessage `json:"balance"`
+	NegativeGraceSecs  int64           `json:"negative_grace_secs,omitempty"`
+	GraceRemainingSecs int64           `json:"grace_remaining_secs,omitempty"`
 }
 
 func (s *Service) proxyPOST(ctx context.Context, base, path, token string, body any) ([]byte, int, error) {
@@ -99,6 +101,26 @@ func (s *Service) proxyPOST(ctx context.Context, base, path, token string, body 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	return raw, resp.StatusCode, err
+}
+
+func (s *Service) proxyPOSTWithTimeout(ctx context.Context, base, path, token string, body any, timeout time.Duration) ([]byte, int, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(b))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := s.httpClientForTimeout(timeout).Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -133,6 +155,15 @@ func (s *Service) httpClient() *http.Client {
 	return &http.Client{Timeout: to}
 }
 
+// httpClientForTimeout returns a client whose timeout accommodates a known long-running request.
+// A zero duration means no timeout (used for async streaming exec).
+func (s *Service) httpClientForTimeout(d time.Duration) *http.Client {
+	if s != nil && s.HTTPClient != nil {
+		return s.HTTPClient
+	}
+	return &http.Client{Timeout: d}
+}
+
 func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[string]any) (any, int, string, map[string]any) {
 	base := dataPlaneBase(sb)
 	if base == "" {
@@ -143,15 +174,22 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "command required"}
 	}
 	timeoutMS := 30000.0
-	if v, ok := args["timeout_ms"].(float64); ok && v > 0 {
-		timeoutMS = v
+	unlimited := false
+	if v, ok := args["timeout_ms"].(float64); ok {
+		if v == 0 {
+			unlimited = true
+		} else if v > 0 {
+			timeoutMS = v
+		}
 	}
 	sec := int(timeoutMS / 1000)
-	if sec <= 0 {
-		sec = 1
-	}
-	if sec > 300 {
-		sec = 300
+	if !unlimited {
+		if sec <= 0 {
+			sec = 1
+		}
+		if sec > 300 {
+			sec = 300
+		}
 	}
 	cwd := "."
 	if v, ok := args["working_dir"].(string); ok && strings.TrimSpace(v) != "" {
@@ -162,12 +200,27 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 		return nil, http.StatusInternalServerError, "token_error", map[string]any{"message": err.Error()}
 	}
 	path := fmt.Sprintf("/sandbox/%s/exec", sb.ID.String())
+	runtimeTimeout := sec
+	if unlimited {
+		runtimeTimeout = 0
+	}
 	body := execRuntimeRequest{
 		Argv:           []string{"/bin/bash", "-lc", cmd},
 		CWD:            cwd,
-		TimeoutSeconds: sec,
+		TimeoutSeconds: runtimeTimeout,
 	}
-	raw, code, err := s.proxyPOST(ctx, base, path, tok, body)
+	var execTimeout time.Duration
+	if unlimited {
+		execTimeout = 4 * time.Hour
+		if s.Cfg != nil && s.Cfg.MCPExecMaxTimeout > 0 {
+			execTimeout = s.Cfg.MCPExecMaxTimeout
+		}
+	} else {
+		execTimeout = time.Duration(sec+10) * time.Second
+	}
+	execCtx, execCancel := context.WithTimeout(ctx, execTimeout)
+	defer execCancel()
+	raw, code, err := s.proxyPOSTWithTimeout(execCtx, base, path, tok, body, execTimeout)
 	if err != nil {
 		return nil, http.StatusServiceUnavailable, "host_unreachable", map[string]any{"message": err.Error()}
 	}
@@ -186,6 +239,175 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 		"duration_ms": 0,
 		"timed_out":   false,
 	}, 0, "", nil
+}
+
+func (s *Service) toolExecAsync(session *Session, sb *store.Sandbox, args map[string]any) (any, int, string, map[string]any) {
+	base := dataPlaneBase(sb)
+	if base == "" {
+		return nil, http.StatusBadRequest, "pod_unreachable", map[string]any{"message": "no data plane endpoint"}
+	}
+	cmd, _ := args["command"].(string)
+	if strings.TrimSpace(cmd) == "" {
+		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "command required"}
+	}
+	cwd := "."
+	if v, ok := args["working_dir"].(string); ok && strings.TrimSpace(v) != "" {
+		cwd = v
+	}
+
+	maxTimeout := 4 * time.Hour
+	if s.Cfg != nil && s.Cfg.MCPExecMaxTimeout > 0 {
+		maxTimeout = s.Cfg.MCPExecMaxTimeout
+	}
+
+	maxConc := 10
+	if s.Cfg != nil && s.Cfg.MCPMaxConcurrentExec > 0 {
+		maxConc = s.Cfg.MCPMaxConcurrentExec
+	}
+	if s.Executions.CountForSession(session.ID) >= maxConc {
+		return nil, http.StatusTooManyRequests, "too_many_executions", map[string]any{
+			"message": fmt.Sprintf("max %d concurrent executions per session", maxConc),
+		}
+	}
+
+	execCtx, execCancel := context.WithTimeout(context.Background(), maxTimeout)
+	exec := s.Executions.Create(session.ID, sb.ID, cmd, execCancel)
+	s.Sessions.TrackSandbox(session.ID, sb.ID)
+
+	go s.runExecAsync(execCtx, execCancel, exec, sb, cmd, cwd)
+
+	return map[string]any{
+		"execution_id": exec.ID,
+		"status":       "running",
+		"sandbox_id":   sb.ID.String(),
+		"command":      cmd,
+		"next_step":    "Poll sandbox_exec_result with this execution_id to retrieve output. Repeat until status is 'completed', 'failed', or 'cancelled'.",
+	}, 0, "", nil
+}
+
+func (s *Service) runExecAsync(ctx context.Context, cancel context.CancelFunc, exec *Execution, sb *store.Sandbox, cmd, cwd string) {
+	defer cancel()
+
+	base := dataPlaneBase(sb)
+	tok, err := s.proxyDataJWT(sb, runtime.ScopeExec)
+	if err != nil {
+		s.Executions.Complete(exec.ID, "failed")
+		exec.SetError(err.Error())
+		return
+	}
+
+	streamPath := fmt.Sprintf("/sandbox/%s/exec/stream", sb.ID.String())
+	body := execRuntimeRequest{
+		Argv:           []string{"/bin/bash", "-lc", cmd},
+		CWD:            cwd,
+		TimeoutSeconds: 0,
+	}
+
+	streamed := s.tryStreamingExec(ctx, exec, sb, base, streamPath, tok, body)
+	if streamed {
+		return
+	}
+
+	fallbackPath := fmt.Sprintf("/sandbox/%s/exec", sb.ID.String())
+	fallbackBody := execRuntimeRequest{
+		Argv:           []string{"/bin/bash", "-lc", cmd},
+		CWD:            cwd,
+		TimeoutSeconds: 0,
+	}
+	raw, code, err := s.proxyPOSTWithTimeout(ctx, base, fallbackPath, tok, fallbackBody, 0)
+	if err != nil {
+		status := "failed"
+		if ctx.Err() != nil {
+			status = "cancelled"
+		}
+		s.Executions.Complete(exec.ID, status)
+		exec.SetError(err.Error())
+		return
+	}
+	if code < 200 || code >= 300 {
+		s.Executions.Complete(exec.ID, "failed")
+		_, textErr := decodeJSONOrText(raw, code)
+		exec.SetError(textErr)
+		return
+	}
+
+	var out execRuntimeResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		s.Executions.Complete(exec.ID, "failed")
+		exec.SetError("invalid response from runtime")
+		return
+	}
+
+	s.Executions.Complete(exec.ID, "completed")
+	exec.SetDone(out.ExitCode)
+	if out.Stdout != "" {
+		exec.AppendOutput("stdout", out.Stdout)
+	}
+	if out.Stderr != "" {
+		exec.AppendOutput("stderr", out.Stderr)
+	}
+}
+
+type streamChunk struct {
+	Type     string `json:"type"`
+	Data     string `json:"data"`
+	ExitCode *int   `json:"exit_code,omitempty"`
+}
+
+func (s *Service) tryStreamingExec(ctx context.Context, exec *Execution, sb *store.Sandbox, base, path, tok string, body execRuntimeRequest) bool {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(b))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		s.Executions.Complete(exec.ID, "failed")
+		_, textErr := decodeJSONOrText(raw, resp.StatusCode)
+		exec.SetError(textErr)
+		return true
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	for dec.More() {
+		var chunk streamChunk
+		if err := dec.Decode(&chunk); err != nil {
+			break
+		}
+		switch chunk.Type {
+		case "stdout", "stderr":
+			exec.AppendOutput(chunk.Type, chunk.Data)
+		case "exit":
+			exitCode := 0
+			if chunk.ExitCode != nil {
+				exitCode = *chunk.ExitCode
+			}
+			s.Executions.Complete(exec.ID, "completed")
+			exec.SetDone(exitCode)
+			return true
+		}
+	}
+
+	if exec.Status == "running" {
+		s.Executions.Complete(exec.ID, "failed")
+		exec.SetError("stream ended without exit")
+	}
+	return true
 }
 
 func decodeJSONOrText(raw []byte, httpCode int) (map[string]any, string) {
@@ -226,8 +448,12 @@ func hostHTTPFailure(code int, raw []byte) (httpStatus int, extra map[string]any
 	}
 	ex := map[string]any{"message": msg, "status": code}
 	st := statusFromDataPlane(code)
-	if code == http.StatusNotFound {
-		ex["hint"] = "Path sandbox id must match the runtime SANDBOX_ID. Check PodProxyURL/pod_id for this sandbox row, or reprovision if the pod was swapped."
+	switch {
+	case code == http.StatusNotFound:
+		ex["hint"] = "Sandbox or path not found. Verify sandbox_id is correct and sandbox status is 'running'."
+	case code == http.StatusServiceUnavailable || code == http.StatusBadGateway || code == http.StatusGatewayTimeout:
+		ex["hint"] = "Data plane temporarily unreachable. Retry after a few seconds."
+		ex["retryable"] = true
 	}
 	return st, ex
 }
@@ -415,6 +641,10 @@ func (s *Service) toolRuntimeStatus(ctx context.Context, sb *store.Sandbox) (map
 	}
 	out := map[string]any{}
 	_ = json.Unmarshal(rs.Balance, &out)
+	if rs.GraceRemainingSecs > 0 {
+		out["grace_remaining_secs"] = rs.GraceRemainingSecs
+		out["negative_grace_secs"] = rs.NegativeGraceSecs
+	}
 	return out, 0, "", nil
 }
 

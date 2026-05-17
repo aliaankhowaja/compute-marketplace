@@ -15,12 +15,13 @@ import (
 
 // RouterDeps wires handlers.
 type RouterDeps struct {
-	Cfg     *config.Control
-	Store   *store.Store
-	Pay     payment.Payment
-	PaySvc  *payment.Service
-	Orch    *orchestrator.Service
-	APIKeys *auth.APIKeyCache
+	Cfg        *config.Control
+	Store      *store.Store
+	Pay        payment.Payment
+	PaySvc     *payment.Service
+	Orch       *orchestrator.Service
+	APIKeys    *auth.APIKeyCache
+	FileLogger func(http.Handler) http.Handler
 }
 
 // NewRouter builds the HTTP mux.
@@ -56,19 +57,20 @@ func NewRouter(d RouterDeps) http.Handler {
 		writeJSON(w, http.StatusOK, rows)
 	}))
 
-	jwtAuth := auth.JWTAuth(d.Cfg.SupabaseJWTSecret)
 	rl := auth.NewRateLimiter(d.Cfg.MCPRPM)
 
 	mcpSvc := mcp.NewService(d.Cfg, d.Store, d.PaySvc, d.Orch, nil)
-	postMCPURL := controlPlaneOrigin(d) + "/v1/mcp"
+	mcpSvc.Sessions = mcp.NewSessionRegistry(d.Cfg.MCPSessionTTL)
+	mcpSvc.Sessions.StartCleanupLoop(0)
+	mcpSvc.Executions = mcp.NewExecutionRegistry()
+
 	mux.Handle("GET /v1/mcp/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mcp.HealthPayload())
 	}))
-	// Legacy SSE: public handshake; POST /v1/mcp still requires its own auth.
-	mux.Handle("GET /v1/mcp", rl.Middleware(mcp.SSEHandler(postMCPURL)))
 	mux.Handle("POST /v1/mcp", mcp.AuthMiddleware(d.APIKeys, d.Store, rl.Middleware(mcp.Handler(mcpSvc))))
 
 	// User JWT routes
+	jwtAuth := auth.JWTAuth(d.Cfg.SupabaseJWTSecret)
 	jt := func(h http.Handler) http.Handler {
 		return jwtAuth(rl.Middleware(h))
 	}
@@ -98,13 +100,9 @@ func NewRouter(d RouterDeps) http.Handler {
 	// Stripe
 	mux.Handle("POST /internal/webhooks/stripe", http.HandlerFunc(handleStripeWebhook(d)))
 
-	return recoverReqIDLog(mux)
-}
-
-func controlPlaneOrigin(d RouterDeps) string {
-	base := strings.TrimRight(strings.TrimSpace(d.Cfg.ControlPlanePublicURL), "/")
-	if base == "" {
-		base = "http://127.0.0.1:" + d.Cfg.Port
+	handler := requestLogger(recoverReqIDLog(mux))
+	if d.FileLogger != nil {
+		return d.FileLogger(handler)
 	}
-	return base
+	return handler
 }

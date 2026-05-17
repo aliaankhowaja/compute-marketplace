@@ -3,7 +3,7 @@
 alter table public.sandboxes
   add column sandbox_token text,
   add column prepaid_balance_msats bigint not null default 0
-    constraint sandboxes_prepaid_balance_msats_check check (prepaid_balance_msats >= -1000000),
+    constraint sandboxes_prepaid_balance_msats_check check (prepaid_balance_msats >= -50000),
   add column pending_invoice_bolt11 text,
   add column pending_invoice_payment_hash bytea,
   add column pending_invoice_amount_msats bigint,

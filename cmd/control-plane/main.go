@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/google/uuid"
 
 	"github.com/aliaankhowaja/sockt-backend/internal/api"
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
@@ -29,9 +31,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	logLevel := strings.ToLower(cfg.LogLevel)
-	if logLevel == "debug" {
-		slog.SetLogLoggerLevel(slog.LevelDebug)
+	var slogLevel slog.Level
+	if strings.ToLower(cfg.LogLevel) == "debug" {
+		slogLevel = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slogLevel})))
+	if cfg.UsePodMock {
+		slog.Info("pod_mock_enabled", "url", cfg.PodMockURL)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -78,22 +84,38 @@ func main() {
 	}
 
 	if lnBot != nil {
+		orchObserver := orchestrator.SandboxDepositObserver(orch, st, cfg)
 		deps := &payment.DepositSettlerBackground{
-			Store:            st,
-			LNBot:            lnBot,
-			Interval:         15 * time.Second,
-			OnSandboxSettled: orchestrator.SandboxDepositObserver(orch, st, cfg),
+			Store:    st,
+			LNBot:    lnBot,
+			Interval: 15 * time.Second,
+			OnSandboxSettled: func(ctx context.Context, sandboxID uuid.UUID, amountMsats, newBalanceMsats int64) {
+				orchObserver(ctx, sandboxID, amountMsats, newBalanceMsats)
+			},
 		}
 		go deps.Run(ctx)
 	}
 
+	var fileLogger func(http.Handler) http.Handler
+	if logPath := os.Getenv("HTTP_LOG_FILE"); logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			slog.Error("open http log file", "path", logPath, "err", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		var mu sync.Mutex
+		fileLogger = api.FileLogMiddleware(f, &mu, []string{"/healthz", "/health"})
+	}
+
 	handler := api.NewRouter(api.RouterDeps{
-		Cfg:     cfg,
-		Store:   st,
-		Pay:     payIface,
-		PaySvc:  paySvc,
-		Orch:    orch,
-		APIKeys: keyCache,
+		Cfg:        cfg,
+		Store:      st,
+		Pay:        payIface,
+		PaySvc:     paySvc,
+		Orch:       orch,
+		APIKeys:    keyCache,
+		FileLogger: fileLogger,
 	})
 
 	addr := cfg.ListenHTTP

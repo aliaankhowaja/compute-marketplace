@@ -21,7 +21,7 @@ func TestHealthPayload(t *testing.T) {
 	}
 }
 
-const sandboxToolCount = 9
+const sandboxToolCount = 11
 
 func TestToolListCount(t *testing.T) {
 	cfg := &config.Control{Port: "8080"}
@@ -153,26 +153,39 @@ func TestHandlerInitializeNegotiates2024(t *testing.T) {
 	}
 }
 
-func TestHandlerUnknownTool(t *testing.T) {
+func TestHandlerUnknownToolWithSession(t *testing.T) {
 	cfg := &config.Control{Port: "8080"}
 	svc := NewService(cfg, nil, nil, nil, nil)
-	h := Handler(svc)
+	svc.Sessions = NewSessionRegistry(0)
+
 	id := uuid.New()
 	p := &auth.Principal{Kind: auth.KindSandbox, SandboxID: &id, BalanceKey: "test"}
+	svc.Sessions.Create("test-session-ut", p)
+
+	h := Handler(svc)
 	body := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"not_a_real_tool","arguments":{}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/mcp", bytes.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", "test-session-ut")
 	req = req.WithContext(auth.WithPrincipal(req.Context(), p))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d", rec.Code)
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.Contains(ct, "application/json") {
+		t.Fatalf("expected application/json, got %q", ct)
 	}
 	var env Response
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatal(err)
 	}
 	if env.Error == nil {
-		t.Fatal("expected rpc error")
+		t.Fatal("expected JSON-RPC error for unknown tool")
+	}
+	if !strings.Contains(env.Error.Message, "unknown tool") {
+		t.Fatalf("expected 'unknown tool' in error message, got: %s", env.Error.Message)
 	}
 }
 
@@ -183,3 +196,84 @@ func TestCallToolUnknownName(t *testing.T) {
 		t.Fatalf("got res=%v st=%d slug=%q", res, st, slug)
 	}
 }
+
+func TestHandlerToolsCallReturnsJSON(t *testing.T) {
+	cfg := &config.Control{Port: "8080", MCPRequestBodyLimit: 1 << 20}
+	svc := NewService(cfg, nil, nil, nil, nil)
+	svc.Sessions = NewSessionRegistry(0)
+
+	id := uuid.New()
+	p := &auth.Principal{Kind: auth.KindSandbox, SandboxID: &id, BalanceKey: "test"}
+	svc.Sessions.Create("test-session-1", p)
+
+	h := Handler(svc)
+	body := []byte(`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"sandbox_status","arguments":{"sandbox_id":"` + id.String() + `"}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/mcp", bytes.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", "test-session-1")
+	req = req.WithContext(auth.WithPrincipal(req.Context(), p))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.Contains(ct, "application/json") {
+		t.Fatalf("expected application/json, got %q", ct)
+	}
+	var env Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error != nil {
+		t.Fatalf("unexpected error: %v", env.Error)
+	}
+}
+
+func TestHandlerToolsCallNoSession(t *testing.T) {
+	cfg := &config.Control{Port: "8080", MCPRequestBodyLimit: 1 << 20}
+	svc := NewService(cfg, nil, nil, nil, nil)
+	svc.Sessions = NewSessionRegistry(0)
+
+	h := Handler(svc)
+	body := []byte(`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"sandbox_status","arguments":{}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/mcp", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var env Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error == nil {
+		t.Fatal("expected session_required error")
+	}
+}
+
+func TestHandlerToolsCallInvalidSession(t *testing.T) {
+	cfg := &config.Control{Port: "8080", MCPRequestBodyLimit: 1 << 20}
+	svc := NewService(cfg, nil, nil, nil, nil)
+	svc.Sessions = NewSessionRegistry(0)
+
+	h := Handler(svc)
+	body := []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"sandbox_status","arguments":{}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/mcp", bytes.NewReader(body))
+	req.Header.Set("Mcp-Session-Id", "nonexistent-session")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var env Response
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error == nil {
+		t.Fatal("expected invalid_session error")
+	}
+}
+

@@ -145,6 +145,30 @@ func (s *Service) PayInvoice(ctx context.Context, invoice string, idempotencyKey
 	return preHex, nil
 }
 
+// SendToAddress sends sats to a lightning address. Best-effort; no preimage verification.
+func (s *Service) SendToAddress(ctx context.Context, address string, amountSats int64, idempotencyKey string) error {
+	if s.LNBOT == nil {
+		return classifyErr(ClassOfferInvalid, errors.New("lightning wallet not configured"))
+	}
+	if amountSats <= 0 {
+		return classifyErr(ClassOfferInvalid, errors.New("amount must be positive"))
+	}
+	if replay, ok := s.IDem.Get(idempotencyKey); ok && replay != nil {
+		if replay.err != nil {
+			return replay.err
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.paymentTimeout())
+	defer cancel()
+	if err := s.LNBOT.SendToAddress(ctx, address, amountSats, idempotencyKey); err != nil {
+		s.IDem.SetFailure(idempotencyKey, err, defaultIdemTTL)
+		return s.classifyBackend(err)
+	}
+	s.IDem.SetSuccess(idempotencyKey, "address-payment", defaultIdemTTL)
+	return nil
+}
+
 func (s *Service) finalizePaymentRequest(ctx context.Context, invoice string, idempotencyKey string) (string, error) {
 	phBytes, err := s.decodePayHash(invoice)
 	if err != nil {

@@ -176,6 +176,7 @@ func (c *Client) GetInvoiceByPaymentHash(ctx context.Context, paymentHashHex str
 
 type paymentReq struct {
 	Target         string `json:"target"`
+	Amount         *int64 `json:"amount,omitempty"`
 	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 	Reference      string `json:"reference,omitempty"`
 }
@@ -212,6 +213,32 @@ func (c *Client) SendPayment(ctx context.Context, bolt11 string, idempotencyKey 
 		return "", &PaymentFailedError{FailureReason: reason}
 	default:
 		return "", fmt.Errorf("lnbot: unexpected payment status %q", resp.Status)
+	}
+}
+
+// SendToAddress pays a lightning address (or LNURL) a specified amount in sats.
+func (c *Client) SendToAddress(ctx context.Context, address string, amountSats int64, idempotencyKey string) error {
+	req := paymentReq{
+		Target:         strings.TrimSpace(address),
+		Amount:         &amountSats,
+		IdempotencyKey: strings.TrimSpace(idempotencyKey),
+	}
+	var resp paymentJSON
+	path := c.walletsPrefix() + "/payments"
+	if err := c.doJSON(ctx, http.MethodPost, path, req, &resp); err != nil {
+		return err
+	}
+	switch strings.TrimSpace(strings.ToLower(resp.Status)) {
+	case "settled", "pending":
+		return nil
+	case "failed":
+		reason := ""
+		if resp.FailureReason != nil {
+			reason = strings.TrimSpace(*resp.FailureReason)
+		}
+		return &PaymentFailedError{FailureReason: reason}
+	default:
+		return fmt.Errorf("lnbot: unexpected payment status %q", resp.Status)
 	}
 }
 
