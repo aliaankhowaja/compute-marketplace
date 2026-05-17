@@ -82,7 +82,6 @@ type CreatePodRequest struct {
 	CPUFlavorIDs      []string `json:"cpuFlavorIds,omitempty"`
 	CPUFlavorPriority string   `json:"cpuFlavorPriority,omitempty"`
 	VCPUCount         int      `json:"vcpuCount,omitempty"`
-	MemoryInGb        int      `json:"memoryInGb,omitempty"`
 	GPUCount          int      `json:"gpuCount,omitempty"`
 	MinVCPUPerGPU     int      `json:"minVCPUPerGPU,omitempty"`
 	MinRAMPerGPU      int      `json:"minRAMPerGPU,omitempty"`
@@ -108,7 +107,6 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         1,
-			MemoryInGb:        2,
 		}, "sockt-nano", "runpod_cpu", nil
 
 	case "micro":
@@ -125,7 +123,6 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         2,
-			MemoryInGb:        4,
 		}, "sockt-micro", "runpod_cpu", nil
 
 	case "standard":
@@ -142,7 +139,6 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         4,
-			MemoryInGb:        8,
 		}, "sockt-standard", "runpod_cpu", nil
 
 	case "gpu_small":
