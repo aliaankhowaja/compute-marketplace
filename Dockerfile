@@ -10,10 +10,16 @@ RUN go build -trimpath -ldflags="-s -w" -mod=vendor -o /sockt-runtime ./cmd/sock
 
 FROM ubuntu:24.04 AS runtime
 RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash ca-certificates python3 python3-pip python3-venv \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+     bash ca-certificates python3 python3-pip python3-venv sudo \
   && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 1001 -s /bin/bash sandbox
+
+COPY sudoers-sandbox /etc/sudoers.d/sandbox
+RUN chmod 0440 /etc/sudoers.d/sandbox \
+  && chown root:root /etc/sudoers.d/sandbox \
+  && visudo -c
 
 COPY --from=build /sockt-runtime /usr/local/bin/sockt-runtime
 

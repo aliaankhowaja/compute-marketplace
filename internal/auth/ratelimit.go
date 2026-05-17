@@ -5,16 +5,29 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/time/rate"
 )
 
+const (
+	rateLimiterTTL      = 10 * time.Minute
+	rateLimiterMaxKeys  = 100_000
+	rateLimiterSweepInt = 1 * time.Minute
+)
+
+type limiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
 // RateLimiter is an in-memory per-key rate limiter (default ~5 req/s ≈ 300 rpm).
 type RateLimiter struct {
 	mu     sync.Mutex
-	lim    map[string]*rate.Limiter
+	lim    map[string]*limiterEntry
 	burst  int
-	rEvery rate.Limit // events per second
+	rEvery rate.Limit
+	done   chan struct{}
 }
 
 // NewRateLimiter creates a limiter. rpm is requests per minute per BalanceKey.
@@ -23,11 +36,14 @@ func NewRateLimiter(rpm int) *RateLimiter {
 		rpm = 300
 	}
 	every := rate.Limit(float64(rpm) / 60.0)
-	return &RateLimiter{
-		lim:    make(map[string]*rate.Limiter),
+	rl := &RateLimiter{
+		lim:    make(map[string]*limiterEntry),
 		burst:  max(10, rpm/60),
 		rEvery: every,
+		done:   make(chan struct{}),
 	}
+	go rl.cleanupLoop()
+	return rl
 }
 
 func max(a, b int) int {
@@ -35,6 +51,26 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (r *RateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(rateLimiterSweepInt)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.mu.Lock()
+			now := time.Now()
+			for k, e := range r.lim {
+				if now.Sub(e.lastSeen) > rateLimiterTTL {
+					delete(r.lim, k)
+				}
+			}
+			r.mu.Unlock()
+		case <-r.done:
+			return
+		}
+	}
 }
 
 // Middleware enforces rate limits using Principal.BalanceKey when present, falling back
@@ -63,12 +99,27 @@ func (r *RateLimiter) Middleware(next http.Handler) http.Handler {
 func (r *RateLimiter) get(key string) *rate.Limiter {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	l, ok := r.lim[key]
+	e, ok := r.lim[key]
 	if !ok {
-		l = rate.NewLimiter(r.rEvery, r.burst)
-		r.lim[key] = l
+		if len(r.lim) >= rateLimiterMaxKeys {
+			// Evict oldest entry to prevent unbounded growth.
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range r.lim {
+				if oldestKey == "" || v.lastSeen.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.lastSeen
+				}
+			}
+			if oldestKey != "" {
+				delete(r.lim, oldestKey)
+			}
+		}
+		e = &limiterEntry{limiter: rate.NewLimiter(r.rEvery, r.burst)}
+		r.lim[key] = e
 	}
-	return l
+	e.lastSeen = time.Now()
+	return e.limiter
 }
 
 // AllowKey reports whether one request is allowed for key without consuming in Middleware twice.

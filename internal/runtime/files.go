@@ -58,7 +58,7 @@ func FilesWriteHandler(cfg *Config) http.Handler {
 
 		path, err := resolveSandboxPath(cfg.SandboxRoot, req.Path)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
 
@@ -70,24 +70,31 @@ func FilesWriteHandler(cfg *Config) http.Handler {
 
 		if req.CreateDirs {
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				http.Error(w, "failed to create directories", http.StatusInternalServerError)
 				return
 			}
 		}
 
-		mode := os.FileMode(req.Mode)
+		mode := os.FileMode(req.Mode) & 0o7777
 		if mode == 0 {
 			mode = 0o644
 		}
+		// Strip setuid, setgid, sticky bits and cap at 0755.
+		mode &^= os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+		if mode > 0o755 {
+			mode = 0o755
+		}
 
 		if err := os.WriteFile(path, data, mode); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "failed to write file", http.StatusInternalServerError)
 			return
 		}
 
 		writeJSON(w, http.StatusOK, map[string]string{"path": path, "status": "ok"})
 	})
 }
+
+const maxReadFileBytes = 50 << 20 // 50 MB
 
 // FilesReadHandler reads a single file as base64.
 func FilesReadHandler(cfg *Config) http.Handler {
@@ -105,13 +112,23 @@ func FilesReadHandler(cfg *Config) http.Handler {
 
 		path, err := resolveSandboxPath(cfg.SandboxRoot, r.URL.Query().Get("path"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+
+		fi, err := os.Stat(path)
+		if err != nil {
+			http.Error(w, "file not found", http.StatusBadRequest)
+			return
+		}
+		if fi.Size() > maxReadFileBytes {
+			http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, "failed to read file", http.StatusBadRequest)
 			return
 		}
 
@@ -143,13 +160,13 @@ func FilesListHandler(cfg *Config) http.Handler {
 
 		path, err := resolveSandboxPath(cfg.SandboxRoot, dir)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
 
 		entries, err := os.ReadDir(path)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, "directory not found", http.StatusBadRequest)
 			return
 		}
 

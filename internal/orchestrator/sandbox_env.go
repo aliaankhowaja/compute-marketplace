@@ -44,6 +44,7 @@ func BuildSandboxEnv(cfg *config.Control, sb *store.Sandbox, initialBalance, rat
 		"JWT_SECRET":             string(cfg.WSSJWTSecret),
 		"JWT_AUDIENCE":           cfg.DataJWTAudience,
 		"SANDBOX_ROOT":           cfg.RuntimeSandboxRoot,
+		"SANDBOX_USER":           "sandbox",
 		"CALLBACK_SECRET":        cfg.CallbackSecret,
 		"BILLING_METHOD":         sb.BillingMethod,
 		"RATE_PER_SECOND":        fmt.Sprintf("%d", ratePerSecond),

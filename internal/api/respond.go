@@ -16,6 +16,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeErr(w http.ResponseWriter, code int, codeStr, msg string) {
+	if code >= 500 {
+		slog.Error("internal_error", "code", codeStr, "detail", msg)
+		msg = "internal error"
+	}
 	writeJSON(w, code, map[string]any{
 		"code":    codeStr,
 		"error":   codeStr,

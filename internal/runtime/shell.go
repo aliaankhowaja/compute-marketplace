@@ -7,11 +7,9 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -115,14 +113,11 @@ func ShellHandler(cfg *Config, meter *Meter, cb *Callbacks) http.Handler {
 		}
 
 		cmd := exec.CommandContext(ctx, "/bin/bash", "-l")
-		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+		cmd.Env = sandboxEnv(cred, cfg.SandboxRoot)
 		cmd.Dir = cfg.SandboxRoot
 
-		if cred == nil {
-			cred = &syscall.SysProcAttr{}
-		}
-		cred.Setsid = true
-		cmd.SysProcAttr = cred
+		cred.SysProcAttr.Setsid = true
+		cmd.SysProcAttr = cred.SysProcAttr
 
 		ptmx, err := pty.Start(cmd)
 		if err != nil {
