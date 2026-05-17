@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -318,7 +319,8 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	case "credits":
 		return s.createCreditsSandbox(ctx, p, tier, templateLabel, runtimeLabel, pr)
 	case "lightning":
-		return s.createLightningSandbox(ctx, tier, templateLabel, runtimeLabel, pr)
+		clientPrepaidSats := int64(argFloat(args, "prepaid_sats"))
+		return s.createLightningSandbox(ctx, tier, templateLabel, runtimeLabel, pr, clientPrepaidSats)
 	}
 	return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing_method"}
 }
@@ -361,25 +363,33 @@ func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, t
 	return sb2, 0, "", nil
 }
 
-func (s *Service) createLightningSandbox(ctx context.Context, tier, templateLabel, runtimeLabel string, pr *store.TierPricing) (any, int, string, map[string]any) {
+func (s *Service) createLightningSandbox(ctx context.Context, tier, templateLabel, runtimeLabel string, pr *store.TierPricing, clientPrepaidSats int64) (any, int, string, map[string]any) {
 	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
 		return nil, http.StatusServiceUnavailable, "payment_disabled", map[string]any{"message": "lightning payment not configured", "retryable": false, "hint": "Lightning payments not configured on this server."}
-	}
-	prepaySecs := s.Cfg.SandboxPrepaySecs
-	if prepaySecs <= 0 {
-		prepaySecs = 30
 	}
 	rate := pr.MsatsPerSecond
 	if rate <= 0 {
 		return nil, http.StatusInternalServerError, "tier_error", map[string]any{"message": "tier has no lightning rate"}
 	}
-	prepayMsats := int64(prepaySecs) * rate
-	prepaySats := prepayMsats / 1000
-	if prepayMsats%1000 != 0 {
-		prepaySats++
-	}
-	if prepaySats <= 0 {
-		prepaySats = 1
+
+	var prepaySats int64
+	var prepaySecs int
+	if clientPrepaidSats > 0 {
+		prepaySats = clientPrepaidSats
+		prepaySecs = int((prepaySats * 1000) / rate)
+	} else {
+		prepaySecs = s.Cfg.SandboxPrepaySecs
+		if prepaySecs <= 0 {
+			prepaySecs = 30
+		}
+		prepayMsats := int64(prepaySecs) * rate
+		prepaySats = prepayMsats / 1000
+		if prepayMsats%1000 != 0 {
+			prepaySats++
+		}
+		if prepaySats <= 0 {
+			prepaySats = 1
+		}
 	}
 
 	token, err := newSandboxToken()
@@ -673,12 +683,47 @@ func (s *Service) toolSandboxTerminate(ctx context.Context, p *auth.Principal, a
 	if err := s.Orch.TerminateSandbox(ctx, podID, id); err != nil {
 		return nil, http.StatusBadGateway, "terminate_failed", map[string]any{"message": err.Error()}
 	}
-	return map[string]any{
+
+	var refundResult map[string]any
+	lightningAddr := strings.TrimSpace(argString(args, "lightning_address"))
+	if sb.BillingMethod == "lightning" && lightningAddr != "" && sb.PrepaidBalanceMsats > 0 {
+		refundResult = s.attemptLightningRefund(ctx, id, sb.PrepaidBalanceMsats, lightningAddr)
+	}
+
+	out := map[string]any{
 		"sandbox_id":           id.String(),
 		"status":               "terminated",
 		"consumed_msats_total": sb.ConsumedMsats,
 		"terminated_at":        time.Now().UTC().Format(time.RFC3339),
-	}, 0, "", nil
+	}
+	if refundResult != nil {
+		out["refund"] = refundResult
+	}
+	return out, 0, "", nil
+}
+
+func (s *Service) attemptLightningRefund(ctx context.Context, sandboxID uuid.UUID, remainingMsats int64, address string) map[string]any {
+	if s.PaySvc == nil || !s.PaySvc.HasLightning() {
+		slog.Warn("refund skipped: lightning not configured", "sandbox_id", sandboxID.String())
+		return map[string]any{"status": "skipped", "reason": "lightning not configured"}
+	}
+
+	refundSats := remainingMsats / 1000
+	if remainingMsats%1000 != 0 {
+		refundSats++
+	}
+	if refundSats <= 0 {
+		return map[string]any{"status": "skipped", "reason": "balance too small"}
+	}
+
+	idem := fmt.Sprintf("sandbox-refund:%s", sandboxID.String())
+	if err := s.PaySvc.SendToAddress(ctx, address, refundSats, idem); err != nil {
+		slog.Error("lightning refund failed", "sandbox_id", sandboxID.String(), "address", address, "amount_sats", refundSats, "err", err)
+		return map[string]any{"status": "failed", "reason": err.Error(), "amount_sats": refundSats}
+	}
+
+	slog.Info("lightning refund sent", "sandbox_id", sandboxID.String(), "address", address, "amount_sats", refundSats)
+	return map[string]any{"status": "sent", "amount_sats": refundSats, "address": address}
 }
 
 // newSandboxToken returns a 256-bit Crockford-base32 opaque bearer token, prefixed `sbx_`.

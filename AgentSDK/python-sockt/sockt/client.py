@@ -139,8 +139,10 @@ class ComputeClient:
 
     # --- public ---
 
-    def create_sandbox(self, *, billing_method: str, tier: str, **_: Any) -> Sandbox:
+    def create_sandbox(self, *, billing_method: str, tier: str, prepaid_sats: int | None = None, **_: Any) -> Sandbox:
         body: dict[str, Any] = {"billing_method": billing_method, "tier": tier}
+        if prepaid_sats is not None:
+            body["prepaid_sats"] = prepaid_sats
         resp = self._request_cp("POST", "/v1/sandbox/create", json=body)
         self._raise_for_cp(resp)
         row = resp.json()
@@ -407,9 +409,12 @@ class Sandbox:
         self.status = "running"
         self.refresh_data_jwt(force=True)
 
-    def terminate(self) -> None:
+    def terminate(self, *, lightning_address: str | None = None) -> None:
         assert self._client is not None
-        resp = self._client._request_cp("DELETE", f"/v1/sandbox/{self.id}")
+        body: dict[str, Any] = {}
+        if lightning_address:
+            body["lightning_address"] = lightning_address
+        resp = self._client._request_cp("DELETE", f"/v1/sandbox/{self.id}", json=body if body else None)
         self._client._raise_for_cp(resp)
 
     def extend_balance(self, *, cents: int | None = None) -> dict[str, Any]:
