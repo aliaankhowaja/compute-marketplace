@@ -202,7 +202,7 @@ func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 		}
 		rate := int64(1)
 		if pr.USDCentsPerSecondX100 > 0 {
-			rate = pr.USDCentsPerSecondX100 / 100
+			rate = pr.USDCentsPerSecondX100 / 100000
 			if rate <= 0 {
 				rate = 1
 			}

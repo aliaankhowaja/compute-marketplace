@@ -111,7 +111,7 @@ func handleAuditBatch(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 				if iv.Consumed <= 0 {
 					continue
 				}
-				cents := (iv.Consumed * pr.USDCentsPerSecondX100) / (100 * pr.MsatsPerSecond)
+				cents := (iv.Consumed * pr.USDCentsPerSecondX100) / 100000
 				if cents <= 0 {
 					cents = 1
 				}
