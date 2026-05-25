@@ -82,7 +82,6 @@ type CreatePodRequest struct {
 	CPUFlavorIDs      []string `json:"cpuFlavorIds,omitempty"`
 	CPUFlavorPriority string   `json:"cpuFlavorPriority,omitempty"`
 	VCPUCount         int      `json:"vcpuCount,omitempty"`
-	MemoryInGb        int      `json:"memoryInGb,omitempty"`
 	GPUCount          int      `json:"gpuCount,omitempty"`
 	MinVCPUPerGPU     int      `json:"minVCPUPerGPU,omitempty"`
 	MinRAMPerGPU      int      `json:"minRAMPerGPU,omitempty"`
@@ -95,9 +94,12 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 	}
 	switch strings.TrimSpace(strings.ToLower(tier)) {
 	case "nano":
-		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		id := strings.TrimSpace(cfg.RunPodTemplateNanoID)
 		if id == "" {
-			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
+			id = strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		}
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_NANO_ID or RUNPOD_TEMPLATE_CPU_ID is required")
 		}
 		return CreatePodRequest{
 			TemplateID:        id,
@@ -105,13 +107,15 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         1,
-			MemoryInGb:        2,
-		}, "sockt-cpu", "runpod_cpu", nil
+		}, "sockt-nano", "runpod_cpu", nil
 
 	case "micro":
-		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		id := strings.TrimSpace(cfg.RunPodTemplateMicroID)
 		if id == "" {
-			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
+			id = strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		}
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_MICRO_ID or RUNPOD_TEMPLATE_CPU_ID is required")
 		}
 		return CreatePodRequest{
 			TemplateID:        id,
@@ -119,13 +123,15 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         2,
-			MemoryInGb:        4,
-		}, "sockt-cpu", "runpod_cpu", nil
+		}, "sockt-micro", "runpod_cpu", nil
 
 	case "standard":
-		id := strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		id := strings.TrimSpace(cfg.RunPodTemplateStandardID)
 		if id == "" {
-			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_CPU_ID is required")
+			id = strings.TrimSpace(cfg.RunPodTemplateCPUID)
+		}
+		if id == "" {
+			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_STANDARD_ID or RUNPOD_TEMPLATE_CPU_ID is required")
 		}
 		return CreatePodRequest{
 			TemplateID:        id,
@@ -133,8 +139,7 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			CPUFlavorIDs:      []string{"cpu3c"},
 			CPUFlavorPriority: "availability",
 			VCPUCount:         4,
-			MemoryInGb:        8,
-		}, "sockt-cpu", "runpod_cpu", nil
+		}, "sockt-standard", "runpod_cpu", nil
 
 	case "gpu_small":
 		id := strings.TrimSpace(cfg.RunPodTemplateGPUSmallID)

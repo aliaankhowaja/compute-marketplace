@@ -55,3 +55,58 @@ func TestResolveSandboxPath(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveSandboxPath_SymlinkEscape(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "sandbox")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a symlink inside the sandbox that points outside it.
+	outside := t.TempDir()
+	secretFile := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secretFile, []byte("sensitive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlink: <sandbox>/escape -> <outside>
+	symlinkPath := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attempting to resolve "escape/secret.txt" should fail — the real path is outside root.
+	_, err := resolveSandboxPath(root, "escape/secret.txt")
+	if err == nil {
+		t.Fatal("expected error for symlink escaping sandbox, got nil")
+	}
+
+	// Direct symlink to a file outside.
+	fileSymlink := filepath.Join(root, "passwd")
+	if err := os.Symlink("/etc/passwd", fileSymlink); err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolveSandboxPath(root, "passwd")
+	if err == nil {
+		t.Fatal("expected error for symlink to /etc/passwd, got nil")
+	}
+
+	// A symlink that stays WITHIN the sandbox should succeed.
+	subdir := filepath.Join(root, "real")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	internalLink := filepath.Join(root, "link_to_real")
+	if err := os.Symlink(subdir, internalLink); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveSandboxPath(root, "link_to_real")
+	if err != nil {
+		t.Fatalf("internal symlink should be allowed, got error: %v", err)
+	}
+	// The function returns the logical path; security is enforced by validating
+	// the resolved real path stays within root.
+	if got != internalLink {
+		t.Fatalf("expected %q, got %q", internalLink, got)
+	}
+}

@@ -3,7 +3,6 @@ package api
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/aliaankhowaja/sockt-backend/internal/auth"
 	"github.com/aliaankhowaja/sockt-backend/internal/config"
@@ -31,12 +30,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	// Cloud Run reserves some paths ending in "z"; /healthz never reaches the container.
 	// See https://cloud.google.com/run/docs/known-issues#ah — use /health for probes on Run.
 	handleCPHealth := func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":                  true,
-			"lightning_wallet_ok": d.PaySvc != nil && d.PaySvc.HasLightning(),
-			"supabase_ok":         d.Cfg != nil && strings.TrimSpace(d.Cfg.SupabaseDBTxDSN) != "",
-			"runpod_configured":   d.Cfg != nil && strings.TrimSpace(d.Cfg.RunPodAPIKey) != "",
-		})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 	mux.HandleFunc("GET /healthz", handleCPHealth)
 	mux.HandleFunc("GET /health", handleCPHealth)

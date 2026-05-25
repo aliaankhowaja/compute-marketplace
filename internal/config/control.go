@@ -26,7 +26,10 @@ type Control struct {
 	RunPodAPIURL        string
 	RunPodDefaultRegion string
 	// RunPod template IDs for tier-based provisioning (see orchestrator.ResolveTier).
-	RunPodTemplateCPUID      string
+	RunPodTemplateCPUID      string // fallback for CPU tiers if per-tier ID is unset
+	RunPodTemplateNanoID     string
+	RunPodTemplateMicroID    string
+	RunPodTemplateStandardID string
 	RunPodTemplateGPUSmallID string
 	RunPodTemplateGPULargeID string
 
@@ -186,6 +189,9 @@ func Load() (*Control, error) {
 		RunPodAPIURL:             envOrDefault("RUNPOD_API_URL", "https://rest.runpod.io/v1"),
 		RunPodDefaultRegion:      envOrDefault("RUNPOD_DEFAULT_REGION", "US-CA-1"),
 		RunPodTemplateCPUID:      strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_CPU_ID")),
+		RunPodTemplateNanoID:     strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_NANO_ID")),
+		RunPodTemplateMicroID:    strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_MICRO_ID")),
+		RunPodTemplateStandardID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_STANDARD_ID")),
 		RunPodTemplateGPUSmallID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_SMALL_ID")),
 		RunPodTemplateGPULargeID: strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_GPU_LARGE_ID")),
 		PodMockURL:               strings.TrimRight(envOrDefault("POD_MOCK_URL", "http://localhost:9090"), "/"),

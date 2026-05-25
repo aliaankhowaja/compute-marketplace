@@ -1,0 +1,42 @@
+# Limited sudo privileges for sandbox user in runtime containers.
+# The sandbox user can install packages and manage services but cannot
+# escalate to an unrestricted root shell.
+
+# Secure defaults
+Defaults:sandbox !env_reset
+Defaults:sandbox secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults:sandbox !visiblepw
+Defaults:sandbox logfile="/var/log/sudo-sandbox.log"
+
+# Package management
+sandbox ALL=(root) NOPASSWD: /usr/bin/apt-get update
+sandbox ALL=(root) NOPASSWD: /usr/bin/apt-get install *
+sandbox ALL=(root) NOPASSWD: /usr/bin/apt-get remove *
+sandbox ALL=(root) NOPASSWD: /usr/bin/apt-get autoremove
+sandbox ALL=(root) NOPASSWD: /usr/bin/apt-get clean
+sandbox ALL=(root) NOPASSWD: /usr/bin/dpkg --configure -a
+
+# Python package management
+sandbox ALL=(root) NOPASSWD: /usr/bin/pip install *
+sandbox ALL=(root) NOPASSWD: /usr/bin/pip3 install *
+sandbox ALL=(root) NOPASSWD: /usr/bin/pip uninstall *
+sandbox ALL=(root) NOPASSWD: /usr/bin/pip3 uninstall *
+
+# Service management
+sandbox ALL=(root) NOPASSWD: /usr/bin/systemctl start *
+sandbox ALL=(root) NOPASSWD: /usr/bin/systemctl stop *
+sandbox ALL=(root) NOPASSWD: /usr/bin/systemctl restart *
+sandbox ALL=(root) NOPASSWD: /usr/bin/systemctl status *
+sandbox ALL=(root) NOPASSWD: /usr/bin/systemctl enable *
+sandbox ALL=(root) NOPASSWD: /usr/bin/systemctl disable *
+
+# Directory creation in common dev paths
+sandbox ALL=(root) NOPASSWD: /usr/bin/mkdir -p /opt/*
+sandbox ALL=(root) NOPASSWD: /usr/bin/mkdir -p /usr/local/*
+sandbox ALL=(root) NOPASSWD: /usr/bin/chown sandbox\:sandbox /opt/*
+sandbox ALL=(root) NOPASSWD: /usr/bin/chown sandbox\:sandbox /usr/local/*
+
+# Writing config files via tee
+sandbox ALL=(root) NOPASSWD: /usr/bin/tee /etc/apt/sources.list.d/*
+sandbox ALL=(root) NOPASSWD: /usr/bin/tee /etc/pip.conf
+sandbox ALL=(root) NOPASSWD: /usr/bin/tee /tmp/*

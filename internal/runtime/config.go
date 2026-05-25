@@ -80,7 +80,7 @@ func Load() (*Config, error) {
 		ListenAddr:      envOrDefault("LISTEN_ADDR", ":8443"),
 		TLSCertFile:     strings.TrimSpace(os.Getenv("TLS_CERT_FILE")),
 		TLSKeyFile:      strings.TrimSpace(os.Getenv("TLS_KEY_FILE")),
-		SandboxUser:     envOrDefault("SANDBOX_USER", "root"),
+		SandboxUser:     envOrDefault("SANDBOX_USER", "sandbox"),
 		SandboxRoot:     filepath.Clean(strings.TrimSpace(envOrDefault("SANDBOX_ROOT", "/home/sandbox"))),
 	}
 
