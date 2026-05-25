@@ -21,7 +21,7 @@ func TestHealthPayload(t *testing.T) {
 	}
 }
 
-const sandboxToolCount = 11
+const sandboxToolCount = 12
 
 func TestToolListCount(t *testing.T) {
 	cfg := &config.Control{Port: "8080"}

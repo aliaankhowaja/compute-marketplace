@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sockt"
 version = "0.1.0"
-description = "Sockt Agent SDK — RunPod MVP (control plane + data plane)"
+description = "Sockt Agent SDK — control plane + data plane"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }

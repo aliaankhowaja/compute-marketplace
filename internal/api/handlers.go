@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -11,6 +12,36 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
+
+func publicRuntime(internal string) string {
+	switch internal {
+	case "runpod_cpu":
+		return "cpu"
+	case "runpod_gpu":
+		return "gpu"
+	default:
+		return internal
+	}
+}
+
+func sanitizedSandbox(sb *store.Sandbox) map[string]any {
+	m := map[string]any{
+		"id":              sb.ID,
+		"billing_method":  sb.BillingMethod,
+		"tier":            sb.Tier,
+		"template":        sb.Template,
+		"status":          sb.Status,
+		"runtime":         publicRuntime(sb.Runtime),
+		"consumed_msats":  sb.ConsumedMsats,
+	}
+	if sb.AgentID != nil {
+		m["agent_id"] = sb.AgentID
+	}
+	if sb.UserID != nil {
+		m["user_id"] = sb.UserID
+	}
+	return m
+}
 
 func canAccessSandbox(p *auth.Principal, sb *store.Sandbox) bool {
 	if p == nil || sb == nil {
@@ -209,15 +240,15 @@ func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 		}
 		env := orchestrator.BuildSandboxEnv(d.Cfg, sb, alloc, rate)
 		if d.Orch == nil {
-			writeErr(w, http.StatusServiceUnavailable, "orchestrator_disabled", "runpod not configured")
+			writeErr(w, http.StatusServiceUnavailable, "orchestrator_disabled", "sandbox orchestration not configured")
 			return
 		}
 		if err := d.Orch.CreateSandbox(r.Context(), sb, env); err != nil {
-			writeErr(w, http.StatusBadGateway, "runpod_error", err.Error())
+			writeErr(w, http.StatusBadGateway, "provisioning_error", err.Error())
 			return
 		}
 		sb2, _ := d.Store.GetSandbox(r.Context(), sb.ID)
-		writeJSON(w, http.StatusOK, sb2)
+		writeJSON(w, http.StatusOK, sanitizedSandbox(sb2))
 	}
 }
 
@@ -238,7 +269,7 @@ func handleGetSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 			writeErr(w, http.StatusForbidden, "forbidden", "")
 			return
 		}
-		writeJSON(w, http.StatusOK, sb)
+		writeJSON(w, http.StatusOK, sanitizedSandbox(sb))
 	}
 }
 
@@ -323,6 +354,7 @@ func handleDeleteSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 		}
 
 		addr := strings.TrimSpace(body.LightningAddress)
+		var refundResult map[string]any
 		if sb.BillingMethod == "lightning" && addr != "" && sb.PrepaidBalanceMsats > 0 && d.PaySvc != nil {
 			refundSats := sb.PrepaidBalanceMsats / 1000
 			if sb.PrepaidBalanceMsats%1000 != 0 {
@@ -330,11 +362,24 @@ func handleDeleteSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			}
 			if refundSats > 0 {
 				idem := "sandbox-refund:" + id.String()
-				_ = d.PaySvc.SendToAddress(r.Context(), addr, refundSats, idem)
+				if err := d.PaySvc.SendToAddress(r.Context(), addr, refundSats, idem); err != nil {
+					refundResult = map[string]any{"status": "failed", "reason": err.Error(), "amount_sats": refundSats}
+				} else {
+					refundResult = map[string]any{"status": "sent", "amount_sats": refundSats, "address": addr}
+				}
 			}
 		}
 
-		w.WriteHeader(http.StatusNoContent)
+		response := map[string]any{
+			"sandbox_id":           id.String(),
+			"status":               "terminated",
+			"consumed_msats_total": sb.ConsumedMsats,
+			"terminated_at":        time.Now().Format(time.RFC3339),
+		}
+		if refundResult != nil {
+			response["refund"] = refundResult
+		}
+		writeJSON(w, http.StatusOK, response)
 	}
 }
 

@@ -502,13 +502,26 @@ export class Sandbox {
     await this.refreshDataJwt(true);
   }
 
-  async terminate(opts?: { lightningAddress?: string }): Promise<void> {
+  async terminate(opts?: { lightningAddress?: string }): Promise<{
+    sandbox_id: string;
+    status: string;
+    consumed_msats_total: number;
+    terminated_at: string;
+    refund?: { status: string; amount_sats?: number; address?: string; reason?: string };
+  }> {
     const init: RequestInit = {};
     if (opts?.lightningAddress) {
       init.body = JSON.stringify({ lightning_address: opts.lightningAddress });
     }
     const resp = await this.client.controlPlaneFetch("DELETE", `/v1/sandbox/${this.id}`, init);
     if (!resp.ok) await readError(resp);
+    return (await resp.json()) as {
+      sandbox_id: string;
+      status: string;
+      consumed_msats_total: number;
+      terminated_at: string;
+      refund?: { status: string; amount_sats?: number; address?: string; reason?: string };
+    };
   }
 
   async extendBalance(opts?: { cents?: number }): Promise<Record<string, unknown>> {

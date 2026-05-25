@@ -23,7 +23,7 @@ class TopUpFailedError(SocktError):
 
 
 class NoCapacityError(SocktError):
-    """Orchestrator cannot place workload (RunPod capacity)."""
+    """Orchestrator cannot place workload (no capacity)."""
 
 
 class HostUnreachableError(SocktError):

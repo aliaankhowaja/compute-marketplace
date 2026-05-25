@@ -1,7 +1,7 @@
 {
   "name": "@sockt/client",
   "version": "0.1.0",
-  "description": "Sockt Agent SDK — TypeScript/JavaScript client (RunPod MVP)",
+  "description": "Sockt Agent SDK — TypeScript/JavaScript client",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

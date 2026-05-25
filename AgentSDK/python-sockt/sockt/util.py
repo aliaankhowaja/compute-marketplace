@@ -7,8 +7,8 @@ import time
 from typing import Any, Mapping
 
 
-def runpod_proxy_base(pod_id: str) -> str:
-    """HTTPS origin for RunPod proxy URL (matches backend `RunPodProxyURL`)."""
+def proxy_base(pod_id: str) -> str:
+    """HTTPS origin for sandbox proxy URL."""
     pid = (pod_id or "").strip()
     if not pid:
         return ""
@@ -19,7 +19,7 @@ def derive_data_endpoint(pod_proxy_url: str | None, pod_id: str | None) -> str:
     u = (pod_proxy_url or "").strip().rstrip("/")
     if u:
         return u
-    return runpod_proxy_base(pod_id or "").rstrip("/")
+    return proxy_base(pod_id or "").rstrip("/")
 
 
 def strip_scheme(host_or_url: str) -> str:
@@ -42,12 +42,12 @@ def pick(d: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
-_RUNPOD_HOST_RE = re.compile(
+_PROXY_HOST_RE = re.compile(
     r"^https?://(?P<pod>[a-zA-Z0-9_-]+)-8443\.proxy\.runpod\.net/?$",
 )
 
 def parse_pod_id_from_endpoint(url: str) -> str | None:
-    m = _RUNPOD_HOST_RE.match((url or "").strip().rstrip("/"))
+    m = _PROXY_HOST_RE.match((url or "").strip().rstrip("/"))
     return m.group("pod") if m else None
 
 
