@@ -329,7 +329,8 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 
 	switch bm {
 	case "credits":
-		return s.createCreditsSandbox(ctx, p, tier, templateLabel, runtimeLabel, pr)
+		initialCents := int64(argFloat(args, "initial_credits_cents"))
+		return s.createCreditsSandbox(ctx, p, tier, templateLabel, runtimeLabel, pr, initialCents)
 	case "lightning":
 		clientPrepaidSats := int64(argFloat(args, "prepaid_sats"))
 		return s.createLightningSandbox(ctx, tier, templateLabel, runtimeLabel, pr, clientPrepaidSats)
@@ -337,10 +338,23 @@ func (s *Service) toolSandboxCreate(ctx context.Context, p *auth.Principal, args
 	return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "billing_method"}
 }
 
-func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, tier, templateLabel, runtimeLabel string, pr *store.TierPricing) (any, int, string, map[string]any) {
+func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, tier, templateLabel, runtimeLabel string, pr *store.TierPricing, initialCents int64) (any, int, string, map[string]any) {
 	if p == nil || p.Kind != auth.KindAPIKey || p.UserID == nil || p.APIKeyID == nil {
 		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "credits billing requires an API key (Bearer sockt_live_...)"}
 	}
+
+	minSubcents := pr.USDCentsPerSecondX100 * 3600
+	if minSubcents <= 0 {
+		minSubcents = store.SubcentsPerCent
+	}
+	allocRequest := initialCents * store.SubcentsPerCent
+	if allocRequest <= 0 {
+		allocRequest = minSubcents
+	}
+	if allocRequest < minSubcents {
+		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": fmt.Sprintf("minimum allocation is %d cents (1 hour of compute)", minSubcents/store.SubcentsPerCent)}
+	}
+
 	sb := &store.Sandbox{
 		BillingMethod: "credits",
 		Tier:          tier,
@@ -353,22 +367,20 @@ func (s *Service) createCreditsSandbox(ctx context.Context, p *auth.Principal, t
 	if err := s.Store.InsertSandbox(ctx, sb); err != nil {
 		return nil, http.StatusInternalServerError, "store_error", map[string]any{"message": err.Error()}
 	}
-	alloc, _, err := s.Store.AllocateCreditsForSandbox(ctx, *sb.UserID, sb.ID, s.Cfg.LowCreditThresholdCents*10)
+	alloc, _, _, err := s.Store.AllocateCreditsForSandbox(ctx, *sb.UserID, sb.ID, allocRequest)
 	if err != nil {
 		return nil, http.StatusPaymentRequired, "insufficient_credits", map[string]any{"message": err.Error()}
 	}
-	rate := int64(1)
-	if pr.USDCentsPerSecondX100 > 0 {
-		rate = pr.USDCentsPerSecondX100 / 100000
-		if rate <= 0 {
-			rate = 1
-		}
+	rate := pr.USDCentsPerSecondX100
+	if rate <= 0 {
+		rate = 1
 	}
 	env := orchestrator.BuildSandboxEnv(s.Cfg, sb, alloc, rate)
 	if s.Orch == nil {
 		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "sandbox orchestration not configured", "retryable": false, "hint": "Sandbox provisioning is not configured on this server."}
 	}
 	if err := s.Orch.CreateSandbox(ctx, sb, env); err != nil {
+		_, _ = s.Store.RefundSandboxCredits(ctx, *sb.UserID, sb.ID)
 		return nil, http.StatusBadGateway, "provisioning_error", map[string]any{"message": err.Error()}
 	}
 	sb2, _ := s.Store.GetSandbox(ctx, sb.ID)
@@ -651,7 +663,7 @@ func (s *Service) toolSandboxResume(ctx context.Context, p *auth.Principal, args
 	if s.Orch == nil {
 		return nil, http.StatusServiceUnavailable, "orchestrator_disabled", map[string]any{"message": "sandbox orchestration not available", "retryable": false, "hint": "Sandbox provisioning is not configured on this server."}
 	}
-	if err := s.Orch.ResumeSandbox(ctx, podID, id); err != nil {
+	if err := s.Orch.ResumeSandbox(ctx, podID, id, sb.Tier); err != nil {
 		return nil, http.StatusBadGateway, "resume_failed", map[string]any{"message": err.Error()}
 	}
 	out := map[string]any{"sandbox_id": id.String(), "status": "running"}
@@ -689,6 +701,16 @@ func (s *Service) toolSandboxTerminate(ctx context.Context, p *auth.Principal, a
 	lightningAddr := strings.TrimSpace(argString(args, "lightning_address"))
 	if sb.BillingMethod == "lightning" && lightningAddr != "" && sb.PrepaidBalanceMsats > 0 {
 		refundResult = s.attemptLightningRefund(ctx, id, sb.PrepaidBalanceMsats, lightningAddr)
+	}
+
+	if sb.BillingMethod == "credits" && sb.UserID != nil {
+		refundedSubcents, refundErr := s.Store.RefundSandboxCredits(ctx, *sb.UserID, sb.ID)
+		if refundErr != nil {
+			slog.Error("credit refund on terminate failed", "sandbox_id", id, "err", refundErr)
+		}
+		if refundedSubcents > 0 {
+			refundResult = map[string]any{"status": "credited", "amount_cents": refundedSubcents / store.SubcentsPerCent}
+		}
 	}
 
 	out := map[string]any{
@@ -760,9 +782,8 @@ func (s *Service) toolListTiers(ctx context.Context) (any, int, string, map[stri
 			tierInfo["sats_per_second"] = float64(t.MsatsPerSecond) / 1000.0
 		}
 
-		// Calculate USD cents per second (from x100 representation)
 		if t.USDCentsPerSecondX100 > 0 {
-			tierInfo["usd_cents_per_second"] = float64(t.USDCentsPerSecondX100) / 100.0
+			tierInfo["usd_cents_per_second"] = float64(t.USDCentsPerSecondX100) / 100000.0
 		}
 
 		// Add examples for common durations
@@ -774,8 +795,7 @@ func (s *Service) toolListTiers(ctx context.Context) (any, int, string, map[stri
 		}
 
 		if t.USDCentsPerSecondX100 > 0 {
-			// Cost for 1 hour in USD
-			tierInfo["cost_per_hour_usd"] = float64(t.USDCentsPerSecondX100*3600) / 10000.0
+			tierInfo["cost_per_hour_usd"] = float64(t.USDCentsPerSecondX100*3600) / (100000.0 * 100.0)
 		}
 
 		result = append(result, tierInfo)

@@ -9,6 +9,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// SubcentsPerCent is the conversion factor between internal "subcent" units and user-facing cents.
+// 1 subcent = 1/100,000 of a cent. This matches the precision of tier_pricing.usd_cents_per_second_x100.
+const SubcentsPerCent int64 = 100_000
+
 // Store holds connection pools and DB helpers.
 type Store struct {
 	Tx      *pgxpool.Pool
@@ -45,7 +49,7 @@ type Agent struct {
 type User struct {
 	ID                    uuid.UUID
 	Email                 string
-	CreditBalanceUSDCents int64
+	CreditBalanceSubcents int64
 	WarningLevel          string
 }
 
@@ -82,6 +86,9 @@ type Sandbox struct {
 	PendingInvoicePaymentHash []byte
 	PendingInvoiceAmountMsats *int64
 	PendingInvoiceExpiresAt   *time.Time
+
+	// Per-sandbox credit pool (credits billing).
+	PrepaidBalanceSubcents int64
 }
 
 // TierPricing row.
@@ -102,13 +109,13 @@ type BillingInterval struct {
 
 // CreditCharge for batched credit path metering.
 type CreditCharge struct {
-	UserID      uuid.UUID
-	SandboxID   uuid.UUID
-	AmountCents int64
-	Start       interface{}
-	End         interface{}
-	Tier        string
-	Description string
+	UserID         uuid.UUID
+	SandboxID      uuid.UUID
+	AmountSubcents int64
+	Start          interface{}
+	End            interface{}
+	Tier           string
+	Description    string
 }
 
 // CreditTxSummary is a dashboard-friendly ledger row.

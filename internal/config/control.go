@@ -93,6 +93,8 @@ type Control struct {
 
 	// SandboxReadyTimeout is the max time to wait for sockt-runtime /healthz after pod create or resume (SANDBOX_READY_TIMEOUT_SECS).
 	SandboxReadyTimeout time.Duration
+	// SandboxReadyTimeoutGPU is the max time for GPU tiers which need longer for large image pulls (SANDBOX_READY_TIMEOUT_GPU_SECS).
+	SandboxReadyTimeoutGPU time.Duration
 	// SandboxReadyPollInterval is the delay between readiness probes (SANDBOX_READY_POLL_INTERVAL_MS).
 	SandboxReadyPollInterval time.Duration
 	// SandboxReadyProbeTimeout is the per-request HTTP timeout for each GET /healthz (SANDBOX_READY_PROBE_TIMEOUT_SECS).
@@ -306,6 +308,10 @@ func Load() (*Control, error) {
 	}
 
 	c.SandboxReadyTimeout, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_SECS", 120*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	c.SandboxReadyTimeoutGPU, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_GPU_SECS", 900*time.Second)
 	if err != nil {
 		return nil, err
 	}

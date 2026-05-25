@@ -111,18 +111,14 @@ func handleAuditBatch(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 				if iv.Consumed <= 0 {
 					continue
 				}
-				cents := (iv.Consumed * pr.USDCentsPerSecondX100) / 100000
-				if cents <= 0 {
-					cents = 1
-				}
 				charges = append(charges, store.CreditCharge{
-					UserID:      *sb.UserID,
-					SandboxID:   sid,
-					AmountCents: cents,
-					Start:       iv.StartedAt,
-					End:         iv.EndedAt,
-					Tier:        sb.Tier,
-					Description: "audit interval",
+					UserID:         *sb.UserID,
+					SandboxID:      sid,
+					AmountSubcents: iv.Consumed,
+					Start:          iv.StartedAt,
+					End:            iv.EndedAt,
+					Tier:           sb.Tier,
+					Description:    "audit interval",
 				})
 			}
 			if err := d.Store.RecordCreditComputeCharges(r.Context(), charges); err != nil {
@@ -237,15 +233,14 @@ func handleTopupTrigger(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 			}
 			want := body.RequestedTopup
 			if want <= 0 {
-				want = d.Cfg.LowCreditThresholdCents * 10
+				want = d.Cfg.LowCreditThresholdCents * store.SubcentsPerCent * 10
 			}
-			a, after, err := d.Store.AllocateCreditsForSandbox(r.Context(), *sb.UserID, sid, want)
+			a, poolAfter, _, err := d.Store.AllocateCreditsForSandbox(r.Context(), *sb.UserID, sid, want)
 			if err != nil {
 				writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "insufficient_credits", "message": err.Error()})
 				return
 			}
-			_ = after
-			writeJSON(w, http.StatusOK, map[string]any{"balance_delta": a, "new_balance": after})
+			writeJSON(w, http.StatusOK, map[string]any{"balance_delta": a, "new_balance": poolAfter})
 		default:
 			writeJSON(w, http.StatusOK, map[string]any{"balance_delta": int64(0), "error_class": "billing_method"})
 		}

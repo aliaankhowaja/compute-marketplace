@@ -91,11 +91,19 @@ func sleepPoll(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (s *Service) waitForRuntime(ctx context.Context, proxyBase string) error {
+func isGPUTier(tier string) bool {
+	t := strings.ToLower(strings.TrimSpace(tier))
+	return t == "gpu_small" || t == "gpu_large"
+}
+
+func (s *Service) waitForRuntime(ctx context.Context, proxyBase string, tier string) error {
 	if s == nil || s.Cfg == nil {
 		return fmt.Errorf("orchestrator not configured")
 	}
 	timeout := s.Cfg.SandboxReadyTimeout
+	if isGPUTier(tier) && s.Cfg.SandboxReadyTimeoutGPU > 0 {
+		timeout = s.Cfg.SandboxReadyTimeoutGPU
+	}
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}

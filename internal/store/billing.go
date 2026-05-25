@@ -249,7 +249,7 @@ func (s *Store) ListCreditTransactionsByUser(ctx context.Context, userID uuid.UU
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.Tx.Query(ctx, `SELECT id, type, amount_usd_cents, balance_after_usd_cents, description, created_at FROM public.credit_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+	rows, err := s.Tx.Query(ctx, `SELECT id, type, amount_subcents, balance_after_subcents, description, created_at FROM public.credit_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
 		userID, limit)
 	if err != nil {
 		return nil, err
