@@ -22,9 +22,8 @@ type Control struct {
 	SupabaseDBTxDSN        string
 	SupabaseDBSessionDSN   string
 
-	RunPodAPIKey        string
-	RunPodAPIURL        string
-	RunPodDefaultRegion string
+	RunPodAPIKey string
+	RunPodAPIURL string
 	// RunPod template IDs for tier-based provisioning (see orchestrator.ResolveTier).
 	RunPodTemplateCPUID      string // fallback for CPU tiers if per-tier ID is unset
 	RunPodTemplateNanoID     string
@@ -187,9 +186,8 @@ func Load() (*Control, error) {
 		SupabaseJWTSecret:        strings.TrimSpace(os.Getenv("SUPABASE_JWT_SECRET")),
 		SupabaseDBTxDSN:          strings.TrimSpace(os.Getenv("SUPABASE_DB_TX_DSN")),
 		SupabaseDBSessionDSN:     strings.TrimSpace(os.Getenv("SUPABASE_DB_SESSION_DSN")),
-		RunPodAPIKey:             strings.TrimSpace(os.Getenv("RUNPOD_API_KEY")),
-		RunPodAPIURL:             envOrDefault("RUNPOD_API_URL", "https://rest.runpod.io/v1"),
-		RunPodDefaultRegion:      envOrDefault("RUNPOD_DEFAULT_REGION", "US-CA-1"),
+		RunPodAPIKey: strings.TrimSpace(os.Getenv("RUNPOD_API_KEY")),
+		RunPodAPIURL: envOrDefault("RUNPOD_API_URL", "https://rest.runpod.io/v1"),
 		RunPodTemplateCPUID:      strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_CPU_ID")),
 		RunPodTemplateNanoID:     strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_NANO_ID")),
 		RunPodTemplateMicroID:    strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_MICRO_ID")),
