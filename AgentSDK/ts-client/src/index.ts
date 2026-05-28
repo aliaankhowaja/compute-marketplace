@@ -8,8 +8,8 @@ export { ComputeClient, Sandbox } from "./client.js";
 export type { RuntimeKind } from "./util.js";
 export {
   deriveDataEndpoint,
-  parsePodIdFromRunpodEndpoint,
-  runpodProxyBase,
+  parsePodIdFromEndpoint,
+  proxyBase,
   shellUrlFor,
 } from "./util.js";
 export {

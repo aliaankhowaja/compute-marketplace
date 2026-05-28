@@ -409,13 +409,26 @@ class Sandbox:
         self.status = "running"
         self.refresh_data_jwt(force=True)
 
-    def terminate(self, *, lightning_address: str | None = None) -> None:
+    def terminate(self, *, lightning_address: str | None = None) -> dict[str, Any]:
+        """
+        Terminate the sandbox and return consumption details.
+
+        Returns:
+            Dictionary with keys:
+            - sandbox_id: The sandbox UUID
+            - status: "terminated"
+            - consumed_msats_total: For credits sandboxes, this is USD cents consumed. For lightning, msats consumed.
+            - terminated_at: RFC3339 timestamp
+            - refund: (optional) Refund details for lightning sandboxes
+        """
         assert self._client is not None
         body: dict[str, Any] = {}
         if lightning_address:
             body["lightning_address"] = lightning_address
         resp = self._client._request_cp("DELETE", f"/v1/sandbox/{self.id}", json=body if body else None)
         self._client._raise_for_cp(resp)
+        data = resp.json()
+        return dict(data) if isinstance(data, dict) else {}
 
     def extend_balance(self, *, cents: int | None = None) -> dict[str, Any]:
         """Allocate more credits for this sandbox (credits-only). Lightning sandboxes top up by paying the

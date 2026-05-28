@@ -5,11 +5,11 @@ import json
 import httpx
 
 from sockt.client import ComputeClient, Sandbox
-from sockt.util import derive_data_endpoint, runpod_proxy_base
+from sockt.util import derive_data_endpoint, proxy_base
 
 
-def test_runpod_proxy_base_shape():
-    assert runpod_proxy_base("abc") == "https://abc-8443.proxy.runpod.net"
+def test_proxy_base_shape():
+    assert proxy_base("abc") == "https://abc-8443.proxy.runpod.net"
 
 
 def test_derive_data_endpoint_prefers_proxy_url():
@@ -32,7 +32,7 @@ def test_refresh_updates_endpoint_after_pod_change():
                 "Status": "running",
                 "Tier": "nano",
                 "Template": "sockt-cpu",
-                "Runtime": "runpod_cpu",
+                "Runtime": "cpu",
                 "BillingMethod": "credits",
                 "PodID": "newpod",
                 "PodProxyURL": None,
@@ -58,7 +58,7 @@ def test_refresh_updates_endpoint_after_pod_change():
         "Status": "running",
         "Tier": "nano",
         "Template": "sockt-cpu",
-        "Runtime": "runpod_cpu",
+        "Runtime": "cpu",
         "BillingMethod": "credits",
         "PodID": "newpod",
         "ConsumedMsats": 0,
@@ -68,7 +68,7 @@ def test_refresh_updates_endpoint_after_pod_change():
         status="running",
         tier="nano",
         template="sockt-cpu",
-        runtime="runpod_cpu",
+        runtime="cpu",
         billing_method="credits",
         pod_id="newpod",
         data_endpoint=derive_data_endpoint(None, "newpod"),

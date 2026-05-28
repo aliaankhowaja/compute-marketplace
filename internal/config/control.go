@@ -22,9 +22,8 @@ type Control struct {
 	SupabaseDBTxDSN        string
 	SupabaseDBSessionDSN   string
 
-	RunPodAPIKey        string
-	RunPodAPIURL        string
-	RunPodDefaultRegion string
+	RunPodAPIKey string
+	RunPodAPIURL string
 	// RunPod template IDs for tier-based provisioning (see orchestrator.ResolveTier).
 	RunPodTemplateCPUID      string // fallback for CPU tiers if per-tier ID is unset
 	RunPodTemplateNanoID     string
@@ -93,6 +92,8 @@ type Control struct {
 
 	// SandboxReadyTimeout is the max time to wait for sockt-runtime /healthz after pod create or resume (SANDBOX_READY_TIMEOUT_SECS).
 	SandboxReadyTimeout time.Duration
+	// SandboxReadyTimeoutGPU is the max time for GPU tiers which need longer for large image pulls (SANDBOX_READY_TIMEOUT_GPU_SECS).
+	SandboxReadyTimeoutGPU time.Duration
 	// SandboxReadyPollInterval is the delay between readiness probes (SANDBOX_READY_POLL_INTERVAL_MS).
 	SandboxReadyPollInterval time.Duration
 	// SandboxReadyProbeTimeout is the per-request HTTP timeout for each GET /healthz (SANDBOX_READY_PROBE_TIMEOUT_SECS).
@@ -185,9 +186,8 @@ func Load() (*Control, error) {
 		SupabaseJWTSecret:        strings.TrimSpace(os.Getenv("SUPABASE_JWT_SECRET")),
 		SupabaseDBTxDSN:          strings.TrimSpace(os.Getenv("SUPABASE_DB_TX_DSN")),
 		SupabaseDBSessionDSN:     strings.TrimSpace(os.Getenv("SUPABASE_DB_SESSION_DSN")),
-		RunPodAPIKey:             strings.TrimSpace(os.Getenv("RUNPOD_API_KEY")),
-		RunPodAPIURL:             envOrDefault("RUNPOD_API_URL", "https://rest.runpod.io/v1"),
-		RunPodDefaultRegion:      envOrDefault("RUNPOD_DEFAULT_REGION", "US-CA-1"),
+		RunPodAPIKey: strings.TrimSpace(os.Getenv("RUNPOD_API_KEY")),
+		RunPodAPIURL: envOrDefault("RUNPOD_API_URL", "https://rest.runpod.io/v1"),
 		RunPodTemplateCPUID:      strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_CPU_ID")),
 		RunPodTemplateNanoID:     strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_NANO_ID")),
 		RunPodTemplateMicroID:    strings.TrimSpace(os.Getenv("RUNPOD_TEMPLATE_MICRO_ID")),
@@ -306,6 +306,10 @@ func Load() (*Control, error) {
 	}
 
 	c.SandboxReadyTimeout, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_SECS", 120*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	c.SandboxReadyTimeoutGPU, err = parseDurationSecs("SANDBOX_READY_TIMEOUT_GPU_SECS", 900*time.Second)
 	if err != nil {
 		return nil, err
 	}

@@ -1,4 +1,4 @@
-"""Sockt Python Agent SDK (RunPod MVP)."""
+"""Sockt Python Agent SDK."""
 
 from sockt.client import ComputeClient, Sandbox
 from sockt.errors import (

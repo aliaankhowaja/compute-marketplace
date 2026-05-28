@@ -9,8 +9,8 @@
 create table public.users (
   id uuid not null primary key references auth.users (id) on delete cascade,
   email text not null,
-  credit_balance_usd_cents bigint not null default 0
-    constraint users_credit_balance_non_negative check (credit_balance_usd_cents >= 0),
+  credit_balance_subcents bigint not null default 0
+    constraint users_credit_balance_non_negative check (credit_balance_subcents >= 0),
   warning_level text not null default 'ok',
   created_at timestamp with time zone not null default now()
 );
@@ -147,9 +147,9 @@ create table public.credit_transactions (
   user_id uuid not null references public.users (id) on delete cascade,
   sandbox_id uuid references public.sandboxes (id) on delete set null,
   type text not null,
-  amount_usd_cents bigint not null
-    constraint credit_transactions_amount_positive check (amount_usd_cents > 0),
-  balance_after_usd_cents bigint not null,
+  amount_subcents bigint not null
+    constraint credit_transactions_amount_positive check (amount_subcents > 0),
+  balance_after_subcents bigint not null,
   description text not null,
   stripe_payment_intent_id text,
   created_at timestamp with time zone not null default now()
@@ -265,3 +265,32 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row
   execute procedure public.handle_new_user();
+
+
+-- Per-sandbox credit pool for credits billing (mirrors prepaid_balance_msats for lightning).
+-- Floor of -500 cents allows grace period overshoot before hard-pause.
+ALTER TABLE public.sandboxes
+  ADD COLUMN prepaid_balance_usd_cents bigint NOT NULL DEFAULT 0
+    CONSTRAINT sandboxes_prepaid_balance_usd_cents_floor CHECK (prepaid_balance_usd_cents >= -100);
+
+
+-- Switch credit storage from "cents" to "subcents" (1 subcent = 1/100,000 of a cent).
+-- This aligns internal storage with the rate column (usd_cents_per_second_x100),
+-- eliminating integer truncation that caused overcharging on low-cost tiers.
+
+-- users: rename + scale existing balances
+ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_credit_balance_non_negative;
+ALTER TABLE public.users RENAME COLUMN credit_balance_usd_cents TO credit_balance_subcents;
+UPDATE public.users SET credit_balance_subcents = credit_balance_subcents * 100000;
+ALTER TABLE public.users ADD CONSTRAINT users_credit_balance_non_negative CHECK (credit_balance_subcents >= 0);
+
+-- sandboxes: rename + scale existing pool balances
+ALTER TABLE public.sandboxes DROP CONSTRAINT IF EXISTS sandboxes_prepaid_balance_usd_cents_floor;
+ALTER TABLE public.sandboxes RENAME COLUMN prepaid_balance_usd_cents TO prepaid_balance_subcents;
+UPDATE public.sandboxes SET prepaid_balance_subcents = prepaid_balance_subcents * 100000;
+ALTER TABLE public.sandboxes ADD CONSTRAINT sandboxes_prepaid_balance_subcents_floor CHECK (prepaid_balance_subcents >= -10000000);
+
+-- credit_transactions: rename + scale
+ALTER TABLE public.credit_transactions RENAME COLUMN amount_usd_cents TO amount_subcents;
+ALTER TABLE public.credit_transactions RENAME COLUMN balance_after_usd_cents TO balance_after_subcents;
+UPDATE public.credit_transactions SET amount_subcents = amount_subcents * 100000, balance_after_subcents = balance_after_subcents * 100000;

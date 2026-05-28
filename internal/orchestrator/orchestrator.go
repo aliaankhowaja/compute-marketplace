@@ -83,8 +83,13 @@ type CreatePodRequest struct {
 	CPUFlavorPriority string   `json:"cpuFlavorPriority,omitempty"`
 	VCPUCount         int      `json:"vcpuCount,omitempty"`
 	GPUCount          int      `json:"gpuCount,omitempty"`
+	GPUTypeIDs        []string `json:"gpuTypeIds,omitempty"`
+	GPUTypePriority   string   `json:"gpuTypePriority,omitempty"`
 	MinVCPUPerGPU     int      `json:"minVCPUPerGPU,omitempty"`
 	MinRAMPerGPU      int      `json:"minRAMPerGPU,omitempty"`
+
+	DataCenterPriority string `json:"dataCenterPriority,omitempty"`
+	CloudType          string `json:"cloudType,omitempty"`
 }
 
 // ResolveTier maps a pricing tier to RunPod CreatePodRequest fields plus labels stored on sandboxes.
@@ -102,11 +107,13 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_NANO_ID or RUNPOD_TEMPLATE_CPU_ID is required")
 		}
 		return CreatePodRequest{
-			TemplateID:        id,
-			ComputeType:       "CPU",
-			CPUFlavorIDs:      []string{"cpu3c"},
-			CPUFlavorPriority: "availability",
-			VCPUCount:         1,
+			TemplateID:         id,
+			ComputeType:        "CPU",
+			CPUFlavorIDs:       []string{"cpu3c"},
+			CPUFlavorPriority:  "availability",
+			VCPUCount:          1,
+			DataCenterPriority: "availability",
+			CloudType:          "SECURE",
 		}, "sockt-nano", "runpod_cpu", nil
 
 	case "micro":
@@ -118,11 +125,13 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_MICRO_ID or RUNPOD_TEMPLATE_CPU_ID is required")
 		}
 		return CreatePodRequest{
-			TemplateID:        id,
-			ComputeType:       "CPU",
-			CPUFlavorIDs:      []string{"cpu3c"},
-			CPUFlavorPriority: "availability",
-			VCPUCount:         2,
+			TemplateID:         id,
+			ComputeType:        "CPU",
+			CPUFlavorIDs:       []string{"cpu3c"},
+			CPUFlavorPriority:  "availability",
+			VCPUCount:          2,
+			DataCenterPriority: "availability",
+			CloudType:          "SECURE",
 		}, "sockt-micro", "runpod_cpu", nil
 
 	case "standard":
@@ -134,11 +143,13 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_STANDARD_ID or RUNPOD_TEMPLATE_CPU_ID is required")
 		}
 		return CreatePodRequest{
-			TemplateID:        id,
-			ComputeType:       "CPU",
-			CPUFlavorIDs:      []string{"cpu3c"},
-			CPUFlavorPriority: "availability",
-			VCPUCount:         4,
+			TemplateID:         id,
+			ComputeType:        "CPU",
+			CPUFlavorIDs:       []string{"cpu3c"},
+			CPUFlavorPriority:  "availability",
+			VCPUCount:          4,
+			DataCenterPriority: "availability",
+			CloudType:          "SECURE",
 		}, "sockt-standard", "runpod_cpu", nil
 
 	case "gpu_small":
@@ -147,11 +158,13 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_GPU_SMALL_ID is required")
 		}
 		return CreatePodRequest{
-			TemplateID:    id,
-			ComputeType:   "GPU",
-			GPUCount:      1,
-			MinVCPUPerGPU: 6,
-			MinRAMPerGPU:  16,
+			TemplateID:         id,
+			ComputeType:        "GPU",
+			GPUCount:           1,
+			GPUTypeIDs:         []string{"NVIDIA GeForce RTX 5090"},
+			GPUTypePriority:    "availability",
+			DataCenterPriority: "availability",
+			CloudType:          "SECURE",
 		}, "sockt-gpu-small", "runpod_gpu", nil
 
 	case "gpu_large":
@@ -160,11 +173,13 @@ func ResolveTier(cfg *config.Control, tier string) (req CreatePodRequest, templa
 			return CreatePodRequest{}, "", "", fmt.Errorf("RUNPOD_TEMPLATE_GPU_LARGE_ID is required")
 		}
 		return CreatePodRequest{
-			TemplateID:    id,
-			ComputeType:   "GPU",
-			GPUCount:      1,
-			MinVCPUPerGPU: 6,
-			MinRAMPerGPU:  32,
+			TemplateID:         id,
+			ComputeType:        "GPU",
+			GPUCount:           1,
+			GPUTypeIDs:         []string{"NVIDIA A100 80GB PCIe"},
+			GPUTypePriority:    "availability",
+			DataCenterPriority: "availability",
+			CloudType:          "SECURE",
 		}, "sockt-gpu-large", "runpod_gpu", nil
 
 	default:
@@ -276,7 +291,7 @@ func (s *Service) CreateSandbox(ctx context.Context, sb *store.Sandbox, env map[
 	if err := s.Store.UpdateSandboxPod(ctx, sb.ID, strPtr(pid), strPtr(proxy), sb.NetworkVolumeID); err != nil {
 		return err
 	}
-	if err := s.waitForRuntime(ctx, proxy); err != nil {
+	if err := s.waitForRuntime(ctx, proxy, sb.Tier); err != nil {
 		cleanCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		_ = s.Client.TerminatePod(cleanCtx, pid)
@@ -303,12 +318,12 @@ func (s *Service) PauseSandbox(ctx context.Context, podID string, sandboxID uuid
 }
 
 // ResumeSandbox starts a stopped pod.
-func (s *Service) ResumeSandbox(ctx context.Context, podID string, sandboxID uuid.UUID) error {
+func (s *Service) ResumeSandbox(ctx context.Context, podID string, sandboxID uuid.UUID, tier string) error {
 	if err := s.Client.StartPod(ctx, podID); err != nil {
 		return err
 	}
 	proxy := RunPodProxyURL(s.Cfg, podID)
-	if err := s.waitForRuntime(ctx, proxy); err != nil {
+	if err := s.waitForRuntime(ctx, proxy, tier); err != nil {
 		return fmt.Errorf("runtime not ready after resume: %w", err)
 	}
 	return s.Store.UpdateSandboxStatus(ctx, sandboxID, "running")

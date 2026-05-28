@@ -13,7 +13,8 @@ import (
 const sandboxColumns = `id, agent_id, user_id, api_key_id, billing_method, tier, template, status, runtime,
 		pod_id, pod_proxy_url, network_volume_id, COALESCE(consumed_msats, 0),
 		sandbox_token, COALESCE(prepaid_balance_msats, 0),
-		pending_invoice_bolt11, pending_invoice_payment_hash, pending_invoice_amount_msats, pending_invoice_expires_at`
+		pending_invoice_bolt11, pending_invoice_payment_hash, pending_invoice_amount_msats, pending_invoice_expires_at,
+		COALESCE(prepaid_balance_subcents, 0)`
 
 func scanSandbox(row pgx.Row, sb *Sandbox) error {
 	return row.Scan(
@@ -21,6 +22,7 @@ func scanSandbox(row pgx.Row, sb *Sandbox) error {
 		&sb.PodID, &sb.PodProxyURL, &sb.NetworkVolumeID, &sb.ConsumedMsats,
 		&sb.SandboxToken, &sb.PrepaidBalanceMsats,
 		&sb.PendingInvoiceBolt11, &sb.PendingInvoicePaymentHash, &sb.PendingInvoiceAmountMsats, &sb.PendingInvoiceExpiresAt,
+		&sb.PrepaidBalanceSubcents,
 	)
 }
 
@@ -35,13 +37,15 @@ func (s *Store) InsertSandbox(ctx context.Context, sb *Sandbox) error {
 		id, agent_id, user_id, api_key_id, billing_method, tier, template, status, runtime,
 		pod_id, pod_proxy_url, network_volume_id, consumed_msats,
 		sandbox_token, prepaid_balance_msats,
-		pending_invoice_bolt11, pending_invoice_payment_hash, pending_invoice_amount_msats, pending_invoice_expires_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`
+		pending_invoice_bolt11, pending_invoice_payment_hash, pending_invoice_amount_msats, pending_invoice_expires_at,
+		prepaid_balance_subcents
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`
 	_, err := s.Tx.Exec(ctx, q,
 		sb.ID, sb.AgentID, sb.UserID, sb.APIKeyID, sb.BillingMethod, sb.Tier, sb.Template, sb.Status, sb.Runtime,
 		sb.PodID, sb.PodProxyURL, sb.NetworkVolumeID, sb.ConsumedMsats,
 		sb.SandboxToken, sb.PrepaidBalanceMsats,
 		sb.PendingInvoiceBolt11, sb.PendingInvoicePaymentHash, sb.PendingInvoiceAmountMsats, sb.PendingInvoiceExpiresAt,
+		sb.PrepaidBalanceSubcents,
 	)
 	return err
 }

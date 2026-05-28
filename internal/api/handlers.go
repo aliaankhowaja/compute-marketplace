@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -11,6 +14,36 @@ import (
 	"github.com/aliaankhowaja/sockt-backend/internal/orchestrator"
 	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
+
+func publicRuntime(internal string) string {
+	switch internal {
+	case "runpod_cpu":
+		return "cpu"
+	case "runpod_gpu":
+		return "gpu"
+	default:
+		return internal
+	}
+}
+
+func sanitizedSandbox(sb *store.Sandbox) map[string]any {
+	m := map[string]any{
+		"id":              sb.ID,
+		"billing_method":  sb.BillingMethod,
+		"tier":            sb.Tier,
+		"template":        sb.Template,
+		"status":          sb.Status,
+		"runtime":         publicRuntime(sb.Runtime),
+		"consumed_msats":  sb.ConsumedMsats,
+	}
+	if sb.AgentID != nil {
+		m["agent_id"] = sb.AgentID
+	}
+	if sb.UserID != nil {
+		m["user_id"] = sb.UserID
+	}
+	return m
+}
 
 func canAccessSandbox(p *auth.Principal, sb *store.Sandbox) bool {
 	if p == nil || sb == nil {
@@ -50,7 +83,7 @@ func handleUserCredits(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 			writeErr(w, http.StatusNotFound, "not_found", "user not found")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]int64{"credit_balance_usd_cents": u.CreditBalanceUSDCents})
+		writeJSON(w, http.StatusOK, map[string]int64{"credit_balance_usd_cents": u.CreditBalanceSubcents / store.SubcentsPerCent})
 	}
 }
 
@@ -142,8 +175,9 @@ func handleRevokeAPIKey(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 }
 
 type createSandboxBody struct {
-	BillingMethod string `json:"billing_method"`
-	Tier          string `json:"tier"`
+	BillingMethod       string `json:"billing_method"`
+	Tier                string `json:"tier"`
+	InitialCreditsCents int64  `json:"initial_credits_cents,omitempty"`
 }
 
 func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) {
@@ -195,29 +229,39 @@ func handleCreateSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
 			return
 		}
-		alloc, _, err := d.Store.AllocateCreditsForSandbox(r.Context(), *sb.UserID, sb.ID, d.Cfg.LowCreditThresholdCents*10)
+		minSubcents := pr.USDCentsPerSecondX100 * 3600
+		if minSubcents <= 0 {
+			minSubcents = store.SubcentsPerCent
+		}
+		allocRequest := body.InitialCreditsCents * store.SubcentsPerCent
+		if allocRequest <= 0 {
+			allocRequest = minSubcents
+		}
+		if allocRequest < minSubcents {
+			writeErr(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("minimum allocation is %d cents (1 hour of compute)", minSubcents/store.SubcentsPerCent))
+			return
+		}
+		alloc, _, _, err := d.Store.AllocateCreditsForSandbox(r.Context(), *sb.UserID, sb.ID, allocRequest)
 		if err != nil {
 			writeErr(w, http.StatusPaymentRequired, "insufficient_credits", err.Error())
 			return
 		}
-		rate := int64(1)
-		if pr.USDCentsPerSecondX100 > 0 {
-			rate = pr.USDCentsPerSecondX100 / 100000
-			if rate <= 0 {
-				rate = 1
-			}
+		rate := pr.USDCentsPerSecondX100
+		if rate <= 0 {
+			rate = 1
 		}
 		env := orchestrator.BuildSandboxEnv(d.Cfg, sb, alloc, rate)
 		if d.Orch == nil {
-			writeErr(w, http.StatusServiceUnavailable, "orchestrator_disabled", "runpod not configured")
+			writeErr(w, http.StatusServiceUnavailable, "orchestrator_disabled", "sandbox orchestration not configured")
 			return
 		}
 		if err := d.Orch.CreateSandbox(r.Context(), sb, env); err != nil {
-			writeErr(w, http.StatusBadGateway, "runpod_error", err.Error())
+			_, _ = d.Store.RefundSandboxCredits(r.Context(), *sb.UserID, sb.ID)
+			writeErr(w, http.StatusBadGateway, "provisioning_error", err.Error())
 			return
 		}
 		sb2, _ := d.Store.GetSandbox(r.Context(), sb.ID)
-		writeJSON(w, http.StatusOK, sb2)
+		writeJSON(w, http.StatusOK, sanitizedSandbox(sb2))
 	}
 }
 
@@ -238,7 +282,7 @@ func handleGetSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) {
 			writeErr(w, http.StatusForbidden, "forbidden", "")
 			return
 		}
-		writeJSON(w, http.StatusOK, sb)
+		writeJSON(w, http.StatusOK, sanitizedSandbox(sb))
 	}
 }
 
@@ -284,7 +328,7 @@ func handleResumeSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 		if sb.PodID != nil {
 			podID = *sb.PodID
 		}
-		if err := d.Orch.ResumeSandbox(r.Context(), podID, id); err != nil {
+		if err := d.Orch.ResumeSandbox(r.Context(), podID, id, sb.Tier); err != nil {
 			writeErr(w, http.StatusBadGateway, "resume_failed", err.Error())
 			return
 		}
@@ -323,6 +367,7 @@ func handleDeleteSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 		}
 
 		addr := strings.TrimSpace(body.LightningAddress)
+		var refundResult map[string]any
 		if sb.BillingMethod == "lightning" && addr != "" && sb.PrepaidBalanceMsats > 0 && d.PaySvc != nil {
 			refundSats := sb.PrepaidBalanceMsats / 1000
 			if sb.PrepaidBalanceMsats%1000 != 0 {
@@ -330,11 +375,34 @@ func handleDeleteSandbox(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 			}
 			if refundSats > 0 {
 				idem := "sandbox-refund:" + id.String()
-				_ = d.PaySvc.SendToAddress(r.Context(), addr, refundSats, idem)
+				if err := d.PaySvc.SendToAddress(r.Context(), addr, refundSats, idem); err != nil {
+					refundResult = map[string]any{"status": "failed", "reason": err.Error(), "amount_sats": refundSats}
+				} else {
+					refundResult = map[string]any{"status": "sent", "amount_sats": refundSats, "address": addr}
+				}
 			}
 		}
 
-		w.WriteHeader(http.StatusNoContent)
+		if sb.BillingMethod == "credits" && sb.UserID != nil {
+			refundedCents, refundErr := d.Store.RefundSandboxCredits(r.Context(), *sb.UserID, sb.ID)
+			if refundErr != nil {
+				slog.Error("credit refund failed", "sandbox_id", id, "err", refundErr)
+			}
+			if refundedCents > 0 {
+				refundResult = map[string]any{"status": "credited", "amount_cents": refundedCents / store.SubcentsPerCent}
+			}
+		}
+
+		response := map[string]any{
+			"sandbox_id":           id.String(),
+			"status":               "terminated",
+			"consumed_msats_total": sb.ConsumedMsats,
+			"terminated_at":        time.Now().Format(time.RFC3339),
+		}
+		if refundResult != nil {
+			response["refund"] = refundResult
+		}
+		writeJSON(w, http.StatusOK, response)
 	}
 }
 
@@ -387,16 +455,16 @@ func handleExtendBalance(d RouterDeps) func(http.ResponseWriter, *http.Request) 
 		}
 		var body extendBody
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		want := body.Cents
+		want := body.Cents * store.SubcentsPerCent
 		if want <= 0 {
-			want = d.Cfg.LowCreditThresholdCents * 10
+			want = d.Cfg.LowCreditThresholdCents * store.SubcentsPerCent * 10
 		}
-		a, after, err := d.Store.AllocateCreditsForSandbox(r.Context(), *p.UserID, id, want)
+		a, poolAfter, _, err := d.Store.AllocateCreditsForSandbox(r.Context(), *p.UserID, id, want)
 		if err != nil {
 			writeErr(w, http.StatusPaymentRequired, "insufficient_credits", err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]int64{"allocated_cents": a, "balance_after_cents": after})
+		writeJSON(w, http.StatusOK, map[string]int64{"allocated_cents": a / store.SubcentsPerCent, "sandbox_pool_cents": poolAfter / store.SubcentsPerCent})
 	}
 }
 

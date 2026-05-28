@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/aliaankhowaja/sockt-backend/internal/store"
 )
 
 // handleStripeWebhook verifies Stripe-Signature and credits users on payment_intent.succeeded.
@@ -80,7 +82,7 @@ func handleStripeWebhook(d RouterDeps) http.HandlerFunc {
 			piPtr = &pi
 		}
 		desc := "stripe payment_intent.succeeded"
-		if _, err := d.Store.AddUserCredits(r.Context(), uid, amount, "purchase", desc, piPtr); err != nil {
+		if _, err := d.Store.AddUserCredits(r.Context(), uid, amount*store.SubcentsPerCent, "purchase", desc, piPtr); err != nil {
 			writeErr(w, http.StatusInternalServerError, "credit_failed", err.Error())
 			return
 		}

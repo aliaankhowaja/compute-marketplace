@@ -96,7 +96,7 @@ func SandboxDepositObserver(orch *Service, st *store.Store, cfg *config.Control)
 			if podID == "" {
 				return
 			}
-			if err := orch.ResumeSandbox(ctx, podID, sb.ID); err != nil {
+			if err := orch.ResumeSandbox(ctx, podID, sb.ID, sb.Tier); err != nil {
 				slog.Warn("settle observer: orch.ResumeSandbox", "sandbox", sandboxID, "err", err)
 			}
 		}

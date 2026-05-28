@@ -53,7 +53,7 @@ func NewCallbacks(cfg *Config) *Callbacks {
 	return &Callbacks{
 		cfg: cfg,
 		client: &http.Client{
-			Timeout: 20 * time.Second,
+			Timeout: 30 * time.Second,
 		},
 	}
 }

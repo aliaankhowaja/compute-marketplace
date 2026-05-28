@@ -10,10 +10,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+const sandboxPoolFloorSubcents = -10_000_000
+
 func (s *Store) GetUserByID(ctx context.Context, id uuid.UUID) (*User, error) {
-	q := `SELECT id, email, credit_balance_usd_cents, warning_level FROM public.users WHERE id = $1`
+	q := `SELECT id, email, credit_balance_subcents, warning_level FROM public.users WHERE id = $1`
 	var u User
-	err := s.Tx.QueryRow(ctx, q, id).Scan(&u.ID, &u.Email, &u.CreditBalanceUSDCents, &u.WarningLevel)
+	err := s.Tx.QueryRow(ctx, q, id).Scan(&u.ID, &u.Email, &u.CreditBalanceSubcents, &u.WarningLevel)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -23,27 +25,27 @@ func (s *Store) GetUserByID(ctx context.Context, id uuid.UUID) (*User, error) {
 	return &u, nil
 }
 
-func (s *Store) AddUserCredits(ctx context.Context, userID uuid.UUID, amountCents int64, txType, desc string, stripePI *string) (balanceAfter int64, err error) {
-	tx, err := s.Tx.Begin(ctx)
+func (s *Store) AddUserCredits(ctx context.Context, userID uuid.UUID, amountSubcents int64, txType, desc string, stripePI *string) (balanceAfter int64, err error) {
+	tx, err := s.Session.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var cur int64
-	if err := tx.QueryRow(ctx, `SELECT credit_balance_usd_cents FROM public.users WHERE id = $1 FOR UPDATE`, userID).Scan(&cur); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT credit_balance_subcents FROM public.users WHERE id = $1 FOR UPDATE`, userID).Scan(&cur); err != nil {
 		return 0, err
 	}
-	newBal := cur + amountCents
+	newBal := cur + amountSubcents
 	if newBal < 0 {
 		return 0, fmt.Errorf("insufficient credits")
 	}
-	if _, err := tx.Exec(ctx, `UPDATE public.users SET credit_balance_usd_cents = $2 WHERE id = $1`, userID, newBal); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE public.users SET credit_balance_subcents = $2 WHERE id = $1`, userID, newBal); err != nil {
 		return 0, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO public.credit_transactions (user_id, sandbox_id, type, amount_usd_cents, balance_after_usd_cents, description, stripe_payment_intent_id)
+	_, err = tx.Exec(ctx, `INSERT INTO public.credit_transactions (user_id, sandbox_id, type, amount_subcents, balance_after_subcents, description, stripe_payment_intent_id)
 		VALUES ($1, NULL, $2, $3, $4, $5, $6)`,
-		userID, txType, amountCents, newBal, desc, stripePI)
+		userID, txType, amountSubcents, newBal, desc, stripePI)
 	if err != nil {
 		return 0, err
 	}
@@ -53,71 +55,88 @@ func (s *Store) AddUserCredits(ctx context.Context, userID uuid.UUID, amountCent
 	return newBal, nil
 }
 
-// AllocateCreditsForSandbox pulls prepaid credits into the sandbox metering path (session pool + advisory lock).
-func (s *Store) AllocateCreditsForSandbox(ctx context.Context, userID, sandboxID uuid.UUID, requestedCents int64) (allocated int64, balanceAfter int64, err error) {
+// AllocateCreditsForSandbox pulls prepaid credits from the user balance into the per-sandbox pool (session pool + advisory lock).
+func (s *Store) AllocateCreditsForSandbox(ctx context.Context, userID, sandboxID uuid.UUID, requestedSubcents int64) (allocated int64, sandboxPoolAfter int64, userBalanceAfter int64, err error) {
 	tx, err := s.Session.Begin(ctx)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1::text))`, userID.String()); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	var bal int64
-	if err := tx.QueryRow(ctx, `SELECT credit_balance_usd_cents FROM public.users WHERE id = $1 FOR UPDATE`, userID).Scan(&bal); err != nil {
-		return 0, 0, err
+	if err := tx.QueryRow(ctx, `SELECT credit_balance_subcents FROM public.users WHERE id = $1 FOR UPDATE`, userID).Scan(&bal); err != nil {
+		return 0, 0, 0, err
 	}
 	var alloc int64
-	if bal >= requestedCents {
-		alloc = requestedCents
+	if bal >= requestedSubcents {
+		alloc = requestedSubcents
 	} else if bal > 0 {
 		alloc = bal
 	} else {
-		return 0, bal, fmt.Errorf("insufficient credits")
+		return 0, 0, bal, fmt.Errorf("insufficient credits")
 	}
 	newBal := bal - alloc
-	if _, err := tx.Exec(ctx, `UPDATE public.users SET credit_balance_usd_cents = $2 WHERE id = $1`, userID, newBal); err != nil {
-		return 0, 0, err
+	if _, err := tx.Exec(ctx, `UPDATE public.users SET credit_balance_subcents = $2 WHERE id = $1`, userID, newBal); err != nil {
+		return 0, 0, 0, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO public.credit_transactions (user_id, sandbox_id, type, amount_usd_cents, balance_after_usd_cents, description)
+
+	var poolAfter int64
+	if err := tx.QueryRow(ctx,
+		`UPDATE public.sandboxes SET prepaid_balance_subcents = prepaid_balance_subcents + $2 WHERE id = $1 RETURNING prepaid_balance_subcents`,
+		sandboxID, alloc).Scan(&poolAfter); err != nil {
+		return 0, 0, 0, err
+	}
+
+	_, err = tx.Exec(ctx, `INSERT INTO public.credit_transactions (user_id, sandbox_id, type, amount_subcents, balance_after_subcents, description)
 		VALUES ($1, $2, 'allocation', $3, $4, $5)`,
 		userID, sandboxID, alloc, newBal, "runtime allocation chunk")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return alloc, newBal, nil
+	return alloc, poolAfter, newBal, nil
 }
 
-// RecordCreditComputeCharges writes compute_charge rows and debits user balance in one tx.
+// RecordCreditComputeCharges writes compute_charge rows and debits the per-sandbox credit pool.
+// All charges must share the same SandboxID. Uses batched writes to minimize round-trips.
 func (s *Store) RecordCreditComputeCharges(ctx context.Context, charges []CreditCharge) error {
 	if len(charges) == 0 {
 		return nil
 	}
-	tx, err := s.Tx.Begin(ctx)
+	tx, err := s.Session.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	sandboxID := charges[0].SandboxID
+
+	var poolBal int64
+	if err := tx.QueryRow(ctx,
+		`SELECT prepaid_balance_subcents FROM public.sandboxes WHERE id = $1 FOR UPDATE`,
+		sandboxID).Scan(&poolBal); err != nil {
+		return err
+	}
+
+	type resolved struct {
+		ch       CreditCharge
+		balAfter int64
+		desc     string
+	}
+	items := make([]resolved, 0, len(charges))
+	runningBal := poolBal
 	for _, ch := range charges {
-		if ch.AmountCents <= 0 {
+		if ch.AmountSubcents <= 0 {
 			continue
 		}
-		var bal int64
-		if err := tx.QueryRow(ctx, `SELECT credit_balance_usd_cents FROM public.users WHERE id = $1 FOR UPDATE`, ch.UserID).Scan(&bal); err != nil {
-			return err
-		}
-		newBal := bal - ch.AmountCents
-		if newBal < 0 {
-			newBal = 0 // clamp; runtime should pause before negative
-		}
-		if _, err := tx.Exec(ctx, `UPDATE public.users SET credit_balance_usd_cents = $2 WHERE id = $1`,
-			ch.UserID, newBal); err != nil {
-			return err
+		runningBal -= ch.AmountSubcents
+		if runningBal < sandboxPoolFloorSubcents {
+			runningBal = sandboxPoolFloorSubcents
 		}
 		desc := ch.Description
 		if desc == "" {
@@ -140,13 +159,77 @@ func (s *Store) RecordCreditComputeCharges(ctx context.Context, charges []Credit
 			}
 			desc = b.String()
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO public.credit_transactions (user_id, sandbox_id, type, amount_usd_cents, balance_after_usd_cents, description)
-			VALUES ($1,$2,'compute_charge',$3,$4,$5)`,
-			ch.UserID, ch.SandboxID, ch.AmountCents, newBal, desc); err != nil {
-			return err
-		}
+		items = append(items, resolved{ch: ch, balAfter: runningBal, desc: desc})
 	}
+
+	if len(items) == 0 {
+		return tx.Commit(ctx)
+	}
+
+	batch := &pgx.Batch{}
+	for _, it := range items {
+		batch.Queue(`INSERT INTO public.credit_transactions (user_id, sandbox_id, type, amount_subcents, balance_after_subcents, description)
+			VALUES ($1,$2,'compute_charge',$3,$4,$5)`,
+			it.ch.UserID, it.ch.SandboxID, it.ch.AmountSubcents, it.balAfter, it.desc)
+	}
+	finalBal := items[len(items)-1].balAfter
+	batch.Queue(`UPDATE public.sandboxes SET prepaid_balance_subcents = $2 WHERE id = $1`,
+		sandboxID, finalBal)
+
+	br := tx.SendBatch(ctx, batch)
+	if err := br.Close(); err != nil {
+		return err
+	}
+
 	return tx.Commit(ctx)
+}
+
+// RefundSandboxCredits returns unused sandbox pool credits to the user balance on delete.
+func (s *Store) RefundSandboxCredits(ctx context.Context, userID, sandboxID uuid.UUID) (refundedSubcents int64, err error) {
+	tx, err := s.Session.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1::text))`, userID.String()); err != nil {
+		return 0, err
+	}
+
+	var pool int64
+	if err := tx.QueryRow(ctx,
+		`SELECT prepaid_balance_subcents FROM public.sandboxes WHERE id = $1 FOR UPDATE`,
+		sandboxID).Scan(&pool); err != nil {
+		return 0, err
+	}
+	if pool <= 0 {
+		return 0, nil
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE public.sandboxes SET prepaid_balance_subcents = 0 WHERE id = $1`,
+		sandboxID); err != nil {
+		return 0, err
+	}
+
+	var newBal int64
+	if err := tx.QueryRow(ctx,
+		`UPDATE public.users SET credit_balance_subcents = credit_balance_subcents + $2 WHERE id = $1 RETURNING credit_balance_subcents`,
+		userID, pool).Scan(&newBal); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO public.credit_transactions (user_id, sandbox_id, type, amount_subcents, balance_after_subcents, description)
+		VALUES ($1, $2, 'refund', $3, $4, 'sandbox refund on delete')`,
+		userID, sandboxID, pool, newBal); err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return pool, nil
 }
 
 // SetUserWarningLevel updates dashboard warning.

@@ -1,6 +1,6 @@
-export type RuntimeKind = "runpod_cpu" | "runpod_gpu" | string;
+export type RuntimeKind = "cpu" | "gpu" | string;
 
-export function runpodProxyBase(podId: string): string {
+export function proxyBase(podId: string): string {
   const pid = (podId || "").trim();
   if (!pid) return "";
   return `https://${pid}-8443.proxy.runpod.net`;
@@ -9,7 +9,7 @@ export function runpodProxyBase(podId: string): string {
 export function deriveDataEndpoint(podProxyUrl?: string | null, podId?: string | null): string {
   const u = (podProxyUrl || "").trim().replace(/\/+$/, "");
   if (u) return u;
-  return runpodProxyBase(podId || "").replace(/\/+$/, "");
+  return proxyBase(podId || "").replace(/\/+$/, "");
 }
 
 export function stripScheme(hostOrUrl: string): string {
@@ -35,7 +35,7 @@ export function pick(row: Record<string, unknown>, ...keys: string[]): unknown {
   return undefined;
 }
 
-export function parsePodIdFromRunpodEndpoint(url: string): string | undefined {
+export function parsePodIdFromEndpoint(url: string): string | undefined {
   const m = /^https?:\/\/(?<pod>[a-zA-Z0-9_-]+)-8443\.proxy\.runpod\.net\/?$/i.exec((url || "").trim().replace(/\/+$/, ""));
   return m?.groups?.pod;
 }

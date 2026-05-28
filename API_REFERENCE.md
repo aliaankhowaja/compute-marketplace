@@ -63,20 +63,13 @@ After authentication, sandbox access checks [`canAccessSandbox`](internal/api/ha
 ### `GET /healthz`
 
 **Auth:** None  
-**Purpose:** Liveness / dependency sniff.
+**Purpose:** Liveness probe.
 
 **Response 200:**
 
 ```json
-{
-  "ok": true,
-  "lnd_connected": false,
-  "supabase_ok": false,
-  "runpod_configured": false
-}
+{"ok": true}
 ```
-
-(Field semantics: non-empty transactional DSN, LND client present, `RunPodAPIKey` configured — see router implementation.)
 
 ---
 
@@ -274,11 +267,11 @@ Empty or missing name defaults to `"default"`.
 }
 ```
 
-`billing_method` is optional and defaults to `credits`; sending `lightning` over REST returns `bad_request`. Validates tier pricing and RunPod tier mapping (`RUNPOD_TEMPLATE_*` env IDs) and allocates credits server-side.
+`billing_method` is optional and defaults to `credits`; sending `lightning` over REST returns `bad_request`. Validates tier pricing and tier mapping and allocates credits server-side.
 
 **Response 200:** Full [`Sandbox`](internal/store/store.go) row after orchestrator provisioning (reloaded). Stored `Template` reflects the canonical label (`sockt-cpu`, `sockt-gpu-small`, `sockt-gpu-large`), not client input.
 
-**Errors (non-exhaustive):** `unauthorized`, `bad_request` (JSON, billing_method, tier), `bad_tier`, `insufficient_credits` (402 credits path), `orchestrator_disabled` (503 RunPod templates misconfigured / unknown tier mapping), `runpod_error` (502), `store_error` (500).
+**Errors (non-exhaustive):** `unauthorized`, `bad_request` (JSON, billing_method, tier), `bad_tier`, `insufficient_credits` (402 credits path), `orchestrator_disabled` (503 templates misconfigured / unknown tier mapping), `provisioning_error` (502), `store_error` (500).
 
 ---
 
@@ -295,7 +288,7 @@ Empty or missing name defaults to `"default"`.
 ### `POST /v1/sandbox/{id}/pause`
 
 **Auth:** API key.  
-**Purpose:** Pause RunPod workload.
+**Purpose:** Pause sandbox workload.
 
 **Response:** **204 No Content**.
 
@@ -318,7 +311,32 @@ Empty or missing name defaults to `"default"`.
 **Auth:** API key.  
 **Purpose:** Terminate sandbox / pod.
 
-**Response:** **204 No Content**.
+**Request body (optional):**
+
+```json
+{ "lightning_address": "user@wallet.com" }
+```
+
+For lightning sandboxes, provide `lightning_address` to receive a refund of any remaining prepaid balance.
+
+**Response 200:**
+
+```json
+{
+  "sandbox_id": "<uuid>",
+  "status": "terminated",
+  "consumed_msats_total": 0,
+  "terminated_at": "<RFC3339 timestamp>",
+  "refund": {
+    "status": "sent|failed|skipped",
+    "amount_sats": 0,
+    "address": "user@wallet.com"
+  }
+}
+```
+
+- `consumed_msats_total`: For **credits** sandboxes, this is **USD cents consumed** (despite the name). For **lightning** sandboxes, this is **msats consumed**.
+- `refund`: Only present for lightning sandboxes when a refund was attempted.
 
 **Errors:** `bad_request`, `forbidden`, `terminate_failed` (502).
 

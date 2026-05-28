@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   deriveDataEndpoint,
-  parsePodIdFromRunpodEndpoint,
-  runpodProxyBase,
+  parsePodIdFromEndpoint,
+  proxyBase,
   shellUrlFor,
 } from "./util.js";
 
-describe("runpod endpoints", () => {
-  it("runpodProxyBase matches documented shape", () => {
-    expect(runpodProxyBase("abc123")).toBe("https://abc123-8443.proxy.runpod.net");
+describe("proxy endpoints", () => {
+  it("proxyBase matches documented shape", () => {
+    expect(proxyBase("abc123")).toBe("https://abc123-8443.proxy.runpod.net");
   });
 
   it("deriveDataEndpoint prefers explicit proxy URL", () => {
@@ -20,9 +20,9 @@ describe("runpod endpoints", () => {
     expect(deriveDataEndpoint("", "xyz")).toBe("https://xyz-8443.proxy.runpod.net");
   });
 
-  it("parsePodIdFromRunpodEndpoint round-trip", () => {
-    const base = runpodProxyBase("podA");
-    expect(parsePodIdFromRunpodEndpoint(base + "/")).toBe("podA");
+  it("parsePodIdFromEndpoint round-trip", () => {
+    const base = proxyBase("podA");
+    expect(parsePodIdFromEndpoint(base + "/")).toBe("podA");
   });
 
   it("shellUrlFor includes token query", () => {

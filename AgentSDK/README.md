@@ -1,17 +1,17 @@
 # Sockt Agent SDK (Phase 6)
 
-Monorepo-local SDKs for the Sockt control plane and RunPod-backed runtime.
+Monorepo-local SDKs for the Sockt control plane and sandbox runtime.
 
 ## Layout
 
-| Path | Package |
-|------|---------|
-| `python-sockt/` | Python `sockt` client |
-| `ts-client/` | npm `@sockt/client` |
-| `mcp-server/` | npm `@sockt/mcp-server` (stdio → Streamable HTTP) |
-| `tests/` | Integration-style tests (mocked HTTP; no live RunPod by default) |
+| Path            | Package                                                           |
+| --------------- | ----------------------------------------------------------------- |
+| `python-sockt/` | Python `sockt` client                                             |
+| `ts-client/`    | npm `@sockt/client`                                               |
+| `mcp-server/`   | npm `@sockt/mcp-server` (stdio → Streamable HTTP)                 |
+| `tests/`        | Integration-style tests (mocked HTTP; no live sandbox by default) |
 
-**Python:** On PEP 668–managed systems, use `python3 -m venv .venv && .venv/bin/pip install -e ./python-sockt`.
+**Python:** On PEP 668-managed systems, use `python3 -m venv .venv && .venv/bin/pip install -e ./python-sockt`.
 
 **TypeScript / Python:** Data-plane `GET /sandbox/{id}/status` is `sandbox.runtimeStatus()` / `sandbox.runtime_status()` — keep separate from the control-plane lifecycle string on `sandbox.status`.
 
