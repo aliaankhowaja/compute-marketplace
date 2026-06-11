@@ -168,6 +168,25 @@ func (s *Service) CallTool(ctx context.Context, p *auth.Principal, name string, 
 	}
 }
 
+// CallerKeyFromPrincipal derives a stable key for execution ownership tracking.
+// Used by REST endpoints as an alternative to MCP session IDs.
+func CallerKeyFromPrincipal(p *auth.Principal) string {
+	if p == nil {
+		return ""
+	}
+	switch p.Kind {
+	case auth.KindAPIKey:
+		if p.APIKeyID != nil {
+			return "apikey:" + p.APIKeyID.String()
+		}
+	case auth.KindSandbox:
+		if p.SandboxID != nil {
+			return "sandbox:" + p.SandboxID.String()
+		}
+	}
+	return ""
+}
+
 // CallToolAsync handles tools that return immediately and deliver results via SSE.
 func (s *Service) CallToolAsync(ctx context.Context, session *Session, p *auth.Principal, name string, args json.RawMessage) (result any, httpStatus int, slug string, extra map[string]any) {
 	if s == nil {
@@ -193,7 +212,7 @@ func (s *Service) CallToolAsync(ctx context.Context, session *Session, p *auth.P
 		if sb == nil {
 			return nil, st, slug, ex
 		}
-		return s.toolExecAsync(session, sb, m)
+		return s.toolExecAsyncWithKey(session.ID, sb, m)
 
 	case "sandbox_exec_cancel":
 		execID := strings.TrimSpace(argString(m, "execution_id"))
@@ -805,4 +824,89 @@ func (s *Service) toolListTiers(ctx context.Context) (any, int, string, map[stri
 		"tiers": result,
 		"note":  "Lightning billing uses msats_per_second and sats_per_second rates. Credits billing uses usd_cents_per_second rates.",
 	}, 0, "", nil
+}
+
+// CallToolAsyncREST handles async exec tools for the REST API surface.
+// It uses callerKey (derived from principal) instead of an MCP session ID.
+func (s *Service) CallToolAsyncREST(ctx context.Context, callerKey string, p *auth.Principal, name string, args json.RawMessage) (result any, httpStatus int, slug string, extra map[string]any) {
+	if s == nil {
+		return nil, http.StatusServiceUnavailable, "service_unavailable", map[string]any{"message": "service not configured"}
+	}
+	if callerKey == "" {
+		return nil, http.StatusUnauthorized, "unauthorized", map[string]any{"message": "authentication required for exec operations"}
+	}
+	var m map[string]any
+	if len(args) > 0 && string(args) != "null" {
+		if err := json.Unmarshal(args, &m); err != nil {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "arguments must be a JSON object"}
+		}
+	}
+	if m == nil {
+		m = map[string]any{}
+	}
+
+	switch name {
+	case "sandbox_exec":
+		id, ok := parseUUIDArg(m, "sandbox_id")
+		if !ok {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
+		}
+		sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, m)
+		if sb == nil {
+			return nil, st, slug, ex
+		}
+		return s.toolExecAsyncWithKey(callerKey, sb, m)
+
+	case "sandbox_exec_cancel":
+		execID := strings.TrimSpace(argString(m, "execution_id"))
+		if execID == "" {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "execution_id required"}
+		}
+		if s.Executions == nil {
+			return nil, http.StatusServiceUnavailable, "service_unavailable", nil
+		}
+		exec := s.Executions.Get(execID)
+		if exec == nil {
+			return nil, http.StatusNotFound, "not_found", map[string]any{
+				"message": "execution not found or already completed",
+				"hint":    "The execution may have already finished or been cleaned up.",
+			}
+		}
+		if exec.SessionID != callerKey {
+			return nil, http.StatusForbidden, "forbidden", map[string]any{
+				"message": "execution belongs to another caller",
+			}
+		}
+		if ok := s.Executions.Cancel(execID); !ok {
+			return nil, http.StatusNotFound, "not_found", map[string]any{
+				"message": "execution not found or already completed",
+			}
+		}
+		return map[string]any{"execution_id": execID, "status": "cancelled"}, 0, "", nil
+
+	case "sandbox_exec_result":
+		execID := strings.TrimSpace(argString(m, "execution_id"))
+		if execID == "" {
+			return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "execution_id required"}
+		}
+		if s.Executions == nil {
+			return nil, http.StatusServiceUnavailable, "service_unavailable", nil
+		}
+		exec := s.Executions.Get(execID)
+		if exec == nil {
+			return nil, http.StatusNotFound, "not_found", map[string]any{
+				"message": "execution not found",
+				"hint":    "The execution may have expired or been cleaned up. Completed executions are only retained temporarily.",
+			}
+		}
+		if exec.SessionID != callerKey {
+			return nil, http.StatusForbidden, "forbidden", map[string]any{
+				"message": "execution belongs to another caller",
+			}
+		}
+		return s.toolExecResult(ctx, exec)
+
+	default:
+		return nil, 0, "", nil
+	}
 }

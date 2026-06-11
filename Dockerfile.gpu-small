@@ -8,6 +8,31 @@ COPY cmd ./cmd
 ENV CGO_ENABLED=0
 RUN go build -trimpath -ldflags="-s -w" -mod=vendor -o /sockt-runtime ./cmd/sockt-runtime
 
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04 AS python-builder
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+     python3 python3-pip python3-venv python3-dev \
+     build-essential libffi-dev libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/ml \
+  && /opt/ml/bin/pip install --no-cache-dir --no-compile \
+     --index-url https://download.pytorch.org/whl/cu126 \
+     torch torchvision \
+  && /opt/ml/bin/pip install --no-cache-dir --no-compile \
+     transformers accelerate \
+     numpy scipy pillow \
+     sentencepiece tokenizers safetensors \
+     huggingface-hub
+
+RUN find /opt/ml -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null; \
+    find /opt/ml -type d -name "tests" -exec rm -rf {} + 2>/dev/null; \
+    find /opt/ml -type d -name "test" -exec rm -rf {} + 2>/dev/null; \
+    find /opt/ml -type f -name "*.pyc" -delete 2>/dev/null; \
+    find /opt/ml -path "*/torch/test/*" -delete 2>/dev/null; \
+    find /opt/ml -path "*/caffe2/python/test/*" -delete 2>/dev/null; \
+    true
+
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04 AS runtime
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -17,13 +42,7 @@ RUN apt-get update \
      build-essential libffi-dev libssl-dev \
   && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m venv /opt/ml \
-  && /opt/ml/bin/pip install --no-cache-dir \
-     torch torchvision torchaudio \
-     transformers accelerate \
-     numpy scipy pillow \
-     sentencepiece tokenizers safetensors \
-     huggingface-hub
+COPY --from=python-builder /opt/ml /opt/ml
 
 RUN useradd -m -u 1001 -s /bin/bash sandbox
 

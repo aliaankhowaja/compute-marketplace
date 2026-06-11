@@ -242,6 +242,14 @@ func (s *Service) toolExec(ctx context.Context, sb *store.Sandbox, args map[stri
 }
 
 func (s *Service) toolExecAsync(session *Session, sb *store.Sandbox, args map[string]any) (any, int, string, map[string]any) {
+	res, st, slug, ex := s.toolExecAsyncWithKey(session.ID, sb, args)
+	if st == 0 && s.Sessions != nil {
+		s.Sessions.TrackSandbox(session.ID, sb.ID)
+	}
+	return res, st, slug, ex
+}
+
+func (s *Service) toolExecAsyncWithKey(callerKey string, sb *store.Sandbox, args map[string]any) (any, int, string, map[string]any) {
 	base := dataPlaneBase(sb)
 	if base == "" {
 		return nil, http.StatusBadRequest, "pod_unreachable", map[string]any{"message": "no data plane endpoint"}
@@ -264,15 +272,14 @@ func (s *Service) toolExecAsync(session *Session, sb *store.Sandbox, args map[st
 	if s.Cfg != nil && s.Cfg.MCPMaxConcurrentExec > 0 {
 		maxConc = s.Cfg.MCPMaxConcurrentExec
 	}
-	if s.Executions.CountForSession(session.ID) >= maxConc {
+	if s.Executions.CountForSession(callerKey) >= maxConc {
 		return nil, http.StatusTooManyRequests, "too_many_executions", map[string]any{
-			"message": fmt.Sprintf("max %d concurrent executions per session", maxConc),
+			"message": fmt.Sprintf("max %d concurrent executions per caller", maxConc),
 		}
 	}
 
 	execCtx, execCancel := context.WithTimeout(context.Background(), maxTimeout)
-	exec := s.Executions.Create(session.ID, sb.ID, cmd, execCancel)
-	s.Sessions.TrackSandbox(session.ID, sb.ID)
+	exec := s.Executions.Create(callerKey, sb.ID, cmd, execCancel)
 
 	go s.runExecAsync(execCtx, execCancel, exec, sb, cmd, cwd)
 

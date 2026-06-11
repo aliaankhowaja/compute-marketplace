@@ -41,16 +41,6 @@ func NewRouter(d RouterDeps) http.Handler {
 	mux.HandleFunc("GET /.well-known/openid-configuration", http.NotFound)
 	mux.HandleFunc("HEAD /.well-known/openid-configuration", http.NotFound)
 
-	// Public catalog
-	mux.Handle("GET /v1/pricing", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rows, err := d.Store.ListTierPricing(r.Context())
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "store_error", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, rows)
-	}))
-
 	rl := auth.NewRateLimiter(d.Cfg.MCPRPM)
 
 	mcpSvc := mcp.NewService(d.Cfg, d.Store, d.PaySvc, d.Orch, nil)
@@ -58,33 +48,28 @@ func NewRouter(d RouterDeps) http.Handler {
 	mcpSvc.Sessions.StartCleanupLoop(0)
 	mcpSvc.Executions = mcp.NewExecutionRegistry()
 
+	// MCP (JSON-RPC 2.0)
 	mux.Handle("GET /v1/mcp/health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mcp.HealthPayload())
 	}))
 	mux.Handle("POST /v1/mcp", mcp.AuthMiddleware(d.APIKeys, d.Store, rl.Middleware(mcp.Handler(mcpSvc))))
 
-	// User JWT routes
-	jwtAuth := auth.JWTAuth(d.Cfg.SupabaseJWTSecret)
-	jt := func(h http.Handler) http.Handler {
-		return jwtAuth(rl.Middleware(h))
+	// REST sandbox endpoints — same auth as MCP (API key, sandbox token, or anonymous)
+	restAuth := func(h http.Handler) http.Handler {
+		return mcp.AuthMiddleware(d.APIKeys, d.Store, rl.Middleware(h))
 	}
-	mux.Handle("GET /v1/user/profile", jt(http.HandlerFunc(handleUserProfile(d))))
-	mux.Handle("GET /v1/user/credits", jt(http.HandlerFunc(handleUserCredits(d))))
-	mux.Handle("GET /v1/user/credits/history", jt(http.HandlerFunc(handleUserCreditsHistory(d))))
-	mux.Handle("POST /v1/user/api-keys", jt(http.HandlerFunc(handleCreateAPIKey(d))))
-	mux.Handle("GET /v1/user/api-keys", jt(http.HandlerFunc(handleListAPIKeys(d))))
-	mux.Handle("DELETE /v1/user/api-keys/{id}", jt(http.HandlerFunc(handleRevokeAPIKey(d))))
-
-	// Sandbox lifecycle — API key (credits) only on REST. Lightning sandboxes are managed via MCP.
-	apiKey := func(h http.Handler) http.Handler { return rl.Middleware(d.APIKeys.Middleware(h)) }
-	mux.Handle("POST /v1/sandbox/create", apiKey(http.HandlerFunc(handleCreateSandbox(d))))
-	mux.Handle("GET /v1/sandbox/{id}", apiKey(http.HandlerFunc(handleGetSandbox(d))))
-	mux.Handle("POST /v1/sandbox/{id}/pause", apiKey(http.HandlerFunc(handlePauseSandbox(d))))
-	mux.Handle("POST /v1/sandbox/{id}/resume", apiKey(http.HandlerFunc(handleResumeSandbox(d))))
-	mux.Handle("DELETE /v1/sandbox/{id}", apiKey(http.HandlerFunc(handleDeleteSandbox(d))))
-	mux.Handle("POST /v1/sandbox/{id}/refresh-data-jwt", apiKey(http.HandlerFunc(handleRefreshDataJWT(d))))
-	mux.Handle("POST /v1/sandbox/{id}/extend-balance", apiKey(http.HandlerFunc(handleExtendBalance(d))))
-	mux.Handle("GET /v1/sandbox/{id}/billing", apiKey(http.HandlerFunc(handleSandboxBilling(d))))
+	mux.Handle("GET /v1/sandboxes/tiers", restAuth(http.HandlerFunc(handleRESTListTiers(mcpSvc))))
+	mux.Handle("POST /v1/sandboxes", restAuth(http.HandlerFunc(handleRESTCreateSandbox(mcpSvc))))
+	mux.Handle("POST /v1/sandboxes/{id}/exec", restAuth(http.HandlerFunc(handleRESTExec(mcpSvc))))
+	mux.Handle("POST /v1/sandboxes/{id}/files/write", restAuth(http.HandlerFunc(handleRESTWriteFile(mcpSvc))))
+	mux.Handle("POST /v1/sandboxes/{id}/files/read", restAuth(http.HandlerFunc(handleRESTReadFile(mcpSvc))))
+	mux.Handle("GET /v1/sandboxes/{id}/files", restAuth(http.HandlerFunc(handleRESTListFiles(mcpSvc))))
+	mux.Handle("GET /v1/sandboxes/{id}", restAuth(http.HandlerFunc(handleRESTSandboxStatus(mcpSvc))))
+	mux.Handle("POST /v1/sandboxes/{id}/pause", restAuth(http.HandlerFunc(handleRESTPause(mcpSvc))))
+	mux.Handle("POST /v1/sandboxes/{id}/resume", restAuth(http.HandlerFunc(handleRESTResume(mcpSvc))))
+	mux.Handle("DELETE /v1/sandboxes/{id}", restAuth(http.HandlerFunc(handleRESTTerminate(mcpSvc))))
+	mux.Handle("GET /v1/executions/{execution_id}", restAuth(http.HandlerFunc(handleRESTExecResult(mcpSvc))))
+	mux.Handle("DELETE /v1/executions/{execution_id}", restAuth(http.HandlerFunc(handleRESTExecCancel(mcpSvc))))
 
 	// Runtime callbacks
 	mux.Handle("POST /v1/runtime/billing/audit-batch", auth.BearerSecret(d.Cfg.CallbackSecret, http.HandlerFunc(handleAuditBatch(d))))
