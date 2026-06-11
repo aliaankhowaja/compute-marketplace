@@ -18,7 +18,17 @@ func writeRESTResponse(w http.ResponseWriter, result any, httpStatus int, slug s
 				msg = m
 			}
 		}
-		writeErr(w, httpStatus, slug, msg)
+		errBody := map[string]any{
+			"code":    slug,
+			"error":   slug,
+			"message": msg,
+		}
+		if extra != nil {
+			if h, ok := extra["hint"].(string); ok && h != "" {
+				errBody["hint"] = h
+			}
+		}
+		writeJSON(w, httpStatus, errBody)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -27,6 +37,16 @@ func writeRESTResponse(w http.ResponseWriter, result any, httpStatus int, slug s
 func sandboxTokenFromRequest(r *http.Request) string {
 	if tok := r.URL.Query().Get("sandbox_token"); tok != "" {
 		return tok
+	}
+	return ""
+}
+
+func execCallerKey(p *auth.Principal, args map[string]any) string {
+	if key := mcp.CallerKeyFromPrincipal(p); key != "" {
+		return key
+	}
+	if tok, ok := args["sandbox_token"].(string); ok {
+		return mcp.CallerKeyFromToken(tok)
 	}
 	return ""
 }
@@ -61,11 +81,6 @@ func handleRESTCreateSandbox(svc *mcp.Service) func(http.ResponseWriter, *http.R
 func handleRESTExec(svc *mcp.Service) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := auth.PrincipalFrom(r.Context())
-		callerKey := mcp.CallerKeyFromPrincipal(p)
-		if callerKey == "" {
-			writeErr(w, http.StatusUnauthorized, "unauthorized", "authentication required for exec operations")
-			return
-		}
 		sandboxID := r.PathValue("id")
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -76,6 +91,11 @@ func handleRESTExec(svc *mcp.Service) func(http.ResponseWriter, *http.Request) {
 		if tok := sandboxTokenFromRequest(r); tok != "" {
 			body["sandbox_token"] = tok
 		}
+		callerKey := execCallerKey(p, body)
+		if callerKey == "" {
+			writeErr(w, http.StatusUnauthorized, "unauthorized", "authentication required for exec operations")
+			return
+		}
 		args, _ := json.Marshal(body)
 		result, httpStatus, slug, extra := svc.CallToolAsyncREST(r.Context(), callerKey, p, "sandbox_exec", args)
 		writeRESTResponse(w, result, httpStatus, slug, extra)
@@ -85,15 +105,15 @@ func handleRESTExec(svc *mcp.Service) func(http.ResponseWriter, *http.Request) {
 func handleRESTExecResult(svc *mcp.Service) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := auth.PrincipalFrom(r.Context())
-		callerKey := mcp.CallerKeyFromPrincipal(p)
-		if callerKey == "" {
-			writeErr(w, http.StatusUnauthorized, "unauthorized", "authentication required")
-			return
-		}
 		executionID := r.PathValue("execution_id")
 		m := map[string]any{"execution_id": executionID}
 		if tok := sandboxTokenFromRequest(r); tok != "" {
 			m["sandbox_token"] = tok
+		}
+		callerKey := execCallerKey(p, m)
+		if callerKey == "" {
+			writeErr(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
 		}
 		args, _ := json.Marshal(m)
 		result, httpStatus, slug, extra := svc.CallToolAsyncREST(r.Context(), callerKey, p, "sandbox_exec_result", args)
@@ -104,15 +124,15 @@ func handleRESTExecResult(svc *mcp.Service) func(http.ResponseWriter, *http.Requ
 func handleRESTExecCancel(svc *mcp.Service) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := auth.PrincipalFrom(r.Context())
-		callerKey := mcp.CallerKeyFromPrincipal(p)
-		if callerKey == "" {
-			writeErr(w, http.StatusUnauthorized, "unauthorized", "authentication required")
-			return
-		}
 		executionID := r.PathValue("execution_id")
 		m := map[string]any{"execution_id": executionID}
 		if tok := sandboxTokenFromRequest(r); tok != "" {
 			m["sandbox_token"] = tok
+		}
+		callerKey := execCallerKey(p, m)
+		if callerKey == "" {
+			writeErr(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
 		}
 		args, _ := json.Marshal(m)
 		result, httpStatus, slug, extra := svc.CallToolAsyncREST(r.Context(), callerKey, p, "sandbox_exec_cancel", args)
@@ -205,6 +225,14 @@ func handleRESTPause(svc *mcp.Service) func(http.ResponseWriter, *http.Request) 
 		if tok := sandboxTokenFromRequest(r); tok != "" {
 			m["sandbox_token"] = tok
 		}
+		if r.Body != nil {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				if tok, ok := body["sandbox_token"].(string); ok && tok != "" {
+					m["sandbox_token"] = tok
+				}
+			}
+		}
 		args, _ := json.Marshal(m)
 		result, httpStatus, slug, extra := svc.CallTool(r.Context(), p, "sandbox_pause", args)
 		writeRESTResponse(w, result, httpStatus, slug, extra)
@@ -219,8 +247,30 @@ func handleRESTResume(svc *mcp.Service) func(http.ResponseWriter, *http.Request)
 		if tok := sandboxTokenFromRequest(r); tok != "" {
 			m["sandbox_token"] = tok
 		}
+		if r.Body != nil {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				if tok, ok := body["sandbox_token"].(string); ok && tok != "" {
+					m["sandbox_token"] = tok
+				}
+			}
+		}
 		args, _ := json.Marshal(m)
 		result, httpStatus, slug, extra := svc.CallTool(r.Context(), p, "sandbox_resume", args)
+		writeRESTResponse(w, result, httpStatus, slug, extra)
+	}
+}
+
+func handleRESTShellURL(svc *mcp.Service) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p := auth.PrincipalFrom(r.Context())
+		sandboxID := r.PathValue("id")
+		m := map[string]any{"sandbox_id": sandboxID}
+		if tok := sandboxTokenFromRequest(r); tok != "" {
+			m["sandbox_token"] = tok
+		}
+		args, _ := json.Marshal(m)
+		result, httpStatus, slug, extra := svc.ShellURL(r.Context(), p, args)
 		writeRESTResponse(w, result, httpStatus, slug, extra)
 	}
 }

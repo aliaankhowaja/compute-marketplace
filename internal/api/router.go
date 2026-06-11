@@ -64,6 +64,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	mux.Handle("POST /v1/sandboxes/{id}/files/write", restAuth(http.HandlerFunc(handleRESTWriteFile(mcpSvc))))
 	mux.Handle("POST /v1/sandboxes/{id}/files/read", restAuth(http.HandlerFunc(handleRESTReadFile(mcpSvc))))
 	mux.Handle("GET /v1/sandboxes/{id}/files", restAuth(http.HandlerFunc(handleRESTListFiles(mcpSvc))))
+	mux.Handle("GET /v1/sandboxes/{id}/shell-url", restAuth(http.HandlerFunc(handleRESTShellURL(mcpSvc))))
 	mux.Handle("GET /v1/sandboxes/{id}", restAuth(http.HandlerFunc(handleRESTSandboxStatus(mcpSvc))))
 	mux.Handle("POST /v1/sandboxes/{id}/pause", restAuth(http.HandlerFunc(handleRESTPause(mcpSvc))))
 	mux.Handle("POST /v1/sandboxes/{id}/resume", restAuth(http.HandlerFunc(handleRESTResume(mcpSvc))))

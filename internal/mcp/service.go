@@ -187,6 +187,16 @@ func CallerKeyFromPrincipal(p *auth.Principal) string {
 	return ""
 }
 
+// CallerKeyFromToken derives a caller key from a sandbox_token string.
+// Used when the caller authenticates via sandbox_token in the request body/query
+// rather than the Authorization header.
+func CallerKeyFromToken(token string) string {
+	if auth.IsSandboxToken(token) {
+		return "token:" + token
+	}
+	return ""
+}
+
 // CallToolAsync handles tools that return immediately and deliver results via SSE.
 func (s *Service) CallToolAsync(ctx context.Context, session *Session, p *auth.Principal, name string, args json.RawMessage) (result any, httpStatus int, slug string, extra map[string]any) {
 	if s == nil {
@@ -909,4 +919,36 @@ func (s *Service) CallToolAsyncREST(ctx context.Context, callerKey string, p *au
 	default:
 		return nil, 0, "", nil
 	}
+}
+
+// ShellURL returns an authenticated WebSocket URL for the sandbox shell.
+func (s *Service) ShellURL(ctx context.Context, p *auth.Principal, rawArgs json.RawMessage) (any, int, string, map[string]any) {
+	var args map[string]any
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return nil, http.StatusBadRequest, "bad_request", map[string]any{"message": "invalid JSON"}
+	}
+	id, ok := parseUUIDArg(args, "sandbox_id")
+	if !ok {
+		return nil, http.StatusBadRequest, "invalid_params", map[string]any{"message": "sandbox_id"}
+	}
+	sb, st, slug, ex := s.getSandboxForPrincipal(ctx, p, id, args)
+	if sb == nil {
+		return nil, st, slug, ex
+	}
+	base := dataPlaneBase(sb)
+	if base == "" {
+		return nil, http.StatusBadRequest, "pod_unreachable", map[string]any{"message": "no data plane endpoint"}
+	}
+	tok, err := s.proxyDataJWT(sb, "shell")
+	if err != nil {
+		return nil, http.StatusInternalServerError, "token_error", map[string]any{"message": err.Error()}
+	}
+	host := strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://")
+	wsURL := fmt.Sprintf("wss://%s/sandbox/%s/shell?token=%s", host, sb.ID.String(), tok)
+	ttl := s.Cfg.DataJWTTTL
+	if s.Cfg.MCPDataJWTTTL > 0 {
+		ttl = s.Cfg.MCPDataJWTTTL
+	}
+	expiresAt := time.Now().Add(ttl).UTC().Format(time.RFC3339)
+	return map[string]any{"url": wsURL, "expires_at": expiresAt}, 0, "", nil
 }
